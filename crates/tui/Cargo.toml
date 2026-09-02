@@ -1,0 +1,11 @@
+[package]
+name = "agent-launcher-tui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true

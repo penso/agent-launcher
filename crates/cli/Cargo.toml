@@ -1,0 +1,17 @@
+[package]
+name = "agent-launcher-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-launcher"
+path = "src/main.rs"
+
+[features]
+default = ["tui"]
+tui = ["dep:agent-launcher-tui", "dep:tokio"]
+
+[dependencies]
+agent-launcher-tui = { path = "../tui", optional = true }
+tokio = { workspace = true, optional = true }
