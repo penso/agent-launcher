@@ -13,5 +13,15 @@ default = ["tui"]
 tui = ["dep:agent-launcher-tui", "dep:tokio"]
 
 [dependencies]
+agent-launcher-core = { path = "../core" }
+agent-launcher-issues = { path = "../issues" }
+agent-launcher-runner = { path = "../runner" }
+agent-launcher-runtime = { path = "../runtime" }
+agent-launcher-store = { path = "../store" }
 agent-launcher-tui = { path = "../tui", optional = true }
+clap.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, optional = true }
+toml.workspace = true
+uuid = { workspace = true, features = ["v5"] }

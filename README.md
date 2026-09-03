@@ -1,6 +1,53 @@
 # agent-launcher
 
-A terminal UI for launching and managing coding agents.
+A repository-local issue inbox for dispatching coding agents into isolated local or remote
+workspaces.
+
+Run `agent-launcher` from inside a Git repository. It detects the current repository's GitHub or
+GitLab remote from Git configuration and also enables Beads when `.beads` exists. Pull requests
+and merge requests are intentionally excluded.
+
+Override the detected remote to fetch issues for a specific GitHub or GitLab repository:
+
+```sh
+agent-launcher --remote https://github.com/owner/repository.git
+agent-launcher --remote git@gitlab.com:group/repository.git
+```
+
+HTTPS, `git://`, `ssh://`, and SCP-style Git URLs are supported. The override is also used as the
+repository identity when selecting or creating a workspace backend.
+
+## Dispatch
+
+The default backend is `auto`: use Superset when the current repository is registered there,
+otherwise create a native Git worktree and run OpenCode. Additional backends are Herdr and
+Conductor Cloud. Native workspaces can run on an SSH host, optionally waking Daytona, Coder, or an
+Azure VM before connecting.
+
+Configuration is loaded from the platform configuration directory: typically
+`~/Library/Application Support/agent-launcher/config.toml` on macOS and
+`~/.config/agent-launcher/config.toml` on Linux. See [`config.example.toml`](config.example.toml)
+for all current options. Provider credentials remain in their standard environments:
+
+- GitHub: `GH_TOKEN`, then `GITHUB_TOKEN`
+- GitLab: `PRIVATE_TOKEN`, then `GITLAB_TOKEN`
+- Conductor: `CONDUCTOR_API_TOKEN`, then `CONDUCTOR_API_KEY`
+- Superset, Herdr, OpenCode, SSH, Daytona, Coder, and Azure use their installed CLI authentication
+
+## Keys
+
+| Key | Inbox | Detail |
+| --- | --- | --- |
+| `↑` / `↓` | Navigate | Scroll |
+| Type / Backspace | Filter | |
+| `Enter` | Open issue | |
+| `d` | Dispatch | Dispatch |
+| `r` | Refresh | |
+| `i` | | Send input |
+| `o` | | Open workspace/session |
+| `s` | | Stop run |
+| `Esc` | Clear filter or quit | Return to inbox |
+| `Ctrl-C` | Quit | Quit |
 
 ## Development
 

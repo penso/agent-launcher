@@ -1,0 +1,590 @@
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
+
+use agent_launcher_core::{BackendKind, Repository, RunState, RunSummary, WorkspaceRef};
+use async_trait::async_trait;
+use chrono::Utc;
+use serde::Deserialize;
+use serde_json::Value;
+use url::Url;
+use uuid::Uuid;
+
+use crate::{
+    Backend, BackendCapabilities, BackendDetection, Capability, DispatchRequest, DispatchResult,
+    Error, OpenResult, Result, SessionRegistry, StatusResult,
+    command::{find_string, run_json, run_output},
+    registry::{BackendSession, RunRecord},
+    sanitize_branch, sanitize_workspace_name,
+};
+
+const MINIMUM_HERDR_VERSION: &str = "0.8.2";
+
+#[derive(Clone, Debug)]
+pub struct HerdrConfig {
+    pub executable: PathBuf,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self {
+            executable: "herdr".into(),
+        }
+    }
+}
+
+pub struct HerdrBackend {
+    config: HerdrConfig,
+    registry: Arc<SessionRegistry>,
+}
+
+impl HerdrBackend {
+    pub fn new(config: HerdrConfig, registry: Arc<SessionRegistry>) -> Self {
+        Self { config, registry }
+    }
+
+    async fn command(&self, args: Vec<OsString>) -> Result<Value> {
+        tracing::debug!(command = ?args, "running Herdr CLI");
+        run_json(&self.config.executable, &args, None).await
+    }
+
+    async fn record(&self, run_id: &str) -> Result<RunRecord> {
+        let record = self.registry.get(run_id).await?;
+        if !matches!(record.session, BackendSession::Herdr { .. }) {
+            return Err(Error::RunNotFound(run_id.to_string()));
+        }
+        Ok(record)
+    }
+
+    async fn status(&self) -> Result<HerdrStatus> {
+        let value = self.command(status_args()).await?;
+        let status: HerdrStatus = serde_json::from_value(value)?;
+        validate_status(&status)?;
+        Ok(status)
+    }
+}
+
+#[async_trait]
+impl Backend for HerdrBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Herdr
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::new([
+            Capability::Detect,
+            Capability::Dispatch,
+            Capability::Refresh,
+            Capability::SendInput,
+            Capability::Stop,
+            Capability::Open,
+        ])
+    }
+
+    async fn owns_run(&self, run_id: &str) -> bool {
+        self.registry
+            .get(run_id)
+            .await
+            .is_ok_and(|record| matches!(record.session, BackendSession::Herdr { .. }))
+    }
+
+    async fn detect(&self, _repository: &Repository) -> Result<BackendDetection> {
+        let result = self.status().await;
+        Ok(BackendDetection {
+            backend: self.kind(),
+            available: result.is_ok(),
+            capabilities: self.capabilities(),
+            message: result.err().map(|error| error.to_string()),
+        })
+    }
+
+    async fn dispatch(&self, request: DispatchRequest) -> Result<DispatchResult> {
+        request.validate()?;
+        self.status().await?;
+
+        let issue_hash = stable_hash(&request.issue.key.canonical());
+        let workspace_name = request.workspace_name.clone().unwrap_or_else(|| {
+            sanitize_workspace_name(&format!(
+                "{}-{}",
+                request.issue.identifier, request.issue.title
+            ))
+        });
+        let branch = sanitize_branch(
+            request
+                .branch
+                .as_deref()
+                .unwrap_or(&format!("agent/{workspace_name}-{}", &issue_hash[..8])),
+        );
+        let response = self
+            .command(worktree_create_args(
+                &request.repository.root,
+                &branch,
+                &workspace_name,
+                request.base_branch.as_deref(),
+            ))
+            .await?;
+        let worktree = parse_worktree(&response)?;
+
+        let agent_name = format!("launcher-{}", &Uuid::new_v4().simple().to_string()[..23]);
+        self.command(agent_start_args(
+            &agent_name,
+            &request.agent,
+            &worktree.pane_id,
+        ))
+        .await?;
+        self.command(agent_prompt_args(&agent_name, &request.prompt))
+            .await?;
+
+        let now = Utc::now();
+        let run_id = Uuid::new_v4().to_string();
+        let summary = RunSummary {
+            id: run_id,
+            issue_key: request.issue.key.canonical(),
+            workspace: Some(WorkspaceRef {
+                backend: BackendKind::Herdr,
+                id: worktree.workspace_id.clone(),
+                host: None,
+                path: worktree.path,
+                branch,
+            }),
+            agent: request.agent,
+            state: RunState::Running,
+            message: None,
+            session_id: Some(agent_name.clone()),
+            started_at: now,
+            updated_at: now,
+        };
+        self.registry
+            .insert(RunRecord {
+                summary: summary.clone(),
+                session: BackendSession::Herdr {
+                    workspace_id: worktree.workspace_id,
+                    pane_id: worktree.pane_id,
+                    agent_name,
+                },
+            })
+            .await?;
+        Ok(DispatchResult {
+            run: summary,
+            capabilities: self.capabilities(),
+        })
+    }
+
+    async fn refresh(&self, run_id: &str) -> Result<StatusResult> {
+        let record = self.record(run_id).await?;
+        let BackendSession::Herdr { agent_name, .. } = &record.session else {
+            unreachable!()
+        };
+        let agent = match self
+            .command(vec!["agent".into(), "get".into(), agent_name.into()])
+            .await
+        {
+            Ok(value) => parse_agent(&value)?,
+            Err(error) => {
+                let summary = self
+                    .registry
+                    .set_state(run_id, RunState::Disconnected, Some(error.to_string()))
+                    .await?;
+                return Ok(StatusResult {
+                    run: summary,
+                    output: None,
+                });
+            },
+        };
+        let output =
+            run_output(&self.config.executable, &agent_read_args(agent_name), None).await?;
+        let mut summary = record.summary;
+        if summary.state != RunState::Cancelled {
+            summary.state = map_agent_status(&agent.status);
+            summary.message = match agent.status.as_str() {
+                "blocked" => Some(
+                    "Herdr reports the agent is blocked; the required interaction is not exposed"
+                        .into(),
+                ),
+                "unknown" => Some("Herdr cannot classify the agent state".into()),
+                _ => None,
+            };
+            summary.updated_at = Utc::now();
+            self.registry.update_summary(summary.clone()).await?;
+        }
+        Ok(StatusResult {
+            run: summary,
+            output: (!output.is_empty()).then_some(output),
+        })
+    }
+
+    async fn send_input(&self, run_id: &str, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Err(Error::InvalidRequest("input cannot be empty".into()));
+        }
+        let record = self.record(run_id).await?;
+        let BackendSession::Herdr { agent_name, .. } = record.session else {
+            unreachable!()
+        };
+        self.command(agent_prompt_args(&agent_name, text)).await?;
+        self.registry
+            .set_state(run_id, RunState::Running, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn stop(&self, run_id: &str) -> Result<()> {
+        let record = self.record(run_id).await?;
+        if record.summary.state == RunState::Cancelled {
+            return Ok(());
+        }
+        let BackendSession::Herdr { agent_name, .. } = record.session else {
+            unreachable!()
+        };
+        let agent = self
+            .command(vec![
+                "agent".into(),
+                "get".into(),
+                agent_name.clone().into(),
+            ])
+            .await?;
+        if parse_agent(&agent)?.status == "blocked" {
+            self.command(agent_send_keys_args(&agent_name, "esc"))
+                .await?;
+        }
+        self.command(agent_send_keys_args(&agent_name, "ctrl+c"))
+            .await?;
+        self.registry
+            .set_state(
+                run_id,
+                RunState::Cancelled,
+                Some("interrupt sent through Herdr".into()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn open(&self, run_id: &str) -> Result<OpenResult> {
+        let record = self.record(run_id).await?;
+        let BackendSession::Herdr { agent_name, .. } = record.session else {
+            unreachable!()
+        };
+        self.command(vec![
+            "agent".into(),
+            "focus".into(),
+            agent_name.clone().into(),
+        ])
+        .await?;
+        let uri = Url::parse(&format!("herdr://agent/{agent_name}"))
+            .map_err(|error| Error::InvalidResponse(error.to_string()))?;
+        Ok(OpenResult {
+            uri,
+            launched: true,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HerdrStatus {
+    client: HerdrClientStatus,
+    server: HerdrServerStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct HerdrClientStatus {
+    version: String,
+    protocol: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HerdrServerStatus {
+    running: bool,
+    version: Option<String>,
+    protocol: Option<u64>,
+    compatible: Option<bool>,
+    restart_needed: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WorktreeResult {
+    workspace_id: String,
+    pane_id: String,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AgentResult {
+    status: String,
+}
+
+fn validate_status(status: &HerdrStatus) -> Result<()> {
+    if !version_at_least(&status.client.version, MINIMUM_HERDR_VERSION) {
+        return Err(Error::InvalidResponse(format!(
+            "Herdr {} is too old; version {MINIMUM_HERDR_VERSION} or newer is required",
+            status.client.version
+        )));
+    }
+    if !status.server.running {
+        return Err(Error::InvalidResponse("Herdr server is not running".into()));
+    }
+    let server_version = status
+        .server
+        .version
+        .as_deref()
+        .ok_or_else(|| Error::InvalidResponse("Herdr status has no server version".into()))?;
+    let server_protocol = status
+        .server
+        .protocol
+        .ok_or_else(|| Error::InvalidResponse("Herdr status has no server protocol".into()))?;
+    if status.client.version != server_version
+        || status.client.protocol != server_protocol
+        || status.server.compatible != Some(true)
+        || status.server.restart_needed
+    {
+        return Err(Error::InvalidResponse(format!(
+            "Herdr client {} protocol {} is incompatible with server {server_version} protocol {server_protocol}; restart or update Herdr",
+            status.client.version, status.client.protocol
+        )));
+    }
+    Ok(())
+}
+
+fn version_at_least(actual: &str, required: &str) -> bool {
+    fn parts(value: &str) -> Option<Vec<u64>> {
+        value
+            .split_once('-')
+            .map_or(value, |(version, _)| version)
+            .split('.')
+            .map(str::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()
+    }
+    matches!((parts(actual), parts(required)), (Some(actual), Some(required)) if actual >= required)
+}
+
+fn parse_worktree(value: &Value) -> Result<WorktreeResult> {
+    let workspace_id = value
+        .pointer("/result/workspace/workspace_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::InvalidResponse("Herdr worktree response has no workspace id".into())
+        })?;
+    let pane_id = value
+        .pointer("/result/root_pane/pane_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Error::InvalidResponse("Herdr worktree response has no root pane id".into())
+        })?;
+    let path = value
+        .pointer("/result/worktree/path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    Ok(WorktreeResult {
+        workspace_id: workspace_id.into(),
+        pane_id: pane_id.into(),
+        path,
+    })
+}
+
+fn parse_agent(value: &Value) -> Result<AgentResult> {
+    let agent = value
+        .pointer("/result/agent")
+        .ok_or_else(|| Error::InvalidResponse("Herdr agent response has no agent".into()))?;
+    let status = find_string(agent, &["agent_status"])
+        .ok_or_else(|| Error::InvalidResponse("Herdr agent response has no status".into()))?;
+    Ok(AgentResult { status })
+}
+
+fn map_agent_status(status: &str) -> RunState {
+    match status {
+        "working" => RunState::Running,
+        "blocked" => RunState::NeedsInput,
+        "idle" => RunState::Idle,
+        "done" => RunState::Completed,
+        _ => RunState::Disconnected,
+    }
+}
+
+fn status_args() -> Vec<OsString> {
+    vec!["status".into(), "--json".into()]
+}
+
+fn worktree_create_args(
+    repository: &std::path::Path,
+    branch: &str,
+    label: &str,
+    base: Option<&str>,
+) -> Vec<OsString> {
+    let mut args = vec![
+        "worktree".into(),
+        "create".into(),
+        "--cwd".into(),
+        repository.as_os_str().to_owned(),
+        "--branch".into(),
+        branch.into(),
+    ];
+    if let Some(base) = base {
+        args.extend([OsString::from("--base"), base.into()]);
+    }
+    args.extend([
+        OsString::from("--label"),
+        label.into(),
+        OsString::from("--no-focus"),
+    ]);
+    args
+}
+
+fn agent_start_args(name: &str, kind: &str, pane: &str) -> Vec<OsString> {
+    vec![
+        "agent".into(),
+        "start".into(),
+        name.into(),
+        "--kind".into(),
+        kind.into(),
+        "--pane".into(),
+        pane.into(),
+    ]
+}
+
+fn agent_prompt_args(name: &str, prompt: &str) -> Vec<OsString> {
+    vec!["agent".into(), "prompt".into(), name.into(), prompt.into()]
+}
+
+fn agent_read_args(name: &str) -> Vec<OsString> {
+    vec![
+        "agent".into(),
+        "read".into(),
+        name.into(),
+        "--source".into(),
+        "recent-unwrapped".into(),
+        "--lines".into(),
+        "240".into(),
+    ]
+}
+
+fn agent_send_keys_args(name: &str, key: &str) -> Vec<OsString> {
+    vec!["agent".into(), "send-keys".into(), name.into(), key.into()]
+}
+
+fn stable_hash(value: &str) -> String {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, value.as_bytes())
+        .simple()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn builds_documented_dispatch_commands() {
+        assert_eq!(
+            worktree_create_args(Path::new("/repo with space"), "agent/fix", "fix", None),
+            args(&[
+                "worktree",
+                "create",
+                "--cwd",
+                "/repo with space",
+                "--branch",
+                "agent/fix",
+                "--label",
+                "fix",
+                "--no-focus",
+            ])
+        );
+        assert_eq!(
+            agent_start_args("launcher-123", "opencode", "w1:p1"),
+            args(&[
+                "agent",
+                "start",
+                "launcher-123",
+                "--kind",
+                "opencode",
+                "--pane",
+                "w1:p1",
+            ])
+        );
+        assert_eq!(
+            agent_prompt_args("launcher-123", "fix it; safely"),
+            args(&["agent", "prompt", "launcher-123", "fix it; safely"])
+        );
+        assert_eq!(
+            agent_read_args("launcher-123"),
+            args(&[
+                "agent",
+                "read",
+                "launcher-123",
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "240",
+            ])
+        );
+        assert_eq!(
+            agent_send_keys_args("launcher-123", "ctrl+c"),
+            args(&["agent", "send-keys", "launcher-123", "ctrl+c"])
+        );
+        assert_eq!(status_args(), args(&["status", "--json"]));
+    }
+
+    #[test]
+    fn parses_authoritative_worktree_and_agent_shapes() {
+        let worktree = json!({
+            "id": "req",
+            "result": {
+                "workspace": {"workspace_id": "w2"},
+                "root_pane": {"pane_id": "w2:p1"},
+                "worktree": {"path": "/tmp/repo/fix"}
+            }
+        });
+        assert_eq!(
+            parse_worktree(&worktree).expect("worktree should parse"),
+            WorktreeResult {
+                workspace_id: "w2".into(),
+                pane_id: "w2:p1".into(),
+                path: Some("/tmp/repo/fix".into()),
+            }
+        );
+        let agent = json!({"result": {"agent": {"agent_status": "blocked"}}});
+        assert_eq!(
+            parse_agent(&agent).expect("agent should parse"),
+            AgentResult {
+                status: "blocked".into()
+            }
+        );
+        assert_eq!(map_agent_status("blocked"), RunState::NeedsInput);
+        assert_eq!(map_agent_status("done"), RunState::Completed);
+        assert_eq!(map_agent_status("future"), RunState::Disconnected);
+    }
+
+    #[test]
+    fn validates_status_protocol_and_version() {
+        let valid: HerdrStatus = serde_json::from_value(json!({
+            "client": {"version": "0.8.2", "protocol": 20},
+            "server": {
+                "running": true,
+                "version": "0.8.2",
+                "protocol": 20,
+                "compatible": true,
+                "restart_needed": false
+            }
+        }))
+        .expect("status should deserialize");
+        validate_status(&valid).expect("matching status should validate");
+
+        let incompatible: HerdrStatus = serde_json::from_value(json!({
+            "client": {"version": "0.8.2", "protocol": 20},
+            "server": {
+                "running": true,
+                "version": "0.7.4",
+                "protocol": 16,
+                "compatible": false,
+                "restart_needed": true
+            }
+        }))
+        .expect("status should deserialize");
+        assert!(validate_status(&incompatible).is_err());
+        assert!(version_at_least("0.8.2-preview.1", "0.7.4"));
+    }
+}

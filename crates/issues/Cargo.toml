@@ -1,16 +1,17 @@
 [package]
-name = "agent-launcher-tui"
+name = "agent-launcher-issues"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
 agent-launcher-core = { path = "../core" }
-agent-launcher-runtime = { path = "../runtime" }
+async-trait.workspace = true
 chrono.workspace = true
-crossterm.workspace = true
-futures-util.workspace = true
-fuzzy-matcher.workspace = true
-ratatui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

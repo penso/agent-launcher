@@ -1,16 +1,16 @@
 [package]
-name = "agent-launcher-tui"
+name = "agent-launcher-store"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
 agent-launcher-core = { path = "../core" }
-agent-launcher-runtime = { path = "../runtime" }
 chrono.workspace = true
-crossterm.workspace = true
-futures-util.workspace = true
-fuzzy-matcher.workspace = true
-ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
 tokio.workspace = true

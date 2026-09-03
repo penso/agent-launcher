@@ -1,0 +1,39 @@
+# auto prefers Superset when its project is configured, then native Git/OpenCode.
+# Other values: superset, native, herdr, conductor.
+backend = "auto"
+poll_interval_seconds = 60
+
+# Set this to target a Superset host instead of the local machine.
+# superset_host = "host-id-or-name"
+
+[agent]
+name = "opencode"
+# model = "provider/model"
+# effort = "high"
+
+[notifications]
+desktop = true
+
+# Uncomment to run the native backend over SSH. The remote host must have Git and OpenCode.
+# [ssh]
+# host = "buildbox"
+# workspace_root = "~/.local/share/agent-launcher"
+
+# Optionally wake remote compute before connecting. Choose one shape.
+# [ssh.wake]
+# provider = "daytona"
+# sandbox = "coding-sandbox"
+
+# [ssh.wake]
+# provider = "coder"
+# workspace = "coding-workspace"
+
+# [ssh.wake]
+# provider = "azure"
+# resource_group = "agents"
+# vm = "worker-1"
+
+# [ssh.wake]
+# provider = "command"
+# program = "my-wake-command"
+# args = ["--host", "buildbox"]
