@@ -232,6 +232,7 @@ impl Backend for ConductorBackend {
         Ok(BackendDetection {
             backend: self.kind(),
             available: result.is_ok(),
+            manager_running: false,
             capabilities: self.capabilities(),
             message: result.err().map(|error| error.to_string()),
         })

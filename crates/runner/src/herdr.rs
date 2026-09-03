@@ -55,10 +55,14 @@ impl HerdrBackend {
     }
 
     async fn status(&self) -> Result<HerdrStatus> {
-        let value = self.command(status_args()).await?;
-        let status: HerdrStatus = serde_json::from_value(value)?;
+        let status = self.reported_status().await?;
         validate_status(&status)?;
         Ok(status)
+    }
+
+    async fn reported_status(&self) -> Result<HerdrStatus> {
+        let value = self.command(status_args()).await?;
+        Ok(serde_json::from_value(value)?)
     }
 }
 
@@ -87,10 +91,14 @@ impl Backend for HerdrBackend {
     }
 
     async fn detect(&self, _repository: &Repository) -> Result<BackendDetection> {
-        let result = self.status().await;
+        let (manager_running, result) = match self.reported_status().await {
+            Ok(status) => (status.server.running, validate_status(&status)),
+            Err(error) => (false, Err(error)),
+        };
         Ok(BackendDetection {
             backend: self.kind(),
             available: result.is_ok(),
+            manager_running,
             capabilities: self.capabilities(),
             message: result.err().map(|error| error.to_string()),
         })
@@ -584,6 +592,7 @@ mod tests {
             }
         }))
         .expect("status should deserialize");
+        assert!(incompatible.server.running);
         assert!(validate_status(&incompatible).is_err());
         assert!(version_at_least("0.8.2-preview.1", "0.7.4"));
     }

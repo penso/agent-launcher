@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use agent_launcher_core::{Issue, RuntimeSnapshot};
+use agent_launcher_core::{BackendKind, Issue, RuntimeSnapshot};
 use ratatui::{
     Frame,
     layout::{Alignment, Margin, Rect},
@@ -16,7 +16,7 @@ use crate::{
     rows::{DisplayRow, display_rows_matching, hierarchy_prefix},
     status::{issue_color, issue_icon, run_color, run_label},
     theme,
-    widgets::{LeftBorderPanel, render_bottom_edge},
+    widgets::render_bottom_edge,
 };
 
 pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut AppState) {
@@ -179,11 +179,11 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
         return;
     }
     let vertical_padding = u16::from(area.height >= 8);
-    let inner = LeftBorderPanel::new()
-        .border_color(theme::primary())
-        .content_bg(theme::panel())
-        .padding(Padding::new(1, 1, vertical_padding, 0))
-        .render(area, frame.buffer_mut());
+    let panel = Block::new()
+        .style(Style::new().bg(theme::panel()))
+        .padding(Padding::new(2, 1, vertical_padding, 0));
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
     if inner.is_empty() {
         app.visible_rows = 0;
         return;
@@ -671,11 +671,9 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
         |repository| abbreviated_path(&repository.root),
     );
     let source = footer_source_label(snapshot);
-    let backend = snapshot
-        .selected_backend
-        .map_or_else(|| "none".to_owned(), |backend| backend.to_string());
     let text = format!(
-        "{repository}  ·  {source}  ·  {backend}  ·  {}",
+        "{repository}  ·  {source}  ·  {}  ·  {}",
+        worktree_manager_label(snapshot),
         if snapshot.selected_agent.is_empty() {
             "none"
         } else {
@@ -694,6 +692,22 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             .alignment(Alignment::Right),
         footer,
     );
+}
+
+fn worktree_manager_label(snapshot: &RuntimeSnapshot) -> &'static str {
+    [BackendKind::Superset, BackendKind::Herdr]
+        .into_iter()
+        .find(|kind| {
+            snapshot
+                .backends
+                .iter()
+                .any(|backend| backend.kind == *kind && backend.manager_running)
+        })
+        .map_or("please run this in a worktree manager", |kind| match kind {
+            BackendKind::Superset => "superset",
+            BackendKind::Herdr => "herdr",
+            BackendKind::Native | BackendKind::Conductor => unreachable!(),
+        })
 }
 
 fn footer_source_label(snapshot: &RuntimeSnapshot) -> String {
@@ -776,8 +790,8 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use agent_launcher_core::{
-        BackendKind, EventEnvelope, IssueKey, IssueProvider, OutputStream, Repository,
-        RepositoryRemote, RunEvent, RunState, RunSummary, SourceStatus, WorkspaceRef,
+        BackendKind, BackendStatus, EventEnvelope, IssueKey, IssueProvider, OutputStream,
+        Repository, RepositoryRemote, RunEvent, RunState, RunSummary, SourceStatus, WorkspaceRef,
     };
     use chrono::{Duration, Utc};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -827,6 +841,12 @@ mod tests {
                 connected: true,
                 message: None,
             }],
+            backends: vec![BackendStatus {
+                kind: BackendKind::Superset,
+                available: true,
+                manager_running: true,
+                message: None,
+            }],
             selected_backend: Some(BackendKind::Superset),
             selected_agent: "opencode".to_owned(),
             ..RuntimeSnapshot::default()
@@ -865,7 +885,8 @@ mod tests {
         };
         let text = render(112, 28, &normal_snapshot(), &mut app);
         let search_line = text.lines().find(|line| line.contains("Repair█")).unwrap();
-        assert!(search_line.contains("┃ Repair█"));
+        assert!(search_line.contains("Repair█"));
+        assert!(!search_line.contains('┃'));
     }
 
     #[test]
@@ -907,7 +928,7 @@ mod tests {
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains('█'));
         assert!(text.contains("Inbox · 1 source · oldest first"));
-        assert!(text.contains('┃'));
+        assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("age"));
         assert!(text.contains("source"));
@@ -920,6 +941,51 @@ mod tests {
         assert!(text.contains("/repo  ·  github online  ·  superset  ·  opencode"));
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
         assert!(!text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn footer_reports_the_detected_worktree_manager() {
+        let mut snapshot = normal_snapshot();
+        snapshot.backends = vec![
+            BackendStatus {
+                kind: BackendKind::Superset,
+                available: false,
+                manager_running: false,
+                message: Some("not running".to_owned()),
+            },
+            BackendStatus {
+                kind: BackendKind::Herdr,
+                available: false,
+                manager_running: true,
+                message: Some("Herdr 0.7.4 is too old".to_owned()),
+            },
+            BackendStatus {
+                kind: BackendKind::Native,
+                available: true,
+                manager_running: false,
+                message: None,
+            },
+        ];
+        snapshot.selected_backend = Some(BackendKind::Native);
+
+        let text = render(112, 28, &snapshot, &mut AppState::default());
+        assert!(text.contains("/repo  ·  github online  ·  herdr  ·  opencode"));
+    }
+
+    #[test]
+    fn footer_asks_for_a_worktree_manager_when_none_is_detected() {
+        let mut snapshot = normal_snapshot();
+        snapshot.backends = vec![BackendStatus {
+            kind: BackendKind::Native,
+            available: true,
+            manager_running: false,
+            message: None,
+        }];
+        snapshot.selected_backend = Some(BackendKind::Native);
+
+        let text = render(112, 28, &snapshot, &mut AppState::default());
+        assert!(text.contains("please run this in a worktree manager"));
+        assert!(!text.contains(" ·  native  · "));
     }
 
     #[test]
@@ -947,7 +1013,7 @@ mod tests {
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains('█'));
         assert!(text.contains("Inbox · 1 source · oldest first"));
-        assert!(text.contains('┃'));
+        assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("src"));
         assert!(text.contains("Repair"));

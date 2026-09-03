@@ -43,6 +43,8 @@ impl BackendCapabilities {
 pub struct BackendDetection {
     pub backend: BackendKind,
     pub available: bool,
+    #[serde(default)]
+    pub manager_running: bool,
     pub capabilities: BackendCapabilities,
     pub message: Option<String>,
 }
@@ -189,6 +191,7 @@ impl Runner {
                 Err(error) => detections.push(BackendDetection {
                     backend: backend.kind(),
                     available: false,
+                    manager_running: false,
                     capabilities: backend.capabilities(),
                     message: Some(error.to_string()),
                 }),

@@ -170,12 +170,14 @@ impl Backend for SupersetBackend {
             Ok(_) => Ok(BackendDetection {
                 backend: self.kind(),
                 available: true,
+                manager_running: true,
                 capabilities: self.capabilities(),
                 message: None,
             }),
             Err(error) => Ok(BackendDetection {
                 backend: self.kind(),
                 available: false,
+                manager_running: false,
                 capabilities: self.capabilities(),
                 message: Some(error.to_string()),
             }),

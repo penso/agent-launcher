@@ -31,6 +31,8 @@ pub struct SourceStatus {
 pub struct BackendStatus {
     pub kind: BackendKind,
     pub available: bool,
+    #[serde(default)]
+    pub manager_running: bool,
     pub message: Option<String>,
 }
 

@@ -762,6 +762,7 @@ impl RuntimeService {
             .map(|detection| BackendStatus {
                 kind: detection.backend,
                 available: detection.available,
+                manager_running: detection.manager_running,
                 message: detection.message.clone(),
             })
             .collect();
@@ -1185,6 +1186,8 @@ mod tests {
             Ok(BackendDetection {
                 backend: self.kind,
                 available: self.available,
+                manager_running: self.available
+                    && matches!(self.kind, BackendKind::Superset | BackendKind::Herdr),
                 capabilities: self.capabilities(),
                 message: (!self.available).then(|| "mock unavailable".to_owned()),
             })
