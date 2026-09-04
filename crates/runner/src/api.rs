@@ -15,6 +15,7 @@ pub enum Capability {
     SendInput,
     Stop,
     Open,
+    DeleteWorktree,
     Remote,
 }
 
@@ -163,6 +164,13 @@ pub trait Backend: Send + Sync {
     async fn send_input(&self, run_id: &str, text: &str) -> Result<()>;
     async fn stop(&self, run_id: &str) -> Result<()>;
     async fn open(&self, run_id: &str) -> Result<OpenResult>;
+    async fn delete_worktree(&self, run_id: &str, force: bool) -> Result<()>;
+    async fn deletion_pending(&self, _run_id: &str) -> bool {
+        false
+    }
+    async fn finalize_deletion(&self, _run_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct Runner {
@@ -226,6 +234,32 @@ impl Runner {
     pub async fn open(&self, run_id: &str) -> Result<OpenResult> {
         let backend = self.backend_for_run(run_id).await?;
         backend.open(run_id).await
+    }
+
+    pub async fn delete_worktree(
+        &self,
+        backend: BackendKind,
+        run_id: &str,
+        force: bool,
+    ) -> Result<()> {
+        self.backend(backend)?.delete_worktree(run_id, force).await
+    }
+
+    pub fn supports(&self, backend: BackendKind, capability: Capability) -> Result<bool> {
+        Ok(self.backend(backend)?.capabilities().supports(capability))
+    }
+
+    pub async fn deletion_pending(&self, run_id: &str) -> bool {
+        for backend in &self.backends {
+            if backend.deletion_pending(run_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn finalize_deletion(&self, backend: BackendKind, run_id: &str) -> Result<()> {
+        self.backend(backend)?.finalize_deletion(run_id).await
     }
 
     async fn backend_for_run(&self, run_id: &str) -> Result<&Arc<dyn Backend>> {

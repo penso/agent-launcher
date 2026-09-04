@@ -19,15 +19,15 @@ repository identity when selecting or creating a workspace backend.
 
 ## Dispatch
 
-The default backend is `auto`: use Superset when the current repository is registered there,
-otherwise create a native Git worktree and run OpenCode. Additional backends are Herdr and
-Conductor Cloud. Native workspaces can run on an SSH host, optionally waking Daytona, Coder, or an
-Azure VM before connecting.
+The default backend is `auto`: use Superset when the current repository is registered there, then
+Herdr when its server is running and compatible, otherwise create a native Git worktree and run
+OpenCode. Conductor Cloud is also available explicitly. Native workspaces can run on an SSH host,
+optionally waking Daytona, Coder, or an Azure VM before connecting.
 
-Configuration is loaded from the platform configuration directory: typically
-`~/Library/Application Support/agent-launcher/config.toml` on macOS and
-`~/.config/agent-launcher/config.toml` on Linux. See [`config.example.toml`](config.example.toml)
-for all current options. Provider credentials remain in their standard environments:
+Configuration is loaded from `~/.config/agent-launcher/config.toml`. See
+[`config.example.toml`](config.example.toml) for all current options. Provider credentials remain
+in their standard environments. Existing configuration in the platform config directory is used
+as a fallback.
 
 - GitHub: `GH_TOKEN`, then `GITHUB_TOKEN`
 - GitLab: `PRIVATE_TOKEN`, then `GITLAB_TOKEN`
@@ -41,12 +41,15 @@ for all current options. Provider credentials remain in their standard environme
 | `↑` / `↓` | Navigate | Scroll |
 | Type / Backspace | Filter | |
 | `Enter` | Open issue | |
-| `d` | Dispatch | Dispatch |
-| `r` | Refresh | |
+| `Ctrl+G`, then `d` | Dispatch | |
+| `Ctrl+G`, then `r` | Refresh | |
+| `Ctrl+G`, then `s` | Choose sorting | |
+| `d` | | Dispatch |
+| `r` | | Refresh |
 | `i` | | Send input |
 | `o` | | Open workspace/session |
 | `s` | | Stop run |
-| `Esc` | Clear filter or quit | Return to inbox |
+| `Esc` | Quit | Return to inbox |
 | `Ctrl-C` | Quit | Quit |
 
 ## Development

@@ -6,14 +6,18 @@ use ratatui::{
     layout::{Alignment, Margin, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{
+        Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Sparkline,
+    },
 };
 
 use crate::{
     app::{AppState, Route},
     detail::draw_detail,
     format::{age_label, truncate},
-    rows::{DisplayRow, display_rows_matching, hierarchy_prefix},
+    metrics::HostMetrics,
+    rows::{DisplayRow, IssueSort, display_rows_matching, hierarchy_prefix},
     status::{issue_color, issue_icon, run_color, run_label},
     theme,
     widgets::render_bottom_edge,
@@ -23,10 +27,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(theme::bg())), area);
     app.reconcile_detail(snapshot);
+    let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     match app.route {
-        Route::Inbox => draw_inbox(frame, area, snapshot, app),
-        Route::Detail => draw_detail(frame, area, snapshot, app),
+        Route::Inbox => draw_inbox(frame, content, snapshot, app),
+        Route::Detail => draw_detail(frame, content, snapshot, app),
     }
+    if app.route == Route::Inbox {
+        if app.sort_overlay {
+            draw_sort_overlay(frame, content, app);
+        } else if app.command_overlay {
+            draw_command_overlay(frame, content);
+        }
+    }
+    draw_footer(frame, area, snapshot, &app.host_metrics);
 }
 
 fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &mut AppState) {
@@ -35,13 +48,7 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         return;
     }
 
-    let footer_height = 1;
-    let body = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(footer_height),
-    );
+    let body = area;
     let horizontal_margin = if body.width >= 80 {
         2
     } else {
@@ -73,6 +80,18 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         panel_height,
     );
 
+    let top_space = panel.y.saturating_sub(body.y);
+    if panel.width >= 48 && top_space >= 7 {
+        let chart_height = top_space.saturating_sub(2).min(10);
+        let chart = Rect::new(
+            panel.x,
+            body.y + top_space.saturating_sub(chart_height) / 2,
+            panel.width,
+            chart_height,
+        );
+        draw_agent_activity(frame, chart, app);
+    }
+
     let logo = Rect::new(panel.x, panel.y, panel.width, logo_height);
     draw_logo(frame, logo, full_logo);
     let listing_y = logo.y + logo.height + logo_gap;
@@ -96,7 +115,6 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             app,
         );
     }
-    draw_footer(frame, area, snapshot);
 }
 
 fn draw_tiny_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
@@ -107,7 +125,7 @@ fn draw_tiny_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot
     } else {
         app.status_message
             .as_deref()
-            .unwrap_or("agent launcher\nTerminal too small\nr refresh · Esc exit")
+            .unwrap_or("agent launcher\nTerminal too small\nCtrl+G commands")
     };
     frame.render_widget(
         Paragraph::new(message)
@@ -154,6 +172,90 @@ fn draw_logo(frame: &mut Frame<'_>, area: Rect, full: bool) {
     }
 }
 
+fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    if area.width < 8 || area.height < 4 {
+        return;
+    }
+    let panel = Block::new()
+        .style(Style::new().bg(theme::panel()))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "agent activity",
+                Style::new().fg(activity_color(app)).bold(),
+            ),
+            Span::styled("  ·  live", Style::new().fg(theme::muted())),
+        ])),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let status = if inner.width < 64 && app.agent_activity.attention > 0 {
+        format!(
+            "{}w · {}! · 15m",
+            app.agent_activity.working, app.agent_activity.attention
+        )
+    } else if inner.width < 64 && app.agent_activity.working > 0 {
+        format!("{}w · 15m", app.agent_activity.working)
+    } else if inner.width < 64 && app.agent_activity.idle > 0 {
+        format!("{} idle · 15m", app.agent_activity.idle)
+    } else if app.agent_activity.attention > 0 {
+        format!(
+            "{} working · {} attention · 15m",
+            app.agent_activity.working, app.agent_activity.attention
+        )
+    } else if app.agent_activity.working > 0 {
+        format!("{} working · 15m", app.agent_activity.working)
+    } else if app.agent_activity.idle > 0 {
+        format!("{} idle · 15m", app.agent_activity.idle)
+    } else {
+        "quiet · 15m".to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(Style::new().fg(theme::secondary()))
+            .alignment(Alignment::Right),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+
+    let graph = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let data = app.agent_activity.sparkline(graph.width as usize);
+    frame.render_widget(
+        Sparkline::default()
+            .data(&data)
+            .max(100)
+            .style(Style::new().fg(activity_color(app)).bg(theme::panel())),
+        graph,
+    );
+    render_bottom_edge(
+        area,
+        theme::primary(),
+        theme::panel(),
+        theme::bg(),
+        frame.buffer_mut(),
+    );
+}
+
+fn activity_color(app: &AppState) -> ratatui::style::Color {
+    if app.agent_activity.attention > 0 {
+        theme::error()
+    } else if app.agent_activity.working > 0 {
+        theme::primary()
+    } else {
+        theme::secondary()
+    }
+}
+
 fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if area.is_empty() {
         return;
@@ -191,13 +293,14 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
 
     let source_count = snapshot.sources.len();
     let metadata = format!(
-        "{} {} · oldest first",
+        "{} {} · {}",
         source_count,
         if source_count == 1 {
             "source"
         } else {
             "sources"
-        }
+        },
+        app.issue_sort.label()
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -237,7 +340,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         app.visible_rows = 0;
         return;
     }
-    let rows = display_rows_matching(snapshot, &app.search_query);
+    let rows = display_rows_matching(snapshot, &app.search_query, app.issue_sort);
     app.selected = app.selected.min(rows.len().saturating_sub(1));
     let visible_rows = area.height.saturating_sub(1) as usize;
     app.visible_rows = visible_rows;
@@ -501,7 +604,7 @@ fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
             Style::new().fg(theme::error()),
         ));
         lines.push(Line::styled(
-            "Press r to retry.",
+            "Press Ctrl+G, then r to retry.",
             Style::new().fg(theme::muted()),
         ));
     } else if no_source_detected(snapshot) {
@@ -520,7 +623,7 @@ fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
         ));
     } else {
         lines.push(Line::styled(
-            "Inbox clear. Press r to refresh.",
+            "Inbox clear. Press Ctrl+G, then r to refresh.",
             Style::new().fg(theme::muted()),
         ));
     }
@@ -552,7 +655,7 @@ fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
 }
 
 fn draw_legends(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
-    let rows = display_rows_matching(snapshot, &app.search_query);
+    let rows = display_rows_matching(snapshot, &app.search_query, app.issue_sort);
     let start = if rows.is_empty() {
         0
     } else {
@@ -560,9 +663,13 @@ fn draw_legends(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
     };
     let end = (app.scroll + app.visible_rows).min(rows.len());
     let range = if rows.is_empty() {
-        "0 of 0 · oldest first".to_owned()
+        format!("0 of 0 · {}", app.issue_sort.label())
     } else {
-        format!("{start}-{end} of {} · oldest first", rows.len())
+        format!(
+            "{start}-{end} of {} · {}",
+            rows.len(),
+            app.issue_sort.label()
+        )
     };
     let range_width = range.chars().count().min(area.width as usize) as u16;
     let status_width = area.width.saturating_sub(range_width.saturating_add(2));
@@ -633,19 +740,17 @@ fn shortcut_line(width: u16) -> Line<'static> {
         &[
             ("↑/↓", " navigate   "),
             ("Enter", " open   "),
-            ("d", " dispatch   "),
-            ("r", " refresh   "),
-            ("Esc", " clear/exit"),
+            ("Ctrl+G", " commands   "),
+            ("Esc", " quit"),
         ][..]
     } else if width >= 32 {
         &[
             ("↑↓", " nav  "),
             ("Enter", " open  "),
-            ("d", " run  "),
-            ("Esc", " exit"),
+            ("Ctrl+G", " commands"),
         ][..]
     } else {
-        &[("↑↓", " nav  "), ("Enter", " open  "), ("Esc", " exit")][..]
+        &[("Ctrl+G", " commands")][..]
     };
     Line::from(
         shortcuts
@@ -660,7 +765,170 @@ fn shortcut_line(width: u16) -> Line<'static> {
     )
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
+fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect) {
+    let width = area.width.saturating_sub(2).min(64);
+    let height = area.height.saturating_sub(2).min(21);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let panel = Block::new()
+        .style(Style::new().bg(theme::element()))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = panel.inner(popup);
+    frame.render_widget(panel, popup);
+    if inner.is_empty() {
+        return;
+    }
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Ctrl+G", Style::new().fg(theme::primary()).bold()),
+            Span::styled("  launcher commands", Style::new().fg(theme::text()).bold()),
+        ]),
+        Line::styled(
+            "Press a command key · Esc cancels",
+            Style::new().fg(theme::muted()),
+        ),
+        Line::raw(""),
+        command_help_line("d", "dispatch selected issue"),
+        command_help_line("r", "refresh issue sources"),
+        command_help_line("s", "choose issue sorting"),
+        command_help_line("c", "clear search"),
+        command_help_line("q", "quit agent-launcher"),
+        command_help_line("?", "keep this keybind sheet open"),
+        Line::raw(""),
+        Line::styled("Inbox", Style::new().fg(theme::primary()).bold()),
+        command_help_line("↑/↓ · PgUp/PgDn · Home/End", "navigate issues"),
+        command_help_line("Enter", "open issue details"),
+        command_help_line("Backspace", "edit search"),
+        command_help_line("Esc", "quit from the main inbox"),
+        Line::styled("Details", Style::new().fg(theme::primary()).bold()),
+        command_help_line("d · o · s", "dispatch · open · stop"),
+        command_help_line("i · x · Esc", "input · delete · back"),
+        command_help_line("Ctrl+C", "quit from anywhere"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::new().bg(theme::element()))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+    render_bottom_edge(
+        popup,
+        theme::primary(),
+        theme::element(),
+        theme::bg(),
+        frame.buffer_mut(),
+    );
+}
+
+fn command_help_line(key: &'static str, action: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key:<30}"), Style::new().fg(theme::text()).bold()),
+        Span::styled(action, Style::new().fg(theme::muted())),
+    ])
+}
+
+fn draw_sort_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let width = area.width.saturating_sub(2).min(50);
+    let height = area.height.saturating_sub(2).min(11);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let panel = Block::new()
+        .style(Style::new().bg(theme::element()))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = panel.inner(popup);
+    frame.render_widget(panel, popup);
+    if inner.is_empty() {
+        return;
+    }
+
+    let mut lines = vec![
+        Line::styled("Sort issues", Style::new().fg(theme::primary()).bold()),
+        Line::styled(
+            "↑/↓ select · Enter apply · 1-5 · Esc cancel",
+            Style::new().fg(theme::muted()),
+        ),
+        Line::raw(""),
+    ];
+    lines.extend(IssueSort::ALL.iter().enumerate().map(|(index, sort)| {
+        let selected = index == app.sort_cursor;
+        let current = *sort == app.issue_sort;
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} {}  ",
+                    if selected {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    index + 1
+                ),
+                Style::new().fg(if selected {
+                    theme::primary()
+                } else {
+                    theme::muted()
+                }),
+            ),
+            Span::styled(
+                format!("{:<18}", sort.label()),
+                Style::new()
+                    .fg(if selected {
+                        theme::text()
+                    } else {
+                        theme::muted()
+                    })
+                    .add_modifier(if selected {
+                        ratatui::style::Modifier::BOLD
+                    } else {
+                        ratatui::style::Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                if current {
+                    "current"
+                } else {
+                    ""
+                },
+                Style::new().fg(theme::secondary()),
+            ),
+        ])
+    }));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::element())),
+        inner,
+    );
+    render_bottom_edge(
+        popup,
+        theme::primary(),
+        theme::element(),
+        theme::bg(),
+        frame.buffer_mut(),
+    );
+}
+
+fn draw_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    metrics: &HostMetrics,
+) {
     if area.height == 0 {
         return;
     }
@@ -681,7 +949,49 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
         }
     );
     let version = env!("CARGO_PKG_VERSION");
-    let left_width = footer.width.saturating_sub(version.len() as u16 + 1);
+    if metrics.has_samples() && footer.width < 37 {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "CPU {}%  MEM {}%",
+                metrics.cpu_percent, metrics.memory_percent
+            ))
+            .style(Style::new().fg(load_color(metrics.cpu_percent.max(metrics.memory_percent))))
+            .alignment(Alignment::Right),
+            footer,
+        );
+        return;
+    }
+
+    let version_width = version.len() as u16;
+    let version_x = footer.x + footer.width.saturating_sub(version_width);
+    let mut left_width = footer.width.saturating_sub(version_width + 1);
+    if metrics.has_samples() {
+        let available = footer.width.saturating_sub(version_width + 1);
+        let spark_width = (footer.width / 5)
+            .clamp(8, 24)
+            .min(available.saturating_sub(23));
+        let metrics_width = 23 + spark_width;
+        let metrics_x = version_x.saturating_sub(metrics_width + 1);
+        left_width = metrics_x.saturating_sub(footer.x + 1);
+        let cpu_label = format!("CPU {:>3}% 15m ", metrics.cpu_percent);
+        frame.render_widget(
+            Paragraph::new(cpu_label).style(Style::new().fg(load_color(metrics.cpu_percent))),
+            Rect::new(metrics_x, footer.y, 13, 1),
+        );
+        let spark_data = metrics.cpu_sparkline(spark_width as usize);
+        frame.render_widget(
+            Sparkline::default()
+                .data(&spark_data)
+                .max(100)
+                .style(Style::new().fg(load_color(metrics.cpu_percent))),
+            Rect::new(metrics_x + 13, footer.y, spark_width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(format!("  MEM {:>3}%", metrics.memory_percent))
+                .style(Style::new().fg(load_color(metrics.memory_percent))),
+            Rect::new(metrics_x + 13 + spark_width, footer.y, 10, 1),
+        );
+    }
     frame.render_widget(
         Paragraph::new(truncate(&text, left_width as usize)).style(Style::new().fg(theme::muted())),
         Rect::new(footer.x, footer.y, left_width, 1),
@@ -692,6 +1002,16 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) {
             .alignment(Alignment::Right),
         footer,
     );
+}
+
+fn load_color(percent: u64) -> ratatui::style::Color {
+    if percent >= 90 {
+        theme::error()
+    } else if percent >= 70 {
+        theme::primary()
+    } else {
+        theme::muted()
+    }
 }
 
 fn worktree_manager_label(snapshot: &RuntimeSnapshot) -> &'static str {
@@ -792,6 +1112,7 @@ mod tests {
     use agent_launcher_core::{
         BackendKind, BackendStatus, EventEnvelope, IssueKey, IssueProvider, OutputStream,
         Repository, RepositoryRemote, RunEvent, RunState, RunSummary, SourceStatus, WorkspaceRef,
+        WorktreeDeleteAction, WorktreeDeletePreview,
     };
     use chrono::{Duration, Utc};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
@@ -907,7 +1228,7 @@ mod tests {
                     .collect::<String>();
                 (y, line)
             })
-            .find(|(_, line)| line.contains("Repair runtime dispatch"))
+            .find(|(_, line)| line.contains("Issue 31"))
             .unwrap();
         let state = line.rfind("open").unwrap();
         let gutter_x = line[..state].chars().count() as u16 + 4;
@@ -927,20 +1248,88 @@ mod tests {
         assert!(!text.contains("agents · issues · workspaces"));
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains('█'));
-        assert!(text.contains("Inbox · 1 source · oldest first"));
+        assert!(text.contains("Inbox · 1 source · newest first"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("age"));
         assert!(text.contains("source"));
         assert!(text.contains("Repair runtime dispatch"));
-        assert!(text.contains("1-1 of 1 · oldest first"));
+        assert!(text.contains("1-1 of 1 · newest first"));
         assert!(text.contains("Enter open"));
-        assert!(text.contains("d dispatch"));
+        assert!(text.contains("Ctrl+G"));
+        assert!(!text.contains("d dispatch"));
         assert!(!text.contains("Ctrl+P"));
         assert!(!text.contains("Tab"));
         assert!(text.contains("/repo  ·  github online  ·  superset  ·  opencode"));
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
         assert!(!text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn tall_inbox_uses_upper_whitespace_for_live_agent_activity() {
+        let mut snapshot = normal_snapshot();
+        let mut app = AppState::default();
+        app.agent_activity.record(&snapshot);
+
+        let before = render(112, 48, &snapshot, &mut app);
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            id: "run-live".to_owned(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: None,
+            agent: "pi".to_owned(),
+            state: RunState::Running,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        app.agent_activity.record(&snapshot);
+        let after = render(112, 48, &snapshot, &mut app);
+
+        assert!(before.contains("agent activity  ·  live"));
+        assert!(before.contains("quiet · 15m"));
+        assert_ne!(before, after);
+        assert!(after.contains("1 working · 15m"));
+        assert!(after.contains("Repair runtime dispatch"));
+    }
+
+    #[test]
+    fn inbox_command_overlay_lists_prefixed_and_contextual_keybinds() {
+        let mut app = AppState {
+            command_overlay: true,
+            ..AppState::default()
+        };
+
+        let text = render(90, 28, &normal_snapshot(), &mut app);
+
+        assert!(text.contains("Ctrl+G  launcher commands"));
+        assert!(text.contains("dispatch selected issue"));
+        assert!(text.contains("refresh issue sources"));
+        assert!(text.contains("choose issue sorting"));
+        assert!(text.contains("quit agent-launcher"));
+        assert!(text.contains("d · o · s"));
+        assert!(text.contains("i · x · Esc"));
+        assert!(text.contains("Ctrl+C"));
+    }
+
+    #[test]
+    fn sort_overlay_lists_modes_and_marks_the_current_sort() {
+        let mut app = AppState {
+            sort_overlay: true,
+            sort_cursor: 2,
+            issue_sort: IssueSort::Newest,
+            ..AppState::default()
+        };
+
+        let text = render(80, 24, &normal_snapshot(), &mut app);
+
+        assert!(text.contains("Sort issues"));
+        assert!(text.contains("newest first      current"));
+        assert!(text.contains("recently updated"));
+        assert!(text.contains("priority"));
+        assert!(text.contains("title A-Z"));
+        assert!(text.contains("Enter apply"));
     }
 
     #[test]
@@ -970,6 +1359,18 @@ mod tests {
 
         let text = render(112, 28, &snapshot, &mut AppState::default());
         assert!(text.contains("/repo  ·  github online  ·  herdr  ·  opencode"));
+    }
+
+    #[test]
+    fn footer_shows_current_host_load_and_cpu_history() {
+        let mut app = AppState::default();
+        app.host_metrics.record(82, 67);
+
+        let text = render(112, 28, &normal_snapshot(), &mut app);
+
+        assert!(text.contains("CPU  82% 15m"));
+        assert!(text.contains("MEM  67%"));
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
@@ -1012,13 +1413,13 @@ mod tests {
         assert!(text.contains("agent launcher"));
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains('█'));
-        assert!(text.contains("Inbox · 1 source · oldest first"));
+        assert!(text.contains("Inbox · 1 source · newest first"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("src"));
         assert!(text.contains("Repair"));
         assert!(text.contains("Enter open"));
-        assert!(text.contains("Esc"));
+        assert!(text.contains("Ctrl+G"));
     }
 
     #[test]
@@ -1158,6 +1559,61 @@ mod tests {
         assert!(text.contains("Esc cancel"));
         assert!(text.contains('╹'));
         assert!(!text.contains('┌'));
+    }
+
+    #[test]
+    fn delete_overlay_requires_confirmation_and_shows_loss_warnings() {
+        let mut snapshot = normal_snapshot();
+        let now = Utc::now();
+        let run = RunSummary {
+            id: "run-7".to_owned(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: Some(WorkspaceRef {
+                backend: BackendKind::Herdr,
+                id: "workspace-7".to_owned(),
+                host: None,
+                path: Some(PathBuf::from("/work/agent-7")),
+                branch: "agent/7".to_owned(),
+            }),
+            agent: "opencode".to_owned(),
+            state: RunState::Running,
+            message: None,
+            session_id: Some("session-7".to_owned()),
+            started_at: now,
+            updated_at: now,
+        };
+        snapshot.runs.push(run.clone());
+        let mut app = AppState {
+            route: Route::Detail,
+            detail_issue_key: Some(snapshot.issues[0].key.clone()),
+            delete_overlay: Some(crate::app::DeleteOverlay {
+                preview: WorktreeDeletePreview {
+                    run,
+                    action: WorktreeDeleteAction::Delete,
+                    has_uncommitted_changes: true,
+                    has_ignored_files: true,
+                    unpushed_commits: 2,
+                    inspection_warning: None,
+                    inspection_fingerprint: Some("fingerprint".to_owned()),
+                },
+            }),
+            ..AppState::default()
+        };
+
+        let text = render(90, 26, &snapshot, &mut app);
+        assert!(text.contains("Delete worktree"));
+        assert!(text.contains("uncommitted or untracked changes will be lost"));
+        assert!(text.contains("ignored files in this worktree will be lost"));
+        assert!(text.contains("2 commits not found on any remote"));
+        assert!(text.contains("branch is retained"));
+        assert!(text.contains("Enter confirm"));
+        assert!(text.contains("Esc cancel"));
+        assert!(app.delete_confirmation_visible);
+
+        let compact = render(24, 6, &snapshot, &mut app);
+        assert!(compact.contains("Resize to review"));
+        assert!(!compact.contains("Enter confirm"));
+        assert!(!app.delete_confirmation_visible);
     }
 
     #[test]

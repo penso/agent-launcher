@@ -12,5 +12,6 @@ crossterm.workspace = true
 futures-util.workspace = true
 fuzzy-matcher.workspace = true
 ratatui.workspace = true
+sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

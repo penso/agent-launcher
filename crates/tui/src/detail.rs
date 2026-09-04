@@ -1,4 +1,6 @@
-use agent_launcher_core::{EventEnvelope, Issue, RunEvent, RunSummary, RuntimeSnapshot};
+use agent_launcher_core::{
+    EventEnvelope, Issue, RunEvent, RunSummary, RuntimeSnapshot, WorktreeDeleteAction,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Margin, Rect},
@@ -49,10 +51,13 @@ pub(crate) fn draw_detail(
         if app.input_overlay.is_some() {
             draw_input_overlay(frame, area, app);
         }
+        if app.delete_overlay.is_some() {
+            draw_delete_overlay(frame, area, app);
+        }
         return;
     }
 
-    let controls_height = if content.width >= 68 {
+    let controls_height = if content.width >= 82 {
         1
     } else {
         2
@@ -91,6 +96,9 @@ pub(crate) fn draw_detail(
     if app.input_overlay.is_some() {
         draw_input_overlay(frame, area, app);
     }
+    if app.delete_overlay.is_some() {
+        draw_delete_overlay(frame, area, app);
+    }
 }
 
 fn draw_tiny_detail(
@@ -119,7 +127,7 @@ fn draw_tiny_detail(
         ));
     }
     lines.push(Line::styled(
-        "Esc back · d dispatch · i input",
+        "Esc back · d dispatch · i input · x delete",
         Style::new().fg(theme::muted()),
     ));
     frame.render_widget(Paragraph::new(lines), area);
@@ -475,12 +483,13 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
     if area.is_empty() {
         return;
     }
-    let controls = if area.width >= 68 {
+    let controls = if area.width >= 82 {
         vec![control_line(&[
             ("d", " dispatch   "),
             ("o", " open   "),
             ("s", " stop   "),
             ("i", " send input   "),
+            ("x", " delete   "),
             ("↑/↓", " scroll   "),
             ("Esc", " back"),
         ])]
@@ -492,7 +501,7 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
                 ("s", " stop  "),
                 ("i", " input"),
             ]),
-            control_line(&[("↑/↓", " scroll  "), ("Esc", " back")]),
+            control_line(&[("x", " delete  "), ("↑/↓", " scroll  "), ("Esc", " back")]),
         ]
     };
     let mut controls = controls;
@@ -596,6 +605,128 @@ fn draw_input_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     render_bottom_edge(
         popup,
         theme::primary(),
+        theme::element(),
+        theme::bg(),
+        frame.buffer_mut(),
+    );
+}
+
+fn draw_delete_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+    let width = area.width.saturating_sub(2).min(80);
+    let height = area.height.saturating_sub(2).min(14);
+    app.delete_confirmation_visible = width >= 28 && height >= 7;
+    let Some(overlay) = app.delete_overlay.as_ref() else {
+        return;
+    };
+    if width == 0 || height == 0 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let action = match overlay.preview.action {
+        WorktreeDeleteAction::Delete => "Delete worktree",
+        WorktreeDeleteAction::Archive => "Archive workspace",
+    };
+    if !app.delete_confirmation_visible {
+        frame.render_widget(
+            Paragraph::new(format!("{action}?\nResize to review warnings.\nEsc cancel"))
+                .style(Style::new().fg(theme::error()).bg(theme::element()))
+                .alignment(Alignment::Center),
+            popup,
+        );
+        return;
+    }
+
+    let inner = LeftBorderPanel::new()
+        .border_color(theme::error())
+        .content_bg(theme::element())
+        .padding(Padding::new(1, 1, 1, 0))
+        .render(popup, frame.buffer_mut());
+    let preview = &overlay.preview;
+    let workspace = preview.run.workspace.as_ref();
+    let target = workspace
+        .and_then(|workspace| workspace.path.as_ref())
+        .map_or_else(
+            || workspace.map_or_else(|| preview.run.id.clone(), |workspace| workspace.id.clone()),
+            |path| path.display().to_string(),
+        );
+    let mut lines = vec![
+        Line::styled(action, Style::new().fg(theme::error()).bold()),
+        Line::styled(
+            truncate(&target, inner.width as usize),
+            Style::new().fg(theme::text()),
+        ),
+        Line::raw(""),
+    ];
+    if preview.has_uncommitted_changes {
+        lines.push(Line::styled(
+            "WARNING: uncommitted or untracked changes will be lost.",
+            Style::new().fg(theme::error()).bold(),
+        ));
+    }
+    if preview.has_ignored_files {
+        lines.push(Line::styled(
+            "WARNING: ignored files in this worktree will be lost.",
+            Style::new().fg(theme::error()).bold(),
+        ));
+    }
+    if preview.unpushed_commits > 0 {
+        lines.push(Line::styled(
+            format!(
+                "WARNING: {} commit{} not found on any remote will remain only on the retained branch.",
+                preview.unpushed_commits,
+                if preview.unpushed_commits == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(theme::error()).bold(),
+        ));
+    }
+    if let Some(warning) = preview.inspection_warning.as_deref() {
+        lines.push(Line::styled(
+            warning.to_owned(),
+            Style::new().fg(theme::error()),
+        ));
+    }
+    if !preview.has_uncommitted_changes
+        && !preview.has_ignored_files
+        && preview.unpushed_commits == 0
+        && preview.inspection_warning.is_none()
+    {
+        lines.push(Line::styled(
+            "No uncommitted changes or unpushed commits were detected.",
+            Style::new().fg(theme::done()),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        match preview.action {
+            WorktreeDeleteAction::Delete => {
+                "The branch is retained. The worktree and persisted run history are removed."
+            },
+            WorktreeDeleteAction::Archive => {
+                "Conductor archives the workspace. Persisted run history is removed."
+            },
+        },
+        Style::new().fg(theme::muted()),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(control_line(&[
+        ("Enter", " confirm   "),
+        ("Esc", " cancel"),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::new().bg(theme::element())),
+        inner,
+    );
+    render_bottom_edge(
+        popup,
+        theme::error(),
         theme::element(),
         theme::bg(),
         frame.buffer_mut(),

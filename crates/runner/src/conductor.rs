@@ -211,6 +211,7 @@ impl Backend for ConductorBackend {
             Capability::SendInput,
             Capability::Stop,
             Capability::Open,
+            Capability::DeleteWorktree,
             Capability::Remote,
         ])
     }
@@ -311,6 +312,7 @@ impl Backend for ConductorBackend {
                     dispatch_key: dispatch_key.clone(),
                     message_offset: 0,
                 },
+                deletion: None,
             })
             .await?;
         if !created.initial_message_accepted {
@@ -438,6 +440,38 @@ impl Backend for ConductorBackend {
             uri,
             launched: true,
         })
+    }
+
+    async fn delete_worktree(&self, run_id: &str, _force: bool) -> Result<()> {
+        let record = self.record(run_id).await?;
+        let BackendSession::Conductor { workspace_id, .. } = record.session else {
+            unreachable!()
+        };
+        self.registry.begin_deletion(run_id, true).await?;
+        match self
+            .post_empty(api_endpoint(&self.config.api_url, &[
+                "workspaces",
+                &workspace_id,
+                "archive",
+            ])?)
+            .await
+        {
+            Ok(_) | Err(Error::HttpStatus { status: 404, .. }) => {},
+            Err(error) => {
+                let _ = self.registry.cancel_deletion(run_id).await;
+                return Err(error);
+            },
+        }
+        self.registry.complete_deletion(run_id).await?;
+        Ok(())
+    }
+
+    async fn deletion_pending(&self, run_id: &str) -> bool {
+        self.registry.deletion_pending(run_id).await
+    }
+
+    async fn finalize_deletion(&self, run_id: &str) -> Result<()> {
+        self.registry.finalize_deletion(run_id).await
     }
 }
 
@@ -779,6 +813,12 @@ mod tests {
                 .expect("endpoint should build")
                 .as_str(),
             "https://api.conductor.build/me"
+        );
+        assert_eq!(
+            api_endpoint(&base, &["workspaces", "w1", "archive"])
+                .expect("archive endpoint should build")
+                .as_str(),
+            "https://api.conductor.build/v0/workspaces/w1/archive"
         );
     }
 }

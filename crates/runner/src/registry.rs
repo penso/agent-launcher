@@ -24,6 +24,8 @@ pub(crate) enum BackendSession {
         base_url: String,
         remote: bool,
         #[serde(default)]
+        process_id: Option<u32>,
+        #[serde(default)]
         pending_permission_id: Option<String>,
         #[serde(default)]
         pending_question_id: Option<String>,
@@ -54,6 +56,20 @@ pub(crate) enum BackendSession {
 pub(crate) struct RunRecord {
     pub summary: RunSummary,
     pub session: BackendSession,
+    #[serde(default)]
+    pub deletion: Option<DeletionState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct DeletionState {
+    pub force: bool,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDeletion {
+    pub run_id: String,
+    pub completed: bool,
 }
 
 pub(crate) struct ManagedChild {
@@ -102,6 +118,7 @@ impl SessionRegistry {
             .read()
             .await
             .values()
+            .filter(|record| record.deletion.is_none())
             .map(|record| record.summary.clone())
             .collect::<Vec<_>>();
         summaries.sort_by(|left, right| right.started_at.cmp(&left.started_at));
@@ -110,6 +127,27 @@ impl SessionRegistry {
 
     pub async fn summary(&self, run_id: &str) -> Result<RunSummary> {
         Ok(self.get(run_id).await?.summary)
+    }
+
+    pub async fn pending_deletions(&self) -> Vec<PendingDeletion> {
+        let mut deletions = self
+            .records
+            .read()
+            .await
+            .iter()
+            .filter_map(|(run_id, record)| {
+                record.deletion.as_ref().map(|deletion| PendingDeletion {
+                    run_id: run_id.clone(),
+                    completed: deletion.completed,
+                })
+            })
+            .collect::<Vec<_>>();
+        deletions.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        deletions
+    }
+
+    pub async fn finalize_deletion(&self, run_id: &str) -> Result<()> {
+        self.remove(run_id).await.map(|_| ())
     }
 
     pub(crate) async fn insert(&self, record: RunRecord) -> Result<()> {
@@ -148,13 +186,122 @@ impl SessionRegistry {
         let record = records
             .get_mut(&summary.id)
             .ok_or_else(|| Error::RunNotFound(summary.id.clone()))?;
+        if record.deletion.is_some() {
+            return Err(Error::RunNotFound(summary.id));
+        }
+        let previous = record.summary.clone();
         record.summary = summary;
         drop(records);
-        self.persist().await
+        if let Err(error) = self.persist().await {
+            if let Some(record) = self.records.write().await.get_mut(&previous.id) {
+                record.summary = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) async fn update(&self, record: RunRecord) -> Result<()> {
-        self.insert(record).await
+        let mut records = self.records.write().await;
+        let Some(existing) = records.get(&record.summary.id) else {
+            return Err(Error::RunNotFound(record.summary.id));
+        };
+        if existing.deletion.is_some() {
+            return Err(Error::RunNotFound(record.summary.id));
+        }
+        let run_id = record.summary.id.clone();
+        let previous = records.insert(run_id.clone(), record);
+        drop(records);
+        if let Err(error) = self.persist().await {
+            if let Some(previous) = previous {
+                self.records.write().await.insert(run_id, previous);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn begin_deletion(&self, run_id: &str, force: bool) -> Result<()> {
+        let mut records = self.records.write().await;
+        let record = records
+            .get_mut(run_id)
+            .ok_or_else(|| Error::RunNotFound(run_id.to_owned()))?;
+        let previous = record.deletion.clone();
+        record.deletion = Some(DeletionState {
+            force,
+            completed: false,
+        });
+        drop(records);
+        if let Err(error) = self.persist().await {
+            if let Some(record) = self.records.write().await.get_mut(run_id) {
+                record.deletion = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn complete_deletion(&self, run_id: &str) -> Result<()> {
+        let mut records = self.records.write().await;
+        let record = records
+            .get_mut(run_id)
+            .ok_or_else(|| Error::RunNotFound(run_id.to_owned()))?;
+        let previous = record.deletion.clone();
+        let deletion = record
+            .deletion
+            .as_mut()
+            .ok_or_else(|| Error::InvalidRequest(format!("run {run_id} is not being deleted")))?;
+        deletion.completed = true;
+        drop(records);
+        if let Err(error) = self.persist().await {
+            if let Some(record) = self.records.write().await.get_mut(run_id) {
+                record.deletion = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn cancel_deletion(&self, run_id: &str) -> Result<()> {
+        let mut records = self.records.write().await;
+        let record = records
+            .get_mut(run_id)
+            .ok_or_else(|| Error::RunNotFound(run_id.to_owned()))?;
+        let previous = record.deletion.take();
+        drop(records);
+        if let Err(error) = self.persist().await {
+            if let Some(record) = self.records.write().await.get_mut(run_id) {
+                record.deletion = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn deletion_pending(&self, run_id: &str) -> bool {
+        self.records.read().await.get(run_id).is_some_and(|record| {
+            record
+                .deletion
+                .as_ref()
+                .is_some_and(|state| state.completed)
+        })
+    }
+
+    pub(crate) async fn remove(&self, run_id: &str) -> Result<RunRecord> {
+        let record = self
+            .records
+            .write()
+            .await
+            .remove(run_id)
+            .ok_or_else(|| Error::RunNotFound(run_id.to_owned()))?;
+        if let Err(error) = self.persist().await {
+            self.records
+                .write()
+                .await
+                .insert(run_id.to_owned(), record.clone());
+            return Err(error);
+        }
+        Ok(record)
     }
 
     pub(crate) async fn set_state(
@@ -168,7 +315,7 @@ impl SessionRegistry {
         record.summary.message = message;
         record.summary.updated_at = chrono::Utc::now();
         let summary = record.summary.clone();
-        self.insert(record).await?;
+        self.update(record).await?;
         Ok(summary)
     }
 
@@ -230,6 +377,7 @@ mod tests {
                 dispatch_key: dispatch_key.into(),
                 message_offset: 0,
             },
+            deletion: None,
         }
     }
 
@@ -260,6 +408,88 @@ mod tests {
         let _ = fs::remove_file(path).await;
     }
 
+    #[tokio::test]
+    async fn removed_records_stay_removed_and_cannot_be_updated() {
+        let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
+        let registry = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should load");
+        let record = conductor_record("deleted", RunState::Running, "dispatch");
+        registry
+            .insert(record.clone())
+            .await
+            .expect("record should persist");
+
+        registry
+            .remove("deleted")
+            .await
+            .expect("record should be removed");
+
+        assert!(matches!(
+            registry.update(record).await,
+            Err(Error::RunNotFound(id)) if id == "deleted"
+        ));
+        let reloaded = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should reload");
+        assert!(reloaded.summaries().await.is_empty());
+        let _ = fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn deletion_tombstones_survive_restart_until_finalized() {
+        let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
+        let registry = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should load");
+        registry
+            .insert(conductor_record("deleted", RunState::Running, "dispatch"))
+            .await
+            .expect("record should persist");
+        registry
+            .begin_deletion("deleted", true)
+            .await
+            .expect("deletion intent should persist");
+        drop(registry);
+
+        let reloaded = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should reload");
+        assert!(reloaded.summaries().await.is_empty());
+        assert_eq!(reloaded.pending_deletions().await, [PendingDeletion {
+            run_id: "deleted".into(),
+            completed: false,
+        }]);
+        reloaded
+            .cancel_deletion("deleted")
+            .await
+            .expect("incomplete deletion should be recoverable");
+        assert_eq!(reloaded.summaries().await.len(), 1);
+        reloaded
+            .begin_deletion("deleted", true)
+            .await
+            .expect("deletion should restart");
+        reloaded
+            .complete_deletion("deleted")
+            .await
+            .expect("completed tombstone should persist");
+        drop(reloaded);
+
+        let reloaded = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should reload again");
+        assert_eq!(reloaded.pending_deletions().await, [PendingDeletion {
+            run_id: "deleted".into(),
+            completed: true,
+        }]);
+        reloaded
+            .finalize_deletion("deleted")
+            .await
+            .expect("tombstone should be removable");
+        assert!(reloaded.pending_deletions().await.is_empty());
+        let _ = fs::remove_file(path).await;
+    }
+
     #[test]
     fn loads_sessions_persisted_before_cursor_fields_existed() {
         let native: BackendSession = serde_json::from_value(serde_json::json!({
@@ -269,6 +499,7 @@ mod tests {
         }))
         .expect("legacy native session should load");
         assert!(matches!(native, BackendSession::Native {
+            process_id: None,
             pending_permission_id: None,
             pending_question_id: None,
             pending_question_count: 0,
@@ -281,6 +512,7 @@ mod tests {
             "backend": "native",
             "base_url": "http://127.0.0.1:1234/",
             "remote": false,
+            "process_id": 1234,
             "pending_question_id": "que_1",
             "pending_question_count": 2,
             "pending_question_prompt": "Choose a target"
@@ -290,6 +522,7 @@ mod tests {
         assert_eq!(persisted["pending_question_id"], "que_1");
         assert_eq!(persisted["pending_question_count"], 2);
         assert_eq!(persisted["pending_question_prompt"], "Choose a target");
+        assert_eq!(persisted["process_id"], 1234);
 
         let conductor: BackendSession = serde_json::from_value(serde_json::json!({
             "backend": "conductor",
@@ -304,6 +537,46 @@ mod tests {
             message_offset: 0,
             ..
         }));
+    }
+
+    #[tokio::test]
+    async fn native_process_id_survives_registry_reload() {
+        let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
+        let registry = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should load");
+        let mut record = conductor_record("native", RunState::Running, "unused");
+        record.session = BackendSession::Native {
+            base_url: "http://127.0.0.1:31234/".into(),
+            remote: false,
+            process_id: Some(4321),
+            pending_permission_id: None,
+            pending_question_id: None,
+            pending_question_count: 0,
+            pending_question_prompt: None,
+            last_message_id: None,
+        };
+        registry
+            .insert(record)
+            .await
+            .expect("native record should persist");
+        drop(registry);
+
+        let reloaded = SessionRegistry::load(Some(path.clone()))
+            .await
+            .expect("registry should reload");
+        assert!(matches!(
+            reloaded
+                .get("native")
+                .await
+                .expect("record should exist")
+                .session,
+            BackendSession::Native {
+                process_id: Some(4321),
+                ..
+            }
+        ));
+        let _ = fs::remove_file(path).await;
     }
 
     #[tokio::test]

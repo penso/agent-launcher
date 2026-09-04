@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use agent_launcher_core::{BackendKind, Repository, RunState, RunSummary, WorkspaceRef};
 use async_trait::async_trait;
@@ -11,12 +11,17 @@ use uuid::Uuid;
 use crate::{
     Backend, BackendCapabilities, BackendDetection, Capability, DispatchRequest, DispatchResult,
     Error, OpenResult, Result, SessionRegistry, StatusResult,
-    command::{find_string, run_json, run_output},
+    command::{contains_string, find_string, run_json, run_output},
     registry::{BackendSession, RunRecord},
     sanitize_branch, sanitize_workspace_name,
 };
 
 const MINIMUM_HERDR_VERSION: &str = "0.8.2";
+const AGENT_START_ATTEMPTS: usize = 20;
+const AGENT_START_RETRY_DELAY: Duration = Duration::from_millis(100);
+const INITIAL_PROMPT_TIMEOUT_MS: &str = "10000";
+const INITIAL_PROMPT_ATTEMPTS: usize = 2;
+const INITIAL_PROMPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct HerdrConfig {
@@ -64,6 +69,54 @@ impl HerdrBackend {
         let value = self.command(status_args()).await?;
         Ok(serde_json::from_value(value)?)
     }
+
+    async fn start_agent(&self, name: &str, kind: &str, pane: &str) -> Result<()> {
+        let args = agent_start_args(name, kind, pane);
+        let mut last_error = None;
+        for attempt in 1..=AGENT_START_ATTEMPTS {
+            match self.command(args.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    tracing::debug!(attempt, %error, "Herdr agent start failed; retrying");
+                    last_error = Some(error);
+                    if attempt < AGENT_START_ATTEMPTS {
+                        tokio::time::sleep(AGENT_START_RETRY_DELAY).await;
+                    }
+                },
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| Error::InvalidResponse("Herdr agent start did not run".to_owned())))
+    }
+
+    async fn rollback_workspace(&self, workspace_id: &str, cause: Error) -> Error {
+        match self.command(worktree_remove_args(workspace_id, true)).await {
+            Ok(_) => cause,
+            Err(cleanup) => Error::InvalidResponse(format!(
+                "Herdr dispatch failed after creating workspace {workspace_id}: {cause}; workspace rollback failed: {cleanup}"
+            )),
+        }
+    }
+
+    async fn submit_initial_prompt(&self, name: &str, prompt: &str) -> Result<()> {
+        let args = initial_agent_prompt_args(name, prompt);
+        for attempt in 1..=INITIAL_PROMPT_ATTEMPTS {
+            match self.command(args.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if attempt < INITIAL_PROMPT_ATTEMPTS
+                        && retryable_initial_prompt_error(&error) =>
+                {
+                    tracing::debug!(attempt, %error, "Herdr initial prompt had no effect; retrying");
+                    tokio::time::sleep(INITIAL_PROMPT_RETRY_DELAY).await;
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::InvalidResponse(
+            "Herdr initial prompt did not run".to_owned(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -80,6 +133,7 @@ impl Backend for HerdrBackend {
             Capability::SendInput,
             Capability::Stop,
             Capability::Open,
+            Capability::DeleteWorktree,
         ])
     }
 
@@ -132,14 +186,17 @@ impl Backend for HerdrBackend {
         let worktree = parse_worktree(&response)?;
 
         let agent_name = format!("launcher-{}", &Uuid::new_v4().simple().to_string()[..23]);
-        self.command(agent_start_args(
-            &agent_name,
-            &request.agent,
-            &worktree.pane_id,
-        ))
-        .await?;
-        self.command(agent_prompt_args(&agent_name, &request.prompt))
-            .await?;
+        let launch_result: Result<()> = async {
+            self.start_agent(&agent_name, &request.agent, &worktree.pane_id)
+                .await?;
+            self.submit_initial_prompt(&agent_name, &request.prompt)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = launch_result {
+            return Err(self.rollback_workspace(&worktree.workspace_id, error).await);
+        }
 
         let now = Utc::now();
         let run_id = Uuid::new_v4().to_string();
@@ -168,6 +225,7 @@ impl Backend for HerdrBackend {
                     pane_id: worktree.pane_id,
                     agent_name,
                 },
+                deletion: None,
             })
             .await?;
         Ok(DispatchResult {
@@ -282,6 +340,37 @@ impl Backend for HerdrBackend {
             uri,
             launched: true,
         })
+    }
+
+    async fn delete_worktree(&self, run_id: &str, force: bool) -> Result<()> {
+        let record = self.record(run_id).await?;
+        let BackendSession::Herdr { workspace_id, .. } = record.session else {
+            unreachable!()
+        };
+        self.registry.begin_deletion(run_id, force).await?;
+        if let Err(error) = self
+            .command(worktree_remove_args(&workspace_id, force))
+            .await
+        {
+            let removed = self
+                .command(vec!["worktree".into(), "list".into(), "--json".into()])
+                .await
+                .is_ok_and(|worktrees| !contains_string(&worktrees, &workspace_id));
+            if !removed {
+                let _ = self.registry.cancel_deletion(run_id).await;
+                return Err(error);
+            }
+        }
+        self.registry.complete_deletion(run_id).await?;
+        Ok(())
+    }
+
+    async fn deletion_pending(&self, run_id: &str) -> bool {
+        self.registry.deletion_pending(run_id).await
+    }
+
+    async fn finalize_deletion(&self, run_id: &str) -> Result<()> {
+        self.registry.finalize_deletion(run_id).await
     }
 }
 
@@ -435,6 +524,19 @@ fn worktree_create_args(
     args
 }
 
+fn worktree_remove_args(workspace_id: &str, force: bool) -> Vec<OsString> {
+    let mut args = vec![
+        "worktree".into(),
+        "remove".into(),
+        "--workspace".into(),
+        workspace_id.into(),
+    ];
+    if force {
+        args.push("--force".into());
+    }
+    args
+}
+
 fn agent_start_args(name: &str, kind: &str, pane: &str) -> Vec<OsString> {
     vec![
         "agent".into(),
@@ -451,13 +553,39 @@ fn agent_prompt_args(name: &str, prompt: &str) -> Vec<OsString> {
     vec!["agent".into(), "prompt".into(), name.into(), prompt.into()]
 }
 
+fn initial_agent_prompt_args(name: &str, prompt: &str) -> Vec<OsString> {
+    let mut args = agent_prompt_args(name, prompt);
+    args.extend([
+        OsString::from("--wait"),
+        OsString::from("--until"),
+        OsString::from("working"),
+        OsString::from("--until"),
+        OsString::from("blocked"),
+        OsString::from("--until"),
+        OsString::from("done"),
+        OsString::from("--until"),
+        OsString::from("idle"),
+        OsString::from("--timeout"),
+        OsString::from(INITIAL_PROMPT_TIMEOUT_MS),
+    ]);
+    args
+}
+
+fn retryable_initial_prompt_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::CommandFailed { stderr, .. }
+            if stderr.contains("agent_prompt_stalled") || stderr.contains("agent_not_ready")
+    )
+}
+
 fn agent_read_args(name: &str) -> Vec<OsString> {
     vec![
         "agent".into(),
         "read".into(),
         name.into(),
         "--source".into(),
-        "recent-unwrapped".into(),
+        "visible".into(),
         "--lines".into(),
         "240".into(),
     ]
@@ -518,13 +646,33 @@ mod tests {
             args(&["agent", "prompt", "launcher-123", "fix it; safely"])
         );
         assert_eq!(
+            initial_agent_prompt_args("launcher-123", "fix it; safely"),
+            args(&[
+                "agent",
+                "prompt",
+                "launcher-123",
+                "fix it; safely",
+                "--wait",
+                "--until",
+                "working",
+                "--until",
+                "blocked",
+                "--until",
+                "done",
+                "--until",
+                "idle",
+                "--timeout",
+                "10000",
+            ])
+        );
+        assert_eq!(
             agent_read_args("launcher-123"),
             args(&[
                 "agent",
                 "read",
                 "launcher-123",
                 "--source",
-                "recent-unwrapped",
+                "visible",
                 "--lines",
                 "240",
             ])
@@ -534,6 +682,28 @@ mod tests {
             args(&["agent", "send-keys", "launcher-123", "ctrl+c"])
         );
         assert_eq!(status_args(), args(&["status", "--json"]));
+        assert_eq!(
+            worktree_remove_args("w2", true),
+            args(&["worktree", "remove", "--workspace", "w2", "--force"])
+        );
+    }
+
+    #[test]
+    fn retries_only_initial_prompt_failures_that_sent_no_effective_turn() {
+        let error = |stderr: &str| Error::CommandFailed {
+            program: "herdr agent prompt".into(),
+            status: "1".into(),
+            stderr: stderr.into(),
+        };
+        assert!(retryable_initial_prompt_error(&error(
+            r#"{"error":{"code":"agent_prompt_stalled"}}"#
+        )));
+        assert!(retryable_initial_prompt_error(&error(
+            r#"{"error":{"code":"agent_not_ready"}}"#
+        )));
+        assert!(!retryable_initial_prompt_error(&error(
+            r#"{"error":{"code":"agent_blocked"}}"#
+        )));
     }
 
     #[test]

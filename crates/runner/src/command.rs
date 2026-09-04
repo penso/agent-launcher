@@ -124,6 +124,17 @@ pub(crate) fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+pub(crate) fn contains_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Array(values) => values.iter().any(|value| contains_string(value, expected)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| contains_string(value, expected)),
+        _ => false,
+    }
+}
+
 pub(crate) async fn open_uri(uri: &Url, _backend: BackendKind) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = {

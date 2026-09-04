@@ -27,6 +27,17 @@ pub enum Error {
     #[error("issue was not found: {0:?}")]
     IssueNotFound(IssueKey),
 
+    #[error("run was not found: {0}")]
+    RunNotFound(String),
+
+    #[error("run `{0}` has no workspace")]
+    WorkspaceUnavailable(String),
+
+    #[error(
+        "worktree `{0}` changed after it was inspected; review the updated warnings and confirm again"
+    )]
+    WorktreeChanged(String),
+
     #[error("no available backend matches {0}")]
     BackendUnavailable(String),
 

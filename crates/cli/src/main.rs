@@ -16,7 +16,7 @@ use agent_launcher_runner::{
 #[cfg(feature = "tui")]
 use agent_launcher_runtime::RuntimeService;
 #[cfg(feature = "tui")]
-use agent_launcher_store::Store;
+use agent_launcher_store::{Store, StoreError};
 use clap::Parser;
 #[cfg(feature = "tui")]
 use thiserror::Error;
@@ -103,6 +103,18 @@ async fn run(remote_url: Option<&str>) -> Result<(), Error> {
 
     let store = Store::open(data_dir.join("state.sqlite3")).await?;
     let registry = SessionRegistry::load(Some(data_dir.join("runner-sessions.json"))).await?;
+    for deletion in registry.pending_deletions().await {
+        if deletion.completed {
+            if let Err(error) = store.delete_run(&deletion.run_id).await
+                && !matches!(error, StoreError::RunNotFound(_))
+            {
+                return Err(error.into());
+            }
+            registry.finalize_deletion(&deletion.run_id).await?;
+        } else {
+            registry.cancel_deletion(&deletion.run_id).await?;
+        }
+    }
     for run in registry.summaries().await {
         store.upsert_run(&run).await?;
     }
@@ -182,21 +194,39 @@ fn validate_config(config: &AppConfig) -> Result<(), Error> {
 
 #[cfg(feature = "tui")]
 async fn load_config() -> Result<AppConfig, Error> {
-    let path = config_path()?;
-    match tokio::fs::read_to_string(&path).await {
-        Ok(contents) => {
-            toml::from_str(&contents).map_err(|source| Error::ParseConfig { path, source })
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
-        Err(source) => Err(Error::ReadConfig { path, source }),
+    let primary = config_path()?;
+    let mut paths = vec![primary.clone()];
+    if let Some(previous) = dirs::config_dir()
+        .map(|root| root.join("agent-launcher").join("config.toml"))
+        .filter(|path| *path != primary)
+    {
+        paths.push(previous);
     }
+    for path in paths {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => {
+                return toml::from_str(&contents)
+                    .map_err(|source| Error::ParseConfig { path, source });
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(source) => return Err(Error::ReadConfig { path, source }),
+        }
+    }
+    Ok(AppConfig::default())
 }
 
 #[cfg(feature = "tui")]
 fn config_path() -> Result<PathBuf, Error> {
-    dirs::config_dir()
-        .map(|root| root.join("agent-launcher").join("config.toml"))
+    dirs::home_dir()
+        .map(|home| config_path_from_home(&home))
         .ok_or(Error::ConfigDirectoryUnavailable)
+}
+
+#[cfg(feature = "tui")]
+fn config_path_from_home(home: &Path) -> PathBuf {
+    home.join(".config")
+        .join("agent-launcher")
+        .join("config.toml")
 }
 
 #[cfg(feature = "tui")]
@@ -255,5 +285,13 @@ mod tests {
         let mut config = AppConfig::default();
         config.agent.name.clear();
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn uses_the_home_config_directory_on_every_platform() {
+        assert_eq!(
+            config_path_from_home(Path::new("/home/agent")),
+            PathBuf::from("/home/agent/.config/agent-launcher/config.toml")
+        );
     }
 }

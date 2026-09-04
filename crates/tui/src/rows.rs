@@ -3,6 +3,36 @@ use std::collections::{HashMap, HashSet};
 use agent_launcher_core::{Issue, RuntimeSnapshot};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum IssueSort {
+    #[default]
+    Newest,
+    Oldest,
+    RecentlyUpdated,
+    Priority,
+    Title,
+}
+
+impl IssueSort {
+    pub const ALL: [Self; 5] = [
+        Self::Newest,
+        Self::Oldest,
+        Self::RecentlyUpdated,
+        Self::Priority,
+        Self::Title,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "newest first",
+            Self::Oldest => "oldest first",
+            Self::RecentlyUpdated => "recently updated",
+            Self::Priority => "priority",
+            Self::Title => "title A-Z",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DisplayRow {
     pub issue_idx: usize,
@@ -11,17 +41,12 @@ pub(crate) struct DisplayRow {
     pub context_only: bool,
 }
 
-pub(crate) fn display_rows(snapshot: &RuntimeSnapshot) -> Vec<DisplayRow> {
+pub(crate) fn display_rows(snapshot: &RuntimeSnapshot, sort: IssueSort) -> Vec<DisplayRow> {
     let mut ordered = (0..snapshot.issues.len()).collect::<Vec<_>>();
     ordered.sort_by(|&left, &right| {
         let left = &snapshot.issues[left];
         let right = &snapshot.issues[right];
-        match (left.created_at, right.created_at) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => left.identifier.cmp(&right.identifier),
-        }
+        compare_issues(left, right, sort)
     });
 
     let parents = parent_indices(snapshot);
@@ -79,8 +104,12 @@ fn append_tree(
     }
 }
 
-pub(crate) fn display_rows_matching(snapshot: &RuntimeSnapshot, query: &str) -> Vec<DisplayRow> {
-    let rows = display_rows(snapshot);
+pub(crate) fn display_rows_matching(
+    snapshot: &RuntimeSnapshot,
+    query: &str,
+    sort: IssueSort,
+) -> Vec<DisplayRow> {
+    let rows = display_rows(snapshot, sort);
     let query = query.trim();
     if query.is_empty() {
         return rows;
@@ -119,6 +148,45 @@ pub(crate) fn display_rows_matching(snapshot: &RuntimeSnapshot, query: &str) -> 
             })
         })
         .collect()
+}
+
+fn compare_issues(left: &Issue, right: &Issue, sort: IssueSort) -> std::cmp::Ordering {
+    let order = match sort {
+        IssueSort::Newest => compare_optional_dates(left.created_at, right.created_at, true),
+        IssueSort::Oldest => compare_optional_dates(left.created_at, right.created_at, false),
+        IssueSort::RecentlyUpdated => compare_optional_dates(
+            left.updated_at.or(left.created_at),
+            right.updated_at.or(right.created_at),
+            true,
+        ),
+        IssueSort::Priority => match (left.priority, right.priority) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+        IssueSort::Title => left
+            .title
+            .to_ascii_lowercase()
+            .cmp(&right.title.to_ascii_lowercase()),
+    };
+    order
+        .then_with(|| right.created_at.cmp(&left.created_at))
+        .then_with(|| left.key.canonical().cmp(&right.key.canonical()))
+}
+
+fn compare_optional_dates(
+    left: Option<chrono::DateTime<chrono::Utc>>,
+    right: Option<chrono::DateTime<chrono::Utc>>,
+    newest: bool,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) if newest => right.cmp(&left),
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 fn parent_indices(snapshot: &RuntimeSnapshot) -> Vec<Option<usize>> {
@@ -260,7 +328,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
 
-        let rows = display_rows_matching(&snapshot, "authn");
+        let rows = display_rows_matching(&snapshot, "authn", IssueSort::Newest);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].issue_idx, 0);
         assert!(rows[0].context_only);
@@ -285,7 +353,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
 
-        let rows = display_rows(&snapshot);
+        let rows = display_rows(&snapshot, IssueSort::Newest);
         let repository_child = rows.iter().find(|row| row.issue_idx == 2).unwrap();
         let other_child = rows.iter().find(|row| row.issue_idx == 3).unwrap();
         assert_eq!(repository_child.depth, 1);
@@ -298,5 +366,34 @@ mod tests {
             rows.iter().position(|row| row.issue_idx == 3).unwrap(),
             rows.iter().position(|row| row.issue_idx == 1).unwrap() + 1
         );
+    }
+
+    #[test]
+    fn defaults_to_newest_and_supports_alternate_sorting() {
+        let now = chrono::Utc::now();
+        let mut older = issue("1", "Zulu", None);
+        older.created_at = Some(now - chrono::Duration::days(2));
+        older.updated_at = Some(now);
+        older.priority = Some(3);
+        let mut newer = issue("2", "Alpha", None);
+        newer.created_at = Some(now - chrono::Duration::days(1));
+        newer.updated_at = Some(now - chrono::Duration::days(1));
+        newer.priority = Some(1);
+        let snapshot = RuntimeSnapshot {
+            issues: vec![older, newer],
+            ..RuntimeSnapshot::default()
+        };
+        let ids = |sort| {
+            display_rows(&snapshot, sort)
+                .into_iter()
+                .map(|row| snapshot.issues[row.issue_idx].key.native_id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(IssueSort::default()), ["2", "1"]);
+        assert_eq!(ids(IssueSort::Oldest), ["1", "2"]);
+        assert_eq!(ids(IssueSort::RecentlyUpdated), ["1", "2"]);
+        assert_eq!(ids(IssueSort::Priority), ["2", "1"]);
+        assert_eq!(ids(IssueSort::Title), ["2", "1"]);
     }
 }

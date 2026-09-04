@@ -1,6 +1,6 @@
-use std::{io, time::Duration};
+use std::{future::Future, io, time::Duration};
 
-use agent_launcher_core::{RunEvent, RuntimeSnapshot};
+use agent_launcher_core::{RunEvent, RuntimeSnapshot, WorktreeDeletePreview};
 use agent_launcher_runtime::RuntimeHandle;
 use crossterm::{
     cursor::Show,
@@ -16,12 +16,29 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     Error,
-    app::{AppState, InputOverlay, Route},
+    app::{AppState, DeleteOverlay, InputOverlay, Route},
+    metrics::HostMetricsSampler,
     render::draw,
-    rows::display_rows_matching,
+    rows::{IssueSort, display_rows_matching},
 };
 
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+const METRICS_INTERVAL: Duration = Duration::from_secs(5);
+const AGENT_ACTIVITY_INTERVAL: Duration = Duration::from_secs(1);
+
+enum UiActionResult {
+    Runtime {
+        result: agent_launcher_runtime::Result<()>,
+        success: &'static str,
+        close_issue: Option<String>,
+    },
+    DeletePreview {
+        request_id: u64,
+        result: agent_launcher_runtime::Result<Box<WorktreeDeletePreview>>,
+    },
+}
+
+type UiActionSender = tokio::sync::mpsc::UnboundedSender<UiActionResult>;
 
 /// Runs the interactive terminal UI against a live runtime handle.
 pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
@@ -38,8 +55,24 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
     let mut snapshots = runtime.subscribe();
     let mut snapshot = runtime.snapshot();
     let mut app = AppState::default();
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+    if snapshot.initialized {
+        app.agent_activity.initialize(&snapshot);
+    }
+    let mut metrics_sampler = HostMetricsSampler::new();
+    metrics_sampler.sample(&mut app.host_metrics);
     let mut ticker = tokio::time::interval(ANIMATION_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut metrics_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + METRICS_INTERVAL,
+        METRICS_INTERVAL,
+    );
+    metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut agent_activity_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + AGENT_ACTIVITY_INTERVAL,
+        AGENT_ACTIVITY_INTERVAL,
+    );
+    agent_activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let termination = termination_signal();
     tokio::pin!(termination);
     let mut needs_draw = true;
@@ -53,13 +86,13 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                        let should_quit = tokio::select! {
-                            should_quit = handle_key(&mut app, key, &snapshot, &runtime) => should_quit,
-                            signal = &mut termination => {
-                                signal?;
-                                true
-                            },
-                        };
+                        let should_quit = handle_key(
+                            &mut app,
+                            key,
+                            &snapshot,
+                            &runtime,
+                            &action_tx,
+                        );
                         if should_quit {
                             break;
                         }
@@ -75,8 +108,12 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
                 if changed.is_err() {
                     break;
                 }
+                let selected_key = app.selected_issue(&snapshot).map(|issue| issue.key.clone());
                 snapshot = snapshots.borrow().clone();
-                app.clamp_selection(&snapshot);
+                if snapshot.initialized && !app.agent_activity.is_initialized() {
+                    app.agent_activity.initialize(&snapshot);
+                }
+                app.reconcile_selection(&snapshot, selected_key.as_ref());
                 app.reconcile_detail(&snapshot);
                 needs_draw = true;
             }
@@ -85,6 +122,22 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
                 if animation_active(&snapshot, &app) {
                     needs_draw = true;
                 }
+            }
+            _ = metrics_tick.tick() => {
+                metrics_sampler.sample(&mut app.host_metrics);
+                needs_draw = true;
+            }
+            _ = agent_activity_tick.tick() => {
+                if snapshot.initialized {
+                    app.agent_activity.record(&snapshot);
+                }
+                if app.route == Route::Inbox {
+                    needs_draw = true;
+                }
+            }
+            Some(result) = action_rx.recv() => {
+                apply_ui_action_result(&mut app, result);
+                needs_draw = true;
             }
             signal = &mut termination => {
                 signal?;
@@ -104,43 +157,64 @@ fn animation_active(snapshot: &RuntimeSnapshot, app: &AppState) -> bool {
         || snapshot.runs.iter().any(|run| run.state.is_active())
 }
 
-async fn handle_key(
+fn handle_key(
     app: &mut AppState,
     key: KeyEvent,
     snapshot: &RuntimeSnapshot,
     runtime: &RuntimeHandle,
+    actions: &UiActionSender,
 ) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
+    }
+    if app.route == Route::Inbox
+        && key.code == KeyCode::Char('g')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.sort_overlay = false;
+        app.command_overlay = !app.command_overlay;
+        return false;
     }
     if app.reconcile_detail(snapshot) {
         return false;
     }
     if app.input_overlay.is_some() {
-        return handle_input_key(app, key, runtime).await;
+        return handle_input_key(app, key, runtime, actions);
+    }
+    if app.delete_overlay.is_some() {
+        return handle_delete_key(app, key, runtime, actions);
+    }
+    if app.sort_overlay {
+        handle_sort_key(app, key);
+        return false;
+    }
+    if app.command_overlay {
+        return handle_inbox_command_key(app, key, snapshot, runtime, actions);
     }
 
-    let rows = display_rows_matching(snapshot, &app.search_query);
+    let rows = display_rows_matching(snapshot, &app.search_query, app.issue_sort);
     match (app.route, key.code) {
-        (Route::Inbox, KeyCode::Esc) if !app.search_query.is_empty() => {
-            app.search_query.clear();
-            app.selected = 0;
-            app.scroll = 0;
-        },
         (Route::Inbox, KeyCode::Esc) => return true,
         (Route::Detail, KeyCode::Esc) => app.reset_detail(),
         (Route::Inbox, KeyCode::Enter) if !rows.is_empty() => {
             app.open_detail(snapshot);
         },
-        (_, KeyCode::Char('r')) if app.search_query.is_empty() => {
-            set_result(app, runtime.refresh().await, "refresh complete");
+        (Route::Detail, KeyCode::Char('r')) => {
+            app.status_message = Some("refreshing issue sources...".to_owned());
+            let runtime = runtime.clone();
+            spawn_runtime_action(actions, "refresh complete", None, async move {
+                runtime.refresh().await
+            });
         },
-        (_, KeyCode::Char('d')) if app.route == Route::Detail || app.search_query.is_empty() => {
-            dispatch_selected(app, snapshot, runtime).await;
+        (Route::Detail, KeyCode::Char('d')) => {
+            dispatch_selected(app, snapshot, runtime, actions);
         },
-        (Route::Detail, KeyCode::Char('o')) => open_selected(app, snapshot, runtime).await,
-        (Route::Detail, KeyCode::Char('s')) => stop_selected(app, snapshot, runtime).await,
+        (Route::Detail, KeyCode::Char('o')) => open_selected(app, snapshot, runtime, actions),
+        (Route::Detail, KeyCode::Char('s')) => stop_selected(app, snapshot, runtime, actions),
         (Route::Detail, KeyCode::Char('i')) => open_input(app, snapshot),
+        (Route::Detail, KeyCode::Char('x')) => {
+            open_delete(app, snapshot, runtime, actions);
+        },
         (Route::Inbox, KeyCode::Up) => select_previous(app, rows.len()),
         (Route::Inbox, KeyCode::Down) => select_next(app, rows.len()),
         (Route::Inbox, KeyCode::PageUp) => {
@@ -189,7 +263,127 @@ async fn handle_key(
     false
 }
 
-async fn handle_input_key(app: &mut AppState, key: KeyEvent, runtime: &RuntimeHandle) -> bool {
+fn handle_inbox_command_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) -> bool {
+    match key.code {
+        KeyCode::Char('?') => return false,
+        KeyCode::Char('d') => {
+            app.command_overlay = false;
+            dispatch_selected(app, snapshot, runtime, actions);
+        },
+        KeyCode::Char('r') => {
+            app.command_overlay = false;
+            app.status_message = Some("refreshing issue sources...".to_owned());
+            let runtime = runtime.clone();
+            spawn_runtime_action(actions, "refresh complete", None, async move {
+                runtime.refresh().await
+            });
+        },
+        KeyCode::Char('s') => {
+            app.command_overlay = false;
+            app.sort_cursor = IssueSort::ALL
+                .iter()
+                .position(|sort| *sort == app.issue_sort)
+                .unwrap_or_default();
+            app.sort_overlay = true;
+        },
+        KeyCode::Char('c') => {
+            app.command_overlay = false;
+            app.search_query.clear();
+            app.selected = 0;
+            app.scroll = 0;
+            app.status_message = Some("search cleared".to_owned());
+        },
+        KeyCode::Char('q') => return true,
+        KeyCode::Esc => app.command_overlay = false,
+        _ => {
+            app.command_overlay = false;
+            app.status_message = Some("unknown launcher command; press Ctrl+G for keybinds".into());
+        },
+    }
+    false
+}
+
+fn handle_sort_key(app: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.sort_overlay = false,
+        KeyCode::Up => {
+            app.sort_cursor = app
+                .sort_cursor
+                .checked_sub(1)
+                .unwrap_or(IssueSort::ALL.len() - 1);
+        },
+        KeyCode::Down => app.sort_cursor = (app.sort_cursor + 1) % IssueSort::ALL.len(),
+        KeyCode::Enter => apply_sort(app, IssueSort::ALL[app.sort_cursor]),
+        KeyCode::Char(character @ '1'..='5') => {
+            let index = character as usize - '1' as usize;
+            apply_sort(app, IssueSort::ALL[index]);
+        },
+        _ => {},
+    }
+}
+
+fn apply_sort(app: &mut AppState, sort: IssueSort) {
+    app.issue_sort = sort;
+    app.sort_cursor = IssueSort::ALL
+        .iter()
+        .position(|candidate| *candidate == sort)
+        .unwrap_or_default();
+    app.sort_overlay = false;
+    app.selected = 0;
+    app.scroll = 0;
+    app.status_message = Some(format!("issues sorted {}", sort.label()));
+}
+
+fn handle_delete_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.delete_overlay = None;
+            app.delete_confirmation_visible = false;
+        },
+        KeyCode::Enter => {
+            if !app.delete_confirmation_visible {
+                app.status_message = Some("resize the terminal to review deletion warnings".into());
+                return false;
+            }
+            let Some(overlay) = app.delete_overlay.take() else {
+                return false;
+            };
+            let success =
+                if overlay.preview.action == agent_launcher_core::WorktreeDeleteAction::Archive {
+                    "workspace archived and run history deleted"
+                } else {
+                    "worktree and run history deleted"
+                };
+            app.status_message = Some("removing worktree...".to_owned());
+            app.delete_confirmation_visible = false;
+            let runtime = runtime.clone();
+            let close_issue = Some(overlay.preview.run.issue_key.clone());
+            spawn_runtime_action(actions, success, close_issue, async move {
+                runtime.delete_worktree(overlay.preview).await
+            });
+        },
+        _ => {},
+    }
+    false
+}
+
+fn handle_input_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) -> bool {
     match key.code {
         KeyCode::Esc => app.input_overlay = None,
         KeyCode::Enter => {
@@ -200,11 +394,12 @@ async fn handle_input_key(app: &mut AppState, key: KeyEvent, runtime: &RuntimeHa
             if text.is_empty() {
                 app.status_message = Some("input cancelled: response was empty".to_owned());
             } else {
-                set_result(
-                    app,
-                    runtime.send_input(overlay.run_id, text).await,
-                    "input sent",
-                );
+                let text = text.to_owned();
+                app.status_message = Some("sending input...".to_owned());
+                let runtime = runtime.clone();
+                spawn_runtime_action(actions, "input sent", None, async move {
+                    runtime.send_input(overlay.run_id, text).await
+                });
             }
         },
         KeyCode::Backspace => {
@@ -222,10 +417,11 @@ async fn handle_input_key(app: &mut AppState, key: KeyEvent, runtime: &RuntimeHa
     false
 }
 
-async fn dispatch_selected(
+fn dispatch_selected(
     app: &mut AppState,
     snapshot: &RuntimeSnapshot,
     runtime: &RuntimeHandle,
+    actions: &UiActionSender,
 ) {
     let Some(issue_key) = dispatch_target(app, snapshot) else {
         return;
@@ -238,7 +434,11 @@ async fn dispatch_selected(
         app.status_message = Some("run already active".to_owned());
         return;
     }
-    set_result(app, runtime.dispatch(issue_key).await, "agent dispatched");
+    app.status_message = Some("dispatching agent...".to_owned());
+    let runtime = runtime.clone();
+    spawn_runtime_action(actions, "agent dispatched", None, async move {
+        runtime.dispatch(issue_key).await
+    });
 }
 
 fn dispatch_target(
@@ -248,7 +448,12 @@ fn dispatch_target(
     selected_action_issue(app, snapshot).map(|issue| issue.key.clone())
 }
 
-async fn open_selected(app: &mut AppState, snapshot: &RuntimeSnapshot, runtime: &RuntimeHandle) {
+fn open_selected(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) {
     let Some(issue) = selected_action_issue(app, snapshot) else {
         return;
     };
@@ -256,10 +461,19 @@ async fn open_selected(app: &mut AppState, snapshot: &RuntimeSnapshot, runtime: 
         app.status_message = Some("dispatch the issue before opening a workspace".to_owned());
         return;
     };
-    set_result(app, runtime.open(run_id).await, "workspace opened");
+    app.status_message = Some("opening workspace...".to_owned());
+    let runtime = runtime.clone();
+    spawn_runtime_action(actions, "workspace opened", None, async move {
+        runtime.open(run_id).await
+    });
 }
 
-async fn stop_selected(app: &mut AppState, snapshot: &RuntimeSnapshot, runtime: &RuntimeHandle) {
+fn stop_selected(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) {
     let Some(issue) = selected_action_issue(app, snapshot) else {
         return;
     };
@@ -267,7 +481,11 @@ async fn stop_selected(app: &mut AppState, snapshot: &RuntimeSnapshot, runtime: 
         app.status_message = Some("no run to stop".to_owned());
         return;
     };
-    set_result(app, runtime.stop(run_id).await, "run stopped");
+    app.status_message = Some("stopping run...".to_owned());
+    let runtime = runtime.clone();
+    spawn_runtime_action(actions, "run stopped", None, async move {
+        runtime.stop(run_id).await
+    });
 }
 
 fn open_input(app: &mut AppState, snapshot: &RuntimeSnapshot) {
@@ -297,6 +515,33 @@ fn open_input(app: &mut AppState, snapshot: &RuntimeSnapshot) {
     });
 }
 
+fn open_delete(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) {
+    let Some(issue) = selected_action_issue(app, snapshot) else {
+        return;
+    };
+    let Some(run_id) = app.latest_run(snapshot, issue).map(|run| run.id.clone()) else {
+        app.status_message = Some("no worktree to delete".to_owned());
+        return;
+    };
+    app.status_message = Some("checking worktree safety...".to_owned());
+    app.next_request_id = app.next_request_id.wrapping_add(1);
+    let request_id = app.next_request_id;
+    app.delete_preview_request = Some(request_id);
+    let runtime = runtime.clone();
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let _ = actions.send(UiActionResult::DeletePreview {
+            request_id,
+            result: runtime.preview_delete_worktree(run_id).await.map(Box::new),
+        });
+    });
+}
+
 fn selected_action_issue<'a>(
     app: &mut AppState,
     snapshot: &'a RuntimeSnapshot,
@@ -319,6 +564,75 @@ fn set_result(app: &mut AppState, result: agent_launcher_runtime::Result<()>, su
         Ok(()) => success.to_owned(),
         Err(error) => format!("runtime error: {error}"),
     });
+}
+
+fn spawn_runtime_action(
+    actions: &UiActionSender,
+    success: &'static str,
+    close_issue: Option<String>,
+    future: impl Future<Output = agent_launcher_runtime::Result<()>> + Send + 'static,
+) {
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let _ = actions.send(UiActionResult::Runtime {
+            result: future.await,
+            success,
+            close_issue,
+        });
+    });
+}
+
+fn apply_ui_action_result(app: &mut AppState, result: UiActionResult) {
+    match result {
+        UiActionResult::Runtime {
+            result,
+            success,
+            close_issue: Some(issue_key),
+        } => apply_delete_result(app, result, success, &issue_key),
+        UiActionResult::Runtime {
+            result, success, ..
+        } => set_result(app, result, success),
+        UiActionResult::DeletePreview { request_id, .. }
+            if app.delete_preview_request != Some(request_id) => {},
+        UiActionResult::DeletePreview {
+            result: Ok(preview),
+            ..
+        } => {
+            app.delete_preview_request = None;
+            if app.route != Route::Detail {
+                return;
+            }
+            app.status_message = None;
+            app.delete_overlay = Some(DeleteOverlay { preview: *preview });
+        },
+        UiActionResult::DeletePreview {
+            result: Err(error), ..
+        } => {
+            app.delete_preview_request = None;
+            app.status_message = Some(format!("runtime error: {error}"));
+        },
+    }
+}
+
+fn apply_delete_result(
+    app: &mut AppState,
+    result: agent_launcher_runtime::Result<()>,
+    success: &str,
+    issue_key: &str,
+) {
+    match result {
+        Ok(()) => {
+            if app
+                .detail_issue_key
+                .as_ref()
+                .is_some_and(|current| current.canonical() == issue_key)
+            {
+                app.reset_detail();
+            }
+            app.status_message = Some(success.to_owned());
+        },
+        Err(error) => app.status_message = Some(format!("runtime error: {error}")),
+    }
 }
 
 fn select_previous(app: &mut AppState, count: usize) {
@@ -378,7 +692,10 @@ impl Drop for TerminalCleanup {
 
 #[cfg(test)]
 mod tests {
-    use agent_launcher_core::{Issue, IssueKey, IssueProvider, RuntimeSnapshot};
+    use agent_launcher_core::{
+        Issue, IssueKey, IssueProvider, RunState, RunSummary, RuntimeSnapshot,
+        WorktreeDeleteAction, WorktreeDeletePreview,
+    };
     use chrono::{Duration, Utc};
 
     use super::*;
@@ -412,7 +729,7 @@ mod tests {
         let selected = issue("2", Duration::days(1));
         let selected_key = selected.key.clone();
         let mut app = AppState {
-            selected: 1,
+            selected: 0,
             ..AppState::default()
         };
         let initial = RuntimeSnapshot {
@@ -456,6 +773,171 @@ mod tests {
         assert_eq!(
             app.status_message.as_deref(),
             Some("selected issue is no longer available; returned to inbox")
+        );
+    }
+
+    #[test]
+    fn successful_delete_closes_detail_but_failure_keeps_it_open() {
+        let mut app = AppState {
+            route: Route::Detail,
+            detail_issue_key: Some(issue("1", Duration::seconds(0)).key),
+            ..AppState::default()
+        };
+
+        apply_delete_result(
+            &mut app,
+            Err(agent_launcher_runtime::Error::RunNotFound(
+                "run-1".to_owned(),
+            )),
+            "deleted",
+            &issue("1", Duration::zero()).key.canonical(),
+        );
+        assert_eq!(app.route, Route::Detail);
+        assert!(app.status_message.as_deref().unwrap().contains("run-1"));
+
+        apply_delete_result(
+            &mut app,
+            Ok(()),
+            "deleted",
+            &issue("1", Duration::zero()).key.canonical(),
+        );
+        assert_eq!(app.route, Route::Inbox);
+        assert_eq!(app.detail_issue_key, None);
+        assert_eq!(app.status_message.as_deref(), Some("deleted"));
+    }
+
+    #[test]
+    fn completed_delete_does_not_close_an_unrelated_detail() {
+        let current = issue("2", Duration::zero()).key;
+        let deleted = issue("1", Duration::zero()).key.canonical();
+        let mut app = AppState {
+            route: Route::Detail,
+            detail_issue_key: Some(current.clone()),
+            ..AppState::default()
+        };
+
+        apply_delete_result(&mut app, Ok(()), "deleted", &deleted);
+
+        assert_eq!(app.route, Route::Detail);
+        assert_eq!(app.detail_issue_key.as_ref(), Some(&current));
+        assert_eq!(app.status_message.as_deref(), Some("deleted"));
+    }
+
+    #[test]
+    fn cancelled_delete_preview_cannot_reappear_in_the_inbox() {
+        let mut app = AppState {
+            route: Route::Detail,
+            delete_preview_request: Some(7),
+            ..AppState::default()
+        };
+        app.reset_detail();
+        let now = Utc::now();
+        let preview = WorktreeDeletePreview {
+            run: RunSummary {
+                id: "run-1".to_owned(),
+                issue_key: issue("1", Duration::zero()).key.canonical(),
+                workspace: None,
+                agent: "opencode".to_owned(),
+                state: RunState::Running,
+                message: None,
+                session_id: None,
+                started_at: now,
+                updated_at: now,
+            },
+            action: WorktreeDeleteAction::Delete,
+            has_uncommitted_changes: false,
+            has_ignored_files: false,
+            unpushed_commits: 0,
+            inspection_warning: None,
+            inspection_fingerprint: Some("fingerprint".to_owned()),
+        };
+
+        apply_ui_action_result(&mut app, UiActionResult::DeletePreview {
+            request_id: 7,
+            result: Ok(Box::new(preview)),
+        });
+
+        assert_eq!(app.route, Route::Inbox);
+        assert!(app.delete_overlay.is_none());
+        assert!(app.delete_preview_request.is_none());
+    }
+
+    #[test]
+    fn snapshot_reordering_preserves_the_selected_issue() {
+        let selected = issue("2", Duration::days(1));
+        let selected_key = selected.key.clone();
+        let mut app = AppState::default();
+        let initial = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::days(2)), selected],
+            ..RuntimeSnapshot::default()
+        };
+        assert_eq!(
+            app.selected_issue(&initial).map(|issue| &issue.key),
+            Some(&selected_key)
+        );
+
+        let refreshed = RuntimeSnapshot {
+            issues: vec![
+                issue("1", Duration::days(2)),
+                issue("2", Duration::days(1)),
+                issue("3", Duration::zero()),
+            ],
+            ..RuntimeSnapshot::default()
+        };
+        app.reconcile_selection(&refreshed, Some(&selected_key));
+
+        assert_eq!(
+            app.selected_issue(&refreshed).map(|issue| &issue.key),
+            Some(&selected_key)
+        );
+        assert_eq!(app.selected, 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_actions_complete_in_the_background() {
+        let (actions, mut results) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+
+        spawn_runtime_action(&actions, "complete", None, async move {
+            wait.await.expect("test should release the action");
+            Ok(())
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), results.recv())
+                .await
+                .is_err()
+        );
+        release.send(()).expect("action should still be running");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), results.recv())
+            .await
+            .expect("action should finish")
+            .expect("result channel should remain open");
+        assert!(matches!(result, UiActionResult::Runtime {
+            result: Ok(()),
+            success: "complete",
+            close_issue: None,
+        }));
+    }
+
+    #[test]
+    fn applying_sort_resets_navigation_and_reports_the_mode() {
+        let mut app = AppState {
+            selected: 8,
+            scroll: 5,
+            sort_overlay: true,
+            ..AppState::default()
+        };
+
+        apply_sort(&mut app, IssueSort::Priority);
+
+        assert_eq!(app.issue_sort, IssueSort::Priority);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll, 0);
+        assert!(!app.sort_overlay);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("issues sorted priority")
         );
     }
 }

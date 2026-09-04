@@ -344,6 +344,29 @@ impl Store {
         rows.iter().map(run_from_row).collect()
     }
 
+    /// Atomically removes a run and all of its persisted events.
+    pub async fn delete_run(&self, run_id: &str) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&mut *transaction)
+            .await?
+            > 0;
+        if !exists {
+            return Err(StoreError::RunNotFound(run_id.to_owned()));
+        }
+        sqlx::query("DELETE FROM events WHERE run_id = ?")
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM runs WHERE id = ?")
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Appends an event. A duplicate `(run_id, sequence)` is an error.
     pub async fn append_event(&self, event: &EventEnvelope) -> Result<()> {
         let sequence = i64::try_from(event.sequence)
@@ -725,6 +748,34 @@ mod tests {
         assert!(matches!(
             store.update_run(&missing).await,
             Err(StoreError::RunNotFound(id)) if id == "missing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_run_also_deletes_its_events() {
+        let store = Store::in_memory().await.unwrap();
+        let run = run("run-delete", timestamp(1_700_000_100));
+        store.insert_run(&run).await.unwrap();
+        store
+            .append_event(&EventEnvelope {
+                run_id: run.id.clone(),
+                sequence: 0,
+                timestamp: run.updated_at,
+                payload: RunEvent::Output {
+                    stream: OutputStream::Stdout,
+                    text: "temporary output".to_owned(),
+                },
+            })
+            .await
+            .unwrap();
+
+        store.delete_run(&run.id).await.unwrap();
+
+        assert_eq!(store.load_run(&run.id).await.unwrap(), None);
+        assert!(store.load_events(&run.id).await.unwrap().is_empty());
+        assert!(matches!(
+            store.delete_run(&run.id).await,
+            Err(StoreError::RunNotFound(id)) if id == "run-delete"
         ));
     }
 

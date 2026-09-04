@@ -262,12 +262,12 @@ impl NativeBackend {
                 .current_dir(workspace_path);
             command
         };
+        // The server outlives this launcher process so persisted sessions can reconnect on restart.
         // OpenCode permissions remain interactive/default; notably, --auto is never passed.
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
         let mut child = command.spawn().map_err(|error| {
             let executable = if self.config.ssh.is_some() {
                 &self.config.ssh_executable
@@ -283,6 +283,38 @@ impl NativeBackend {
             return Err(error);
         }
         Ok((base_url, child))
+    }
+
+    async fn terminate_managed_process(
+        &self,
+        run_id: &str,
+        process_id: Option<u32>,
+        base_url: &Url,
+        remote: bool,
+    ) -> Result<bool> {
+        if let Some(mut managed_child) = self.registry.children.lock().await.remove(run_id) {
+            if managed_child.child.try_wait()?.is_none() {
+                managed_child.child.kill().await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let Some(process_id) = process_id else {
+            return Ok(false);
+        };
+        let executable = if remote {
+            &self.config.ssh_executable
+        } else {
+            &self.config.opencode_executable
+        };
+        #[cfg(windows)]
+        if !self.health(base_url).await {
+            return Ok(false);
+        }
+        if !managed_process_matches(process_id, executable, base_url, remote).await? {
+            return Ok(false);
+        }
+        terminate_process(process_id).await
     }
 
     async fn wait_for_health(&self, base_url: &Url, child: &mut Child) -> Result<()> {
@@ -477,6 +509,7 @@ impl Backend for NativeBackend {
             Capability::SendInput,
             Capability::Stop,
             Capability::Open,
+            Capability::DeleteWorktree,
         ];
         if self.config.ssh.is_some() {
             capabilities.push(Capability::Remote);
@@ -578,6 +611,7 @@ impl Backend for NativeBackend {
         let (base_url, mut child) = self
             .launch_server(&workspace_path, remote_path.as_deref(), remote_port)
             .await?;
+        let process_id = child.id();
 
         let session_url = endpoint(&base_url, &["session"])?;
         let session = match self
@@ -638,12 +672,14 @@ impl Backend for NativeBackend {
                 session: BackendSession::Native {
                     base_url: base_url.to_string(),
                     remote: self.config.ssh.is_some(),
+                    process_id,
                     pending_permission_id: None,
                     pending_question_id: None,
                     pending_question_count: 0,
                     pending_question_prompt: None,
                     last_message_id: None,
                 },
+                deletion: None,
             })
             .await
         {
@@ -907,9 +943,16 @@ impl Backend for NativeBackend {
 
     async fn stop(&self, run_id: &str) -> Result<()> {
         let record = self.record(run_id).await?;
-        let BackendSession::Native { base_url, .. } = &record.session else {
+        let BackendSession::Native {
+            base_url,
+            remote,
+            process_id,
+            ..
+        } = &record.session
+        else {
             unreachable!()
         };
+        let process_id = *process_id;
         let base_url =
             Url::parse(base_url).map_err(|error| Error::InvalidResponse(error.to_string()))?;
         let abort_error = if self.health(&base_url).await {
@@ -926,16 +969,18 @@ impl Backend for NativeBackend {
             Some(Error::Disconnected(run_id.into()))
         };
         let abort_failed = abort_error.is_some();
-        let managed_child = self.registry.children.lock().await.remove(run_id);
-        if let Some(mut managed_child) = managed_child {
-            managed_child.child.kill().await?;
-        } else if let Some(error) = abort_error {
+        let terminated = self
+            .terminate_managed_process(run_id, process_id, &base_url, *remote)
+            .await?;
+        if !terminated && let Some(error) = abort_error {
             return Err(error);
         }
-        let message = if abort_failed {
+        let message = if terminated && abort_failed {
             "managed OpenCode server or SSH process terminated; session abort was unavailable"
-        } else {
+        } else if terminated {
             "OpenCode session aborted and managed server terminated"
+        } else {
+            "OpenCode session aborted; persisted server process was already unavailable"
         };
         self.registry
             .set_state(run_id, RunState::Cancelled, Some(message.into()))
@@ -958,6 +1003,107 @@ impl Backend for NativeBackend {
             uri,
             launched: true,
         })
+    }
+
+    async fn delete_worktree(&self, run_id: &str, force: bool) -> Result<()> {
+        let record = self.record(run_id).await?;
+        let workspace = record
+            .summary
+            .workspace
+            .as_ref()
+            .ok_or_else(|| Error::InvalidRequest("run has no workspace".into()))?;
+        let path = workspace
+            .path
+            .as_ref()
+            .ok_or_else(|| Error::InvalidRequest("workspace has no path".into()))?;
+        let BackendSession::Native {
+            base_url,
+            remote,
+            process_id,
+            ..
+        } = record.session
+        else {
+            unreachable!()
+        };
+
+        if remote {
+            let ssh = self.config.ssh.as_ref().ok_or_else(|| {
+                Error::InvalidRequest("the run's SSH host is not configured".into())
+            })?;
+            if workspace.host.as_deref() != Some(ssh.destination.as_str()) {
+                return Err(Error::InvalidRequest(format!(
+                    "the run belongs to SSH host {}, not {}",
+                    workspace.host.as_deref().unwrap_or("unknown"),
+                    ssh.destination
+                )));
+            }
+        }
+
+        let base_url =
+            Url::parse(&base_url).map_err(|error| Error::InvalidResponse(error.to_string()))?;
+        self.registry.begin_deletion(run_id, force).await?;
+        let deletion = async {
+            if remote {
+                let ssh = self
+                    .config
+                    .ssh
+                    .as_ref()
+                    .expect("remote SSH configuration was validated above");
+                let workspace = remote_path_expression(path);
+                let force = if force {
+                    " --force"
+                } else {
+                    ""
+                };
+                let script = format!(
+                    "workspace={workspace}; if [ -e \"$workspace\" ]; then git_dir=$(git -C \"$workspace\" rev-parse --path-format=absolute --git-common-dir) && git --git-dir \"$git_dir\" worktree remove{force} -- \"$workspace\"; fi"
+                );
+                let args = ssh_command_args(&ssh.destination, &script, None);
+                run_output(&self.config.ssh_executable, &args, None).await?;
+            } else if tokio::fs::try_exists(path).await? {
+                let common_dir = run_output(
+                    &self.config.git_executable,
+                    &[
+                        "-C".into(),
+                        path.as_os_str().to_owned(),
+                        "rev-parse".into(),
+                        "--path-format=absolute".into(),
+                        "--git-common-dir".into(),
+                    ],
+                    None,
+                )
+                .await?;
+                let mut args = vec![
+                    "--git-dir".into(),
+                    common_dir.trim().into(),
+                    "worktree".into(),
+                    "remove".into(),
+                ];
+                if force {
+                    args.push("--force".into());
+                }
+                args.extend([OsString::from("--"), path.as_os_str().to_owned()]);
+                run_output(&self.config.git_executable, &args, None).await?;
+            }
+            self.terminate_managed_process(run_id, process_id, &base_url, remote)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = deletion {
+            let _ = self.registry.cancel_deletion(run_id).await;
+            return Err(error);
+        }
+        self.registry.complete_deletion(run_id).await?;
+        Ok(())
+    }
+
+    async fn deletion_pending(&self, run_id: &str) -> bool {
+        self.registry.deletion_pending(run_id).await
+    }
+
+    async fn finalize_deletion(&self, run_id: &str) -> Result<()> {
+        self.registry.finalize_deletion(run_id).await
     }
 }
 
@@ -988,6 +1134,136 @@ fn prompt_body(agent: &str, text: &str, model: Option<&str>) -> Value {
 fn available_port() -> Result<u16> {
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
     Ok(listener.local_addr()?.port())
+}
+
+#[cfg(unix)]
+async fn managed_process_matches(
+    process_id: u32,
+    executable: &Path,
+    base_url: &Url,
+    remote: bool,
+) -> Result<bool> {
+    let output = Command::new("ps")
+        .args(["-p", &process_id.to_string(), "-o", "args="])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(command_matches_session(
+        &String::from_utf8_lossy(&output.stdout),
+        executable,
+        base_url,
+        remote,
+    ))
+}
+
+#[cfg(windows)]
+async fn managed_process_matches(
+    process_id: u32,
+    executable: &Path,
+    _base_url: &Url,
+    _remote: bool,
+) -> Result<bool> {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {process_id}"), "/FO", "CSV", "/NH"])
+        .output()
+        .await?;
+    let expected = executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(output.status.success()
+        && !expected.is_empty()
+        && String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains(&expected))
+}
+
+#[cfg(unix)]
+fn command_matches_session(command: &str, executable: &Path, base_url: &Url, remote: bool) -> bool {
+    let Some(executable) = executable.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(port) = base_url.port_or_known_default() else {
+        return false;
+    };
+    let port_signature = if remote {
+        format!("{port}:127.0.0.1:")
+    } else {
+        format!("--port {port}")
+    };
+    command.contains(executable) && command.contains(&port_signature)
+}
+
+#[cfg(unix)]
+async fn process_running(process_id: u32) -> Result<bool> {
+    let probe = run_output(
+        Path::new("kill"),
+        &[OsString::from("-0"), process_id.to_string().into()],
+        None,
+    )
+    .await;
+    match probe {
+        Ok(_) => Ok(true),
+        Err(Error::CommandFailed { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_process(process_id: u32) -> Result<bool> {
+    if !process_running(process_id).await? {
+        return Ok(false);
+    }
+    run_output(
+        Path::new("kill"),
+        &[OsString::from("-TERM"), process_id.to_string().into()],
+        None,
+    )
+    .await?;
+    for _ in 0..50 {
+        sleep(Duration::from_millis(100)).await;
+        if !process_running(process_id).await? {
+            return Ok(true);
+        }
+    }
+    run_output(
+        Path::new("kill"),
+        &[OsString::from("-KILL"), process_id.to_string().into()],
+        None,
+    )
+    .await?;
+    for _ in 0..20 {
+        sleep(Duration::from_millis(100)).await;
+        if !process_running(process_id).await? {
+            return Ok(true);
+        }
+    }
+    Err(Error::Disconnected(format!(
+        "managed process {process_id} did not exit"
+    )))
+}
+
+#[cfg(windows)]
+async fn terminate_process(process_id: u32) -> Result<bool> {
+    match run_output(
+        Path::new("taskkill"),
+        &[
+            OsString::from("/PID"),
+            process_id.to_string().into(),
+            OsString::from("/T"),
+            OsString::from("/F"),
+        ],
+        None,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(Error::CommandFailed { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn endpoint(base: &Url, segments: &[&str]) -> Result<Url> {
@@ -1287,6 +1563,38 @@ mod tests {
             "\"$HOME\"/'.local/share/agent launcher'"
         );
         assert_eq!(remote_path_expression(Path::new("/srv/a b")), "'/srv/a b'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognizes_only_processes_owned_by_the_persisted_session() {
+        let local = Url::parse("http://127.0.0.1:31234/").expect("URL should parse");
+        assert!(command_matches_session(
+            "/opt/bin/opencode serve --hostname 127.0.0.1 --port 31234",
+            Path::new("/opt/bin/opencode"),
+            &local,
+            false,
+        ));
+        assert!(!command_matches_session(
+            "/usr/bin/python --port 31234",
+            Path::new("/opt/bin/opencode"),
+            &local,
+            false,
+        ));
+
+        let remote = Url::parse("http://127.0.0.1:41234/").expect("URL should parse");
+        assert!(command_matches_session(
+            "ssh -L 41234:127.0.0.1:38123 host opencode serve",
+            Path::new("ssh"),
+            &remote,
+            true,
+        ));
+        assert!(!command_matches_session(
+            "ssh host",
+            Path::new("ssh"),
+            &remote,
+            true,
+        ));
     }
 
     #[test]

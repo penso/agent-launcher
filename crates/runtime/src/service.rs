@@ -7,13 +7,16 @@ use std::{
 use agent_launcher_core::{
     AppConfig, BackendConfig, BackendKind, BackendStatus, EventEnvelope, Issue, IssueKey,
     IssueProvider, OutputStream, Repository, RunEvent, RunState, RunSummary, RuntimeCommand,
-    RuntimeSnapshot, SourceStatus,
+    RuntimeSnapshot, SourceStatus, WorktreeDeleteAction, WorktreeDeletePreview,
 };
 use agent_launcher_issues::{IssueSource, SyncCheckpoint, SyncMode};
-use agent_launcher_runner::{BackendDetection, Capability, DispatchRequest, Runner, StatusResult};
-use agent_launcher_store::Store;
+use agent_launcher_runner::{
+    BackendDetection, Capability, DispatchRequest, Error as RunnerError, Runner, StatusResult,
+};
+use agent_launcher_store::{Store, StoreError};
 use chrono::Utc;
 use tokio::{
+    process::Command,
     sync::{mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior},
@@ -96,6 +99,51 @@ impl RuntimeHandle {
     pub async fn open(&self, run_id: impl Into<String>) -> Result<()> {
         self.send(RuntimeCommand::Open {
             run_id: run_id.into(),
+        })
+        .await
+    }
+
+    pub async fn preview_delete_worktree(
+        &self,
+        run_id: impl Into<String>,
+    ) -> Result<WorktreeDeletePreview> {
+        let run_id = run_id.into();
+        let run = self
+            .snapshot()
+            .runs
+            .into_iter()
+            .find(|run| run.id == *run_id)
+            .ok_or_else(|| Error::RunNotFound(run_id.clone()))?;
+        let workspace = run
+            .workspace
+            .as_ref()
+            .ok_or_else(|| Error::WorkspaceUnavailable(run_id.clone()))?;
+        let action = if workspace.backend == BackendKind::Conductor {
+            WorktreeDeleteAction::Archive
+        } else {
+            WorktreeDeleteAction::Delete
+        };
+        let (
+            has_uncommitted_changes,
+            has_ignored_files,
+            unpushed_commits,
+            inspection_warning,
+            inspection_fingerprint,
+        ) = inspect_worktree(workspace.host.as_deref(), workspace.path.as_deref()).await;
+        Ok(WorktreeDeletePreview {
+            run,
+            action,
+            has_uncommitted_changes,
+            has_ignored_files,
+            unpushed_commits,
+            inspection_warning,
+            inspection_fingerprint,
+        })
+    }
+
+    pub async fn delete_worktree(&self, preview: WorktreeDeletePreview) -> Result<()> {
+        self.send(RuntimeCommand::DeleteWorktree {
+            preview: Box::new(preview),
         })
         .await
     }
@@ -318,6 +366,7 @@ impl RuntimeService {
             Err(error) => self.set_error_without_publish("store:runs", error.to_string()),
         }
         self.apply_detections(self.runner.detect(&self.repository).await);
+        self.snapshot.initialized = true;
         self.publish();
     }
 
@@ -389,6 +438,10 @@ impl RuntimeService {
                     .map_err(Error::from);
                 ("open", result, false)
             },
+            RuntimeCommand::DeleteWorktree { preview } => {
+                let result = self.delete_run_worktree(*preview).await;
+                ("delete-worktree", result, false)
+            },
             RuntimeCommand::Shutdown => ("shutdown", Ok(()), true),
         };
         self.record_command_result(name, &result);
@@ -446,6 +499,94 @@ impl RuntimeService {
         self.store.insert_run(&run).await?;
         self.next_sequences.insert(run.id.clone(), 0);
         self.upsert_snapshot_run(run);
+        self.publish();
+        Ok(())
+    }
+
+    async fn delete_run_worktree(&mut self, preview: WorktreeDeletePreview) -> Result<()> {
+        let run_id = &preview.run.id;
+        let run = self
+            .snapshot
+            .runs
+            .iter()
+            .find(|run| run.id.as_str() == run_id.as_str())
+            .cloned()
+            .ok_or_else(|| Error::RunNotFound(run_id.clone()))?;
+        let workspace = run
+            .workspace
+            .as_ref()
+            .ok_or_else(|| Error::WorkspaceUnavailable(run_id.clone()))?;
+        if preview.run.workspace.as_ref() != Some(workspace) {
+            return Err(Error::WorktreeChanged(run_id.clone()));
+        }
+        let (
+            has_uncommitted_changes,
+            has_ignored_files,
+            unpushed_commits,
+            inspection_warning,
+            inspection_fingerprint,
+        ) = inspect_worktree(workspace.host.as_deref(), workspace.path.as_deref()).await;
+        if has_uncommitted_changes != preview.has_uncommitted_changes
+            || has_ignored_files != preview.has_ignored_files
+            || unpushed_commits != preview.unpushed_commits
+            || inspection_warning != preview.inspection_warning
+            || inspection_fingerprint != preview.inspection_fingerprint
+        {
+            return Err(Error::WorktreeChanged(run_id.clone()));
+        }
+        let backend = workspace.backend;
+        let deletion_pending = self.runner.deletion_pending(run_id).await;
+        self.invalidate_run_refresh(run_id);
+        self.run_refresh_pending.remove(run_id);
+        if !deletion_pending
+            && (run.state.is_active() || backend == BackendKind::Native)
+            && backend != BackendKind::Conductor
+            && self.runner.supports(backend, Capability::Stop)?
+        {
+            let stop_result = self.runner.stop(run_id).await;
+            if let Err(error) = stop_result
+                && !(backend == BackendKind::Native
+                    && !run.state.is_active()
+                    && matches!(error, RunnerError::Disconnected(_)))
+            {
+                return Err(error.into());
+            }
+            let stopped_inspection =
+                inspect_worktree(workspace.host.as_deref(), workspace.path.as_deref()).await;
+            if stopped_inspection
+                != (
+                    has_uncommitted_changes,
+                    has_ignored_files,
+                    unpushed_commits,
+                    inspection_warning.clone(),
+                    inspection_fingerprint.clone(),
+                )
+            {
+                return Err(Error::WorktreeChanged(run_id.clone()));
+            }
+        }
+        let force = has_uncommitted_changes
+            || has_ignored_files
+            || unpushed_commits > 0
+            || inspection_warning.is_some();
+        if !deletion_pending {
+            self.runner.delete_worktree(backend, run_id, force).await?;
+        }
+        if let Err(error) = self.store.delete_run(run_id).await
+            && !matches!(error, StoreError::RunNotFound(_))
+        {
+            return Err(error.into());
+        }
+        self.runner.finalize_deletion(backend, run_id).await?;
+
+        self.snapshot.runs.retain(|run| run.id != *run_id);
+        self.snapshot.run_events.remove(run_id);
+        self.run_refresh_unsupported.remove(run_id);
+        self.next_sequences.remove(run_id);
+        self.last_outputs.remove(run_id);
+        self.notified.retain(|(id, _)| id != run_id);
+        self.errors.retain(|key, _| !key.contains(run_id));
+        self.update_error_text();
         self.publish();
         Ok(())
     }
@@ -896,6 +1037,155 @@ impl RuntimeHandle {
     }
 }
 
+async fn inspect_worktree(
+    host: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> (bool, bool, u64, Option<String>, Option<String>) {
+    if let Some(host) = host {
+        return (
+            false,
+            false,
+            0,
+            Some(format!(
+                "Could not inspect changes on remote host {host}; confirm only if remote work may be discarded."
+            )),
+            None,
+        );
+    }
+    let Some(path) = path else {
+        return (
+            false,
+            false,
+            0,
+            Some("The manager did not provide a local worktree path, so changes could not be inspected.".into()),
+            None,
+        );
+    };
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return (
+            false,
+            false,
+            0,
+            Some(format!(
+                "The worktree path {} is unavailable, so changes could not be inspected.",
+                path.display()
+            )),
+            None,
+        );
+    }
+
+    let status = git_output(path, &[
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+        "--ignored=matching",
+    ])
+    .await;
+    let unpushed = git_output(path, &["rev-list", "--count", "HEAD", "--not", "--remotes"]).await;
+    let fingerprint = worktree_fingerprint(path).await;
+    let has_uncommitted_changes = status
+        .as_ref()
+        .is_ok_and(|output| output.lines().any(|line| !line.starts_with("!! ")));
+    let has_ignored_files = status
+        .as_ref()
+        .is_ok_and(|output| output.lines().any(|line| line.starts_with("!! ")));
+    let unpushed_commits = unpushed
+        .as_ref()
+        .ok()
+        .and_then(|output| output.trim().parse().ok())
+        .unwrap_or(0);
+    let inspection_fingerprint = fingerprint.as_ref().ok().cloned();
+    let errors = [status.err(), unpushed.err(), fingerprint.err()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    (
+        has_uncommitted_changes,
+        has_ignored_files,
+        unpushed_commits,
+        (!errors.is_empty())
+            .then(|| format!("Worktree safety inspection was incomplete: {errors}")),
+        inspection_fingerprint,
+    )
+}
+
+async fn worktree_fingerprint(path: &std::path::Path) -> std::result::Result<String, String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    use tokio::io::AsyncReadExt;
+
+    let status = git_output(path, &["status", "--porcelain=v1", "-z"]).await?;
+    let head = git_output(path, &["rev-parse", "HEAD"]).await?;
+    let tracked = git_output(path, &["diff", "--binary", "HEAD", "--"]).await?;
+    let untracked = git_output(path, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
+    let ignored = git_output(path, &[
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+    ])
+    .await?;
+    let mut hasher = DefaultHasher::new();
+    status.hash(&mut hasher);
+    head.hash(&mut hasher);
+    tracked.hash(&mut hasher);
+    for relative in untracked
+        .split('\0')
+        .chain(ignored.split('\0'))
+        .filter(|relative| !relative.is_empty())
+    {
+        relative.hash(&mut hasher);
+        let untracked_path = path.join(relative);
+        let metadata = tokio::fs::symlink_metadata(&untracked_path)
+            .await
+            .map_err(|error| format!("could not inspect untracked file {relative}: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            tokio::fs::read_link(&untracked_path)
+                .await
+                .map_err(|error| format!("could not read untracked symlink {relative}: {error}"))?
+                .hash(&mut hasher);
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "untracked path {relative} is not a regular file or symlink"
+            ));
+        }
+        let mut file = tokio::fs::File::open(&untracked_path)
+            .await
+            .map_err(|error| format!("could not read untracked file {relative}: {error}"))?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|error| format!("could not read untracked file {relative}: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            buffer[..read].hash(&mut hasher);
+        }
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+async fn git_output(path: &std::path::Path, args: &[&str]) -> std::result::Result<String, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .map_err(|_| format!("git {} timed out", args.join(" ")))?
+        .map_err(|error| format!("git {} failed to start: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("git {} failed: {}", args.join(" "), stderr.trim()))
+    }
+}
+
 enum WorkResult {
     Source {
         source_name: String,
@@ -958,9 +1248,13 @@ fn select_backend(
             .any(|detection| detection.backend == kind && detection.available)
     };
     match configured {
-        BackendConfig::Auto => [BackendKind::Superset, BackendKind::Native]
-            .into_iter()
-            .find(|kind| available(*kind)),
+        BackendConfig::Auto => [
+            BackendKind::Superset,
+            BackendKind::Herdr,
+            BackendKind::Native,
+        ]
+        .into_iter()
+        .find(|kind| available(*kind)),
         BackendConfig::Superset => {
             available(BackendKind::Superset).then_some(BackendKind::Superset)
         },
@@ -974,7 +1268,7 @@ fn select_backend(
 
 fn backend_config_name(config: &BackendConfig) -> &'static str {
     match config {
-        BackendConfig::Auto => "auto (Superset or Native)",
+        BackendConfig::Auto => "auto (Superset, Herdr, or Native)",
         BackendConfig::Superset => "superset",
         BackendConfig::Native => "native",
         BackendConfig::Herdr => "herdr",
@@ -1172,6 +1466,7 @@ mod tests {
                 Capability::SendInput,
                 Capability::Stop,
                 Capability::Open,
+                Capability::DeleteWorktree,
             ])
         }
 
@@ -1294,6 +1589,19 @@ mod tests {
                 launched: true,
             })
         }
+
+        async fn delete_worktree(
+            &self,
+            run_id: &str,
+            _force: bool,
+        ) -> agent_launcher_runner::Result<()> {
+            self.runs
+                .lock()
+                .unwrap()
+                .remove(run_id)
+                .map(|_| ())
+                .ok_or_else(|| agent_launcher_runner::Error::RunNotFound(run_id.to_owned()))
+        }
     }
 
     #[derive(Default)]
@@ -1393,6 +1701,28 @@ mod tests {
         })
         .await
         .expect("snapshot condition timed out")
+    }
+
+    #[test]
+    fn auto_prefers_herdr_to_native_when_superset_is_unavailable() {
+        let detection = |backend, available| BackendDetection {
+            backend,
+            available,
+            manager_running: available
+                && matches!(backend, BackendKind::Superset | BackendKind::Herdr),
+            capabilities: BackendCapabilities::default(),
+            message: None,
+        };
+        let detections = [
+            detection(BackendKind::Native, true),
+            detection(BackendKind::Herdr, true),
+            detection(BackendKind::Superset, false),
+        ];
+
+        assert_eq!(
+            select_backend(&BackendConfig::Auto, &detections),
+            Some(BackendKind::Herdr)
+        );
     }
 
     #[tokio::test]
@@ -1640,6 +1970,23 @@ mod tests {
         assert_eq!(superset.inputs.load(Ordering::SeqCst), 1);
         assert_eq!(superset.stops.load(Ordering::SeqCst), 1);
         assert_eq!(superset.opens.load(Ordering::SeqCst), 1);
+
+        let preview = handle.preview_delete_worktree("run-1").await.unwrap();
+        assert_eq!(preview.action, WorktreeDeleteAction::Delete);
+        assert!(preview.inspection_warning.is_some());
+        let mut stale_preview = preview.clone();
+        stale_preview.inspection_warning = Some("stale inspection".to_owned());
+        assert!(matches!(
+            handle.delete_worktree(stale_preview).await,
+            Err(Error::WorktreeChanged(run_id)) if run_id == "run-1"
+        ));
+        assert!(superset.owns_run("run-1").await);
+        handle.delete_worktree(preview).await.unwrap();
+        assert!(handle.snapshot().runs.is_empty());
+        assert!(!handle.snapshot().run_events.contains_key("run-1"));
+        assert_eq!(store.load_run("run-1").await.unwrap(), None);
+        assert!(store.load_events("run-1").await.unwrap().is_empty());
+        assert!(!superset.owns_run("run-1").await);
         handle.shutdown().await.unwrap();
     }
 
@@ -1785,5 +2132,136 @@ mod tests {
         );
         assert!(native.refreshes.load(Ordering::SeqCst) >= 2);
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_cannot_restore_a_deleted_run() {
+        let store = Store::in_memory().await.unwrap();
+        let (source, _) = MockSource::new(vec![Ok(SyncResult {
+            issues: vec![issue("12", "Delete safely", "open")],
+            checkpoint: SyncCheckpoint::default(),
+            mode: SyncMode::Full,
+        })]);
+        let native = MockBackend::new(BackendKind::Native, true);
+        let handle = RuntimeService::start_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[Arc::clone(&native)]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let mut snapshots = handle.subscribe();
+        let ready = wait_for(&mut snapshots, |snapshot| snapshot.issues.len() == 1).await;
+        handle.dispatch(ready.issues[0].key.clone()).await.unwrap();
+
+        let gate = native.block_next_refresh();
+        let refresh_handle = handle.clone();
+        let refresh = tokio::spawn(async move { refresh_handle.refresh().await });
+        gate.started.acquire().await.unwrap().forget();
+
+        let preview = handle.preview_delete_worktree("run-1").await.unwrap();
+        handle.delete_worktree(preview).await.unwrap();
+        assert!(handle.snapshot().runs.is_empty());
+        gate.release.add_permits(1);
+        refresh.await.unwrap().unwrap();
+
+        assert!(handle.snapshot().runs.is_empty());
+        assert_eq!(store.load_run("run-1").await.unwrap(), None);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_backend_deletion_preserves_the_persisted_run() {
+        let store = Store::in_memory().await.unwrap();
+        let (source, _) = MockSource::new(vec![Ok(SyncResult {
+            issues: vec![issue("13", "Keep failed deletion recoverable", "open")],
+            checkpoint: SyncCheckpoint::default(),
+            mode: SyncMode::Full,
+        })]);
+        let native = MockBackend::new(BackendKind::Native, true);
+        let handle = RuntimeService::start_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[Arc::clone(&native)]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let mut snapshots = handle.subscribe();
+        let ready = wait_for(&mut snapshots, |snapshot| snapshot.issues.len() == 1).await;
+        handle.dispatch(ready.issues[0].key.clone()).await.unwrap();
+        let preview = handle.preview_delete_worktree("run-1").await.unwrap();
+        native.runs.lock().unwrap().remove("run-1");
+
+        assert!(handle.delete_worktree(preview).await.is_err());
+        assert!(store.load_run("run-1").await.unwrap().is_some());
+        assert_eq!(handle.snapshot().runs.len(), 1);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worktree_fingerprint_detects_content_changes_with_the_same_status() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-fingerprint-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        tokio::fs::create_dir_all(&path).await.unwrap();
+        let git = |args: &[&str]| {
+            let path = path.clone();
+            let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+            async move {
+                let status = Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .await
+                    .unwrap();
+                assert!(status.success());
+            }
+        };
+        git(&["init", "--quiet"]).await;
+        tokio::fs::write(path.join("tracked.txt"), "initial\n")
+            .await
+            .unwrap();
+        tokio::fs::write(path.join(".gitignore"), "ignored/\n")
+            .await
+            .unwrap();
+        git(&["add", "tracked.txt", ".gitignore"]).await;
+        git(&[
+            "-c",
+            "user.name=Agent Launcher",
+            "-c",
+            "user.email=agent-launcher@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ])
+        .await;
+
+        tokio::fs::write(path.join("tracked.txt"), "first edit\n")
+            .await
+            .unwrap();
+        let first = worktree_fingerprint(&path).await.unwrap();
+        tokio::fs::write(path.join("tracked.txt"), "second edit\n")
+            .await
+            .unwrap();
+        let second = worktree_fingerprint(&path).await.unwrap();
+
+        assert_ne!(first, second);
+        tokio::fs::create_dir(path.join("ignored")).await.unwrap();
+        tokio::fs::write(path.join("ignored/secret.env"), "first secret\n")
+            .await
+            .unwrap();
+        let ignored_first = worktree_fingerprint(&path).await.unwrap();
+        tokio::fs::write(path.join("ignored/secret.env"), "second secret\n")
+            .await
+            .unwrap();
+        let ignored_second = worktree_fingerprint(&path).await.unwrap();
+        assert_ne!(ignored_first, ignored_second);
+        let _ = tokio::fs::remove_dir_all(path).await;
     }
 }

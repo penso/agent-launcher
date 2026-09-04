@@ -71,3 +71,20 @@ pub struct RunSummary {
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorktreeDeleteAction {
+    Delete,
+    Archive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeDeletePreview {
+    pub run: RunSummary,
+    pub action: WorktreeDeleteAction,
+    pub has_uncommitted_changes: bool,
+    pub has_ignored_files: bool,
+    pub unpushed_commits: u64,
+    pub inspection_warning: Option<String>,
+    pub inspection_fingerprint: Option<String>,
+}

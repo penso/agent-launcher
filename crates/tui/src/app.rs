@@ -1,6 +1,10 @@
-use agent_launcher_core::{Issue, IssueKey, RunSummary, RuntimeSnapshot};
+use agent_launcher_core::{Issue, IssueKey, RunSummary, RuntimeSnapshot, WorktreeDeletePreview};
 
-use crate::rows::display_rows_matching;
+use crate::{
+    activity::AgentActivity,
+    metrics::HostMetrics,
+    rows::{IssueSort, display_rows_matching},
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum Route {
@@ -16,6 +20,11 @@ pub(crate) struct InputOverlay {
     pub text: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DeleteOverlay {
+    pub preview: WorktreeDeletePreview,
+}
+
 #[derive(Default)]
 pub(crate) struct AppState {
     pub route: Route,
@@ -27,19 +36,40 @@ pub(crate) struct AppState {
     pub detail_scroll: u16,
     pub detail_scroll_max: u16,
     pub input_overlay: Option<InputOverlay>,
+    pub delete_overlay: Option<DeleteOverlay>,
+    pub delete_confirmation_visible: bool,
+    pub delete_preview_request: Option<u64>,
+    pub next_request_id: u64,
+    pub command_overlay: bool,
+    pub sort_overlay: bool,
+    pub sort_cursor: usize,
+    pub issue_sort: IssueSort,
     pub status_message: Option<String>,
+    pub host_metrics: HostMetrics,
+    pub agent_activity: AgentActivity,
     pub tick: u32,
 }
 
 impl AppState {
-    pub fn clamp_selection(&mut self, snapshot: &RuntimeSnapshot) {
-        let count = display_rows_matching(snapshot, &self.search_query).len();
-        self.selected = self.selected.min(count.saturating_sub(1));
-        self.scroll = self.scroll.min(count.saturating_sub(1));
+    pub fn reconcile_selection(
+        &mut self,
+        snapshot: &RuntimeSnapshot,
+        selected_key: Option<&IssueKey>,
+    ) {
+        let rows = display_rows_matching(snapshot, &self.search_query, self.issue_sort);
+        if let Some(position) = selected_key.and_then(|key| {
+            rows.iter()
+                .position(|row| snapshot.issues[row.issue_idx].key == *key)
+        }) {
+            self.selected = position;
+        } else {
+            self.selected = self.selected.min(rows.len().saturating_sub(1));
+        }
+        self.scroll = self.scroll.min(rows.len().saturating_sub(1));
     }
 
     pub fn selected_issue<'a>(&self, snapshot: &'a RuntimeSnapshot) -> Option<&'a Issue> {
-        display_rows_matching(snapshot, &self.search_query)
+        display_rows_matching(snapshot, &self.search_query, self.issue_sort)
             .get(self.selected)
             .and_then(|row| snapshot.issues.get(row.issue_idx))
     }
@@ -89,5 +119,8 @@ impl AppState {
         self.detail_scroll = 0;
         self.detail_scroll_max = 0;
         self.input_overlay = None;
+        self.delete_overlay = None;
+        self.delete_confirmation_visible = false;
+        self.delete_preview_request = None;
     }
 }

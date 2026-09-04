@@ -1,8 +1,10 @@
+mod activity;
 mod app;
 mod detail;
 mod error;
 mod event_loop;
 mod format;
+mod metrics;
 mod render;
 mod rows;
 mod status;

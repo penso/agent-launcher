@@ -3,10 +3,14 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{BackendKind, EventEnvelope, Issue, IssueKey, Repository, RunSummary};
+use crate::{
+    BackendKind, EventEnvelope, Issue, IssueKey, Repository, RunSummary, WorktreeDeletePreview,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RuntimeSnapshot {
+    #[serde(default)]
+    pub initialized: bool,
     pub repository: Option<Repository>,
     pub issues: Vec<Issue>,
     pub runs: Vec<RunSummary>,
@@ -43,5 +47,6 @@ pub enum RuntimeCommand {
     SendInput { run_id: String, text: String },
     Stop { run_id: String },
     Open { run_id: String },
+    DeleteWorktree { preview: Box<WorktreeDeletePreview> },
     Shutdown,
 }

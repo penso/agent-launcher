@@ -1,4 +1,4 @@
-# auto prefers Superset when its project is configured, then native Git/OpenCode.
+# auto prefers Superset, then Herdr, then native Git/OpenCode.
 # Other values: superset, native, herdr, conductor.
 backend = "auto"
 poll_interval_seconds = 60

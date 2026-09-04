@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     Backend, BackendCapabilities, BackendDetection, Capability, DispatchRequest, DispatchResult,
     Error, OpenResult, Result, SessionRegistry, StatusResult,
-    command::{find_string, open_uri, run_json},
+    command::{contains_string, find_string, open_uri, run_json},
     registry::{BackendSession, RunRecord},
     sanitize_branch, sanitize_workspace_name,
 };
@@ -149,6 +149,7 @@ impl Backend for SupersetBackend {
             Capability::Detect,
             Capability::Dispatch,
             Capability::Open,
+            Capability::DeleteWorktree,
             Capability::Remote,
         ])
     }
@@ -255,6 +256,7 @@ impl Backend for SupersetBackend {
                     session_kind: session_kind.clone(),
                     host: self.config.host.clone(),
                 },
+                deletion: None,
             })
             .await?;
 
@@ -318,6 +320,40 @@ impl Backend for SupersetBackend {
             uri,
             launched: true,
         })
+    }
+
+    async fn delete_worktree(&self, run_id: &str, _force: bool) -> Result<()> {
+        let record = self.record(run_id).await?;
+        let BackendSession::Superset {
+            workspace_id, host, ..
+        } = record.session
+        else {
+            unreachable!()
+        };
+        self.registry.begin_deletion(run_id, true).await?;
+        if let Err(error) = self
+            .command(workspace_delete_args(&workspace_id, host.as_deref()))
+            .await
+        {
+            let removed = self
+                .command(json_command_args(workspace_list_args(host.as_deref())))
+                .await
+                .is_ok_and(|workspaces| !contains_string(&workspaces, &workspace_id));
+            if !removed {
+                let _ = self.registry.cancel_deletion(run_id).await;
+                return Err(error);
+            }
+        }
+        self.registry.complete_deletion(run_id).await?;
+        Ok(())
+    }
+
+    async fn deletion_pending(&self, run_id: &str) -> bool {
+        self.registry.deletion_pending(run_id).await
+    }
+
+    async fn finalize_deletion(&self, run_id: &str) -> Result<()> {
+        self.registry.finalize_deletion(run_id).await
     }
 }
 
@@ -392,6 +428,24 @@ fn projects_list_args() -> Vec<OsString> {
 fn agents_list_args(config: &SupersetConfig) -> Vec<OsString> {
     let mut args = vec!["agents".into(), "list".into()];
     args.extend(target_args(config, true));
+    args
+}
+
+fn workspace_delete_args(workspace_id: &str, host: Option<&str>) -> Vec<OsString> {
+    let mut args = vec!["workspaces".into(), "delete".into(), workspace_id.into()];
+    match host {
+        Some(host) => args.extend([OsString::from("--host"), host.into()]),
+        None => args.push("--local".into()),
+    }
+    args
+}
+
+fn workspace_list_args(host: Option<&str>) -> Vec<OsString> {
+    let mut args = vec!["workspaces".into(), "list".into()];
+    match host {
+        Some(host) => args.extend([OsString::from("--host"), host.into()]),
+        None => args.push("--local".into()),
+    }
     args
 }
 
@@ -470,6 +524,34 @@ mod tests {
             OsString::from("--host"),
             OsString::from("host_123"),
             OsString::from("--json"),
+        ]);
+    }
+
+    #[test]
+    fn builds_explicit_workspace_delete_targets() {
+        assert_eq!(workspace_list_args(None), [
+            OsString::from("workspaces"),
+            OsString::from("list"),
+            OsString::from("--local"),
+        ]);
+        assert_eq!(workspace_list_args(Some("host_1")), [
+            OsString::from("workspaces"),
+            OsString::from("list"),
+            OsString::from("--host"),
+            OsString::from("host_1"),
+        ]);
+        assert_eq!(workspace_delete_args("workspace_1", None), [
+            OsString::from("workspaces"),
+            OsString::from("delete"),
+            OsString::from("workspace_1"),
+            OsString::from("--local"),
+        ]);
+        assert_eq!(workspace_delete_args("workspace_1", Some("host_1")), [
+            OsString::from("workspaces"),
+            OsString::from("delete"),
+            OsString::from("workspace_1"),
+            OsString::from("--host"),
+            OsString::from("host_1"),
         ]);
     }
 
