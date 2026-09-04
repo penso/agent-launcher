@@ -7,6 +7,7 @@ poll_interval_seconds = 60
 # superset_host = "host-id-or-name"
 
 [agent]
+# Backend agent executable or preset. Prompt profiles live in ~/.config/agent-launcher/agents/.
 name = "opencode"
 # model = "provider/model"
 # effort = "high"

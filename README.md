@@ -29,6 +29,24 @@ Configuration is loaded from `~/.config/agent-launcher/config.toml`. See
 in their standard environments. Existing configuration in the platform config directory is used
 as a fallback.
 
+### Prompt profiles
+
+On first launch, agent-launcher creates editable prompt profiles at:
+
+```text
+~/.config/agent-launcher/agents/designer/prompt.md
+~/.config/agent-launcher/agents/implementer/prompt.md
+~/.config/agent-launcher/agents/reviewer/prompt.md
+```
+
+Add another profile by creating `agents/<name>/prompt.md`. When more than one profile is available,
+dispatch opens a chooser; a single profile is selected automatically. Templates use MiniJinja and
+are read from disk for every dispatch, so edits take effect without rebuilding or restarting.
+
+Available variables are `issue_text`, `issue_title`, `issue_link`, `issue_identifier`,
+`issue_repository`, and `issue_provider`. MiniJinja filters and control flow are also available.
+Undefined variables are rejected before an agent is started.
+
 - GitHub: `GH_TOKEN`, then `GITHUB_TOKEN`
 - GitLab: `PRIVATE_TOKEN`, then `GITLAB_TOKEN`
 - Conductor: `CONDUCTOR_API_TOKEN`, then `CONDUCTOR_API_KEY`

@@ -27,6 +27,30 @@ pub enum Error {
     #[error("issue was not found: {0:?}")]
     IssueNotFound(IssueKey),
 
+    #[error("prompt profile was not found: {0}")]
+    PromptProfileNotFound(String),
+
+    #[error("could not read prompt profile `{profile}` at {path}: {source}")]
+    ReadPromptProfile {
+        profile: String,
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("prompt profile `{0}` is empty")]
+    EmptyPromptProfile(String),
+
+    #[error("prompt profile `{0}` rendered an empty prompt for this issue")]
+    EmptyRenderedPrompt(String),
+
+    #[error("could not render prompt profile `{profile}`: {source}")]
+    RenderPromptProfile {
+        profile: String,
+        #[source]
+        source: minijinja::Error,
+    },
+
     #[error("run was not found: {0}")]
     RunNotFound(String),
 

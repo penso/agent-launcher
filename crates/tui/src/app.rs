@@ -25,6 +25,12 @@ pub(crate) struct DeleteOverlay {
     pub preview: WorktreeDeletePreview,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DispatchOverlay {
+    pub issue_key: IssueKey,
+    pub cursor: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct AppState {
     pub route: Route,
@@ -38,6 +44,7 @@ pub(crate) struct AppState {
     pub input_overlay: Option<InputOverlay>,
     pub delete_overlay: Option<DeleteOverlay>,
     pub delete_confirmation_visible: bool,
+    pub dispatch_overlay: Option<DispatchOverlay>,
     pub delete_preview_request: Option<u64>,
     pub next_request_id: u64,
     pub command_overlay: bool,
@@ -100,6 +107,25 @@ impl AppState {
         true
     }
 
+    pub fn reconcile_dispatch(&mut self, snapshot: &RuntimeSnapshot) -> bool {
+        let Some(overlay) = self.dispatch_overlay.as_mut() else {
+            return false;
+        };
+        if !snapshot
+            .issues
+            .iter()
+            .any(|issue| issue.key == overlay.issue_key)
+            || snapshot.prompt_profiles.is_empty()
+        {
+            self.dispatch_overlay = None;
+            self.status_message =
+                Some("prompt chooser closed because its issue or profiles are unavailable".into());
+            return true;
+        }
+        overlay.cursor = overlay.cursor.min(snapshot.prompt_profiles.len() - 1);
+        false
+    }
+
     pub fn latest_run<'a>(
         &self,
         snapshot: &'a RuntimeSnapshot,
@@ -122,5 +148,6 @@ impl AppState {
         self.delete_overlay = None;
         self.delete_confirmation_visible = false;
         self.delete_preview_request = None;
+        self.dispatch_overlay = None;
     }
 }

@@ -10,6 +10,7 @@ agent-launcher-issues = { path = "../issues" }
 agent-launcher-runner = { path = "../runner" }
 agent-launcher-store = { path = "../store" }
 chrono.workspace = true
+minijinja.workspace = true
 notify-rust.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

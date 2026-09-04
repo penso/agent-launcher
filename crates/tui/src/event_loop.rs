@@ -16,7 +16,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     Error,
-    app::{AppState, DeleteOverlay, InputOverlay, Route},
+    app::{AppState, DeleteOverlay, DispatchOverlay, InputOverlay, Route},
     metrics::HostMetricsSampler,
     render::draw,
     rows::{IssueSort, display_rows_matching},
@@ -115,6 +115,7 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
                 }
                 app.reconcile_selection(&snapshot, selected_key.as_ref());
                 app.reconcile_detail(&snapshot);
+                app.reconcile_dispatch(&snapshot);
                 needs_draw = true;
             }
             _ = ticker.tick() => {
@@ -170,6 +171,7 @@ fn handle_key(
     if app.route == Route::Inbox
         && key.code == KeyCode::Char('g')
         && key.modifiers.contains(KeyModifiers::CONTROL)
+        && app.dispatch_overlay.is_none()
     {
         app.sort_overlay = false;
         app.command_overlay = !app.command_overlay;
@@ -178,11 +180,17 @@ fn handle_key(
     if app.reconcile_detail(snapshot) {
         return false;
     }
+    if app.reconcile_dispatch(snapshot) {
+        return false;
+    }
     if app.input_overlay.is_some() {
         return handle_input_key(app, key, runtime, actions);
     }
     if app.delete_overlay.is_some() {
         return handle_delete_key(app, key, runtime, actions);
+    }
+    if app.dispatch_overlay.is_some() {
+        return handle_dispatch_key(app, key, snapshot, runtime, actions);
     }
     if app.sort_overlay {
         handle_sort_key(app, key);
@@ -434,10 +442,88 @@ fn dispatch_selected(
         app.status_message = Some("run already active".to_owned());
         return;
     }
-    app.status_message = Some("dispatching agent...".to_owned());
+    if snapshot.prompt_profiles.len() > 1 {
+        app.status_message = None;
+        app.dispatch_overlay = Some(DispatchOverlay {
+            issue_key,
+            cursor: 0,
+        });
+        return;
+    }
+    let profile = snapshot.prompt_profiles.first().cloned();
+    start_dispatch(app, runtime, actions, issue_key, profile);
+}
+
+fn handle_dispatch_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) -> bool {
+    let profile_count = snapshot.prompt_profiles.len();
+    match key.code {
+        KeyCode::Esc => app.dispatch_overlay = None,
+        KeyCode::Up if profile_count > 0 => {
+            if let Some(overlay) = app.dispatch_overlay.as_mut() {
+                overlay.cursor = overlay.cursor.checked_sub(1).unwrap_or(profile_count - 1);
+            }
+        },
+        KeyCode::Down if profile_count > 0 => {
+            if let Some(overlay) = app.dispatch_overlay.as_mut() {
+                overlay.cursor = (overlay.cursor + 1) % profile_count;
+            }
+        },
+        KeyCode::Char(character @ '1'..='9') => {
+            let index = character as usize - '1' as usize;
+            if index < profile_count {
+                dispatch_from_overlay(app, snapshot, runtime, actions, index);
+            }
+        },
+        KeyCode::Enter if profile_count > 0 => {
+            let index = app
+                .dispatch_overlay
+                .as_ref()
+                .map_or(0, |overlay| overlay.cursor.min(profile_count - 1));
+            dispatch_from_overlay(app, snapshot, runtime, actions, index);
+        },
+        _ => {},
+    }
+    false
+}
+
+fn dispatch_from_overlay(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+    profile_index: usize,
+) {
+    let Some(overlay) = app.dispatch_overlay.take() else {
+        return;
+    };
+    let Some(profile) = snapshot.prompt_profiles.get(profile_index).cloned() else {
+        app.status_message = Some("selected prompt profile is no longer available".into());
+        return;
+    };
+    start_dispatch(app, runtime, actions, overlay.issue_key, Some(profile));
+}
+
+fn start_dispatch(
+    app: &mut AppState,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+    issue_key: agent_launcher_core::IssueKey,
+    profile: Option<String>,
+) {
+    let status = profile.as_deref().map_or_else(
+        || "dispatching agent...".to_owned(),
+        |profile| format!("dispatching {profile}..."),
+    );
+    app.status_message = Some(status);
     let runtime = runtime.clone();
     spawn_runtime_action(actions, "agent dispatched", None, async move {
-        runtime.dispatch(issue_key).await
+        runtime.dispatch(issue_key, profile).await
     });
 }
 
@@ -891,6 +977,27 @@ mod tests {
             Some(&selected_key)
         );
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn prompt_chooser_closes_if_its_issue_disappears() {
+        let selected = issue("2", Duration::zero());
+        let mut app = AppState {
+            dispatch_overlay: Some(DispatchOverlay {
+                issue_key: selected.key,
+                cursor: 0,
+            }),
+            ..AppState::default()
+        };
+        let snapshot = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::zero())],
+            prompt_profiles: vec!["implementer".to_owned(), "reviewer".to_owned()],
+            ..RuntimeSnapshot::default()
+        };
+
+        assert!(app.reconcile_dispatch(&snapshot));
+        assert!(app.dispatch_overlay.is_none());
+        assert!(app.status_message.as_deref().unwrap().contains("closed"));
     }
 
     #[tokio::test]

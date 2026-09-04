@@ -5,7 +5,7 @@ use std::{
 };
 
 #[cfg(feature = "tui")]
-use agent_launcher_core::AppConfig;
+use agent_launcher_core::{AppConfig, PromptProfile};
 #[cfg(feature = "tui")]
 use agent_launcher_issues::sources_from_cwd_with_remote;
 #[cfg(feature = "tui")]
@@ -59,6 +59,14 @@ enum Error {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("could not {operation} prompt profiles at {path}: {source}")]
+    PromptProfiles {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("prompt profile `{name}` at {path} is empty")]
+    EmptyPromptProfile { name: String, path: PathBuf },
     #[error("could not create data directory at {path}: {source}")]
     CreateDataDirectory {
         path: PathBuf,
@@ -91,7 +99,8 @@ async fn main() {
 async fn run(remote_url: Option<&str>) -> Result<(), Error> {
     let cwd = std::env::current_dir().map_err(Error::CurrentDirectory)?;
     let (repository, sources) = sources_from_cwd_with_remote(&cwd, remote_url).await?;
-    let config = load_config().await?;
+    let mut config = load_config().await?;
+    config.prompt_profiles = load_prompt_profiles(&config_root()?).await?;
     validate_config(&config)?;
     let data_dir = repository_data_dir(&repository.git_dir)?;
     tokio::fs::create_dir_all(&data_dir)
@@ -217,16 +226,141 @@ async fn load_config() -> Result<AppConfig, Error> {
 
 #[cfg(feature = "tui")]
 fn config_path() -> Result<PathBuf, Error> {
+    Ok(config_root()?.join("config.toml"))
+}
+
+#[cfg(feature = "tui")]
+fn config_root() -> Result<PathBuf, Error> {
     dirs::home_dir()
-        .map(|home| config_path_from_home(&home))
+        .map(|home| config_root_from_home(&home))
         .ok_or(Error::ConfigDirectoryUnavailable)
 }
 
 #[cfg(feature = "tui")]
-fn config_path_from_home(home: &Path) -> PathBuf {
-    home.join(".config")
-        .join("agent-launcher")
-        .join("config.toml")
+fn config_root_from_home(home: &Path) -> PathBuf {
+    home.join(".config").join("agent-launcher")
+}
+
+#[cfg(feature = "tui")]
+async fn load_prompt_profiles(config_root: &Path) -> Result<Vec<PromptProfile>, Error> {
+    const DEFAULTS: [(&str, &str); 3] = [
+        ("designer", include_str!("../../../prompts/designer.md")),
+        (
+            "implementer",
+            include_str!("../../../prompts/implementer.md"),
+        ),
+        ("reviewer", include_str!("../../../prompts/reviewer.md")),
+    ];
+
+    let agents_dir = config_root.join("agents");
+    tokio::fs::create_dir_all(config_root)
+        .await
+        .map_err(|source| Error::PromptProfiles {
+            operation: "create",
+            path: config_root.to_owned(),
+            source,
+        })?;
+    if !tokio::fs::try_exists(&agents_dir)
+        .await
+        .map_err(|source| Error::PromptProfiles {
+            operation: "inspect",
+            path: agents_dir.clone(),
+            source,
+        })?
+    {
+        let temporary = config_root.join(format!(".agents.tmp-{}", Uuid::new_v4()));
+        for (name, template) in DEFAULTS {
+            let directory = temporary.join(name);
+            tokio::fs::create_dir_all(&directory)
+                .await
+                .map_err(|source| Error::PromptProfiles {
+                    operation: "create",
+                    path: directory.clone(),
+                    source,
+                })?;
+            let path = directory.join("prompt.md");
+            tokio::fs::write(&path, template)
+                .await
+                .map_err(|source| Error::PromptProfiles {
+                    operation: "write",
+                    path,
+                    source,
+                })?;
+        }
+        if let Err(source) = tokio::fs::rename(&temporary, &agents_dir).await {
+            let won_race = tokio::fs::try_exists(&agents_dir).await.unwrap_or(false);
+            let _ = tokio::fs::remove_dir_all(&temporary).await;
+            if !won_race {
+                return Err(Error::PromptProfiles {
+                    operation: "initialize",
+                    path: agents_dir.clone(),
+                    source,
+                });
+            }
+        }
+    }
+
+    let mut entries =
+        tokio::fs::read_dir(&agents_dir)
+            .await
+            .map_err(|source| Error::PromptProfiles {
+                operation: "read",
+                path: agents_dir.clone(),
+                source,
+            })?;
+    let mut profiles = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| Error::PromptProfiles {
+            operation: "read",
+            path: agents_dir.clone(),
+            source,
+        })?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|source| Error::PromptProfiles {
+                operation: "inspect",
+                path: entry.path(),
+                source,
+            })?;
+        let directory = entry.path();
+        let is_directory = file_type.is_dir()
+            || (file_type.is_symlink()
+                && tokio::fs::metadata(&directory)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir()));
+        if !is_directory {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = directory.join("prompt.md");
+        let template = match tokio::fs::read_to_string(&path).await {
+            Ok(template) => template,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::PromptProfiles {
+                    operation: "read",
+                    path,
+                    source,
+                });
+            },
+        };
+        if template.trim().is_empty() {
+            return Err(Error::EmptyPromptProfile { name, path });
+        }
+        profiles.push(PromptProfile { name, path });
+    }
+    profiles.sort_by(|left, right| {
+        let left_default = left.name != "implementer";
+        let right_default = right.name != "implementer";
+        left_default
+            .cmp(&right_default)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(profiles)
 }
 
 #[cfg(feature = "tui")]
@@ -290,8 +424,51 @@ mod tests {
     #[test]
     fn uses_the_home_config_directory_on_every_platform() {
         assert_eq!(
-            config_path_from_home(Path::new("/home/agent")),
+            config_root_from_home(Path::new("/home/agent")).join("config.toml"),
             PathBuf::from("/home/agent/.config/agent-launcher/config.toml")
         );
+    }
+
+    #[tokio::test]
+    async fn seeds_preserves_and_discovers_prompt_profiles() {
+        let root = std::env::temp_dir().join(format!("agent-launcher-prompts-{}", Uuid::new_v4()));
+        let (seeded, concurrent) =
+            tokio::join!(load_prompt_profiles(&root), load_prompt_profiles(&root));
+        let seeded = seeded.unwrap();
+        assert_eq!(seeded, concurrent.unwrap());
+        assert_eq!(
+            seeded
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["implementer", "designer", "reviewer"]
+        );
+        let reviewer = root.join("agents/reviewer/prompt.md");
+        tokio::fs::write(&reviewer, "Custom {{ issue_title }}")
+            .await
+            .unwrap();
+        let custom = root.join("agents/security");
+        tokio::fs::create_dir_all(&custom).await.unwrap();
+        tokio::fs::write(custom.join("prompt.md"), "Audit {{ issue_text }}")
+            .await
+            .unwrap();
+        tokio::fs::remove_dir_all(root.join("agents/designer"))
+            .await
+            .unwrap();
+
+        let reloaded = load_prompt_profiles(&root).await.unwrap();
+
+        assert_eq!(
+            reloaded
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["implementer", "reviewer", "security"]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(reviewer).await.unwrap(),
+            "Custom {{ issue_title }}"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

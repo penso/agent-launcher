@@ -6,8 +6,8 @@ use std::{
 
 use agent_launcher_core::{
     AppConfig, BackendConfig, BackendKind, BackendStatus, EventEnvelope, Issue, IssueKey,
-    IssueProvider, OutputStream, Repository, RunEvent, RunState, RunSummary, RuntimeCommand,
-    RuntimeSnapshot, SourceStatus, WorktreeDeleteAction, WorktreeDeletePreview,
+    IssueProvider, OutputStream, PromptProfile, Repository, RunEvent, RunState, RunSummary,
+    RuntimeCommand, RuntimeSnapshot, SourceStatus, WorktreeDeleteAction, WorktreeDeletePreview,
 };
 use agent_launcher_issues::{IssueSource, SyncCheckpoint, SyncMode};
 use agent_launcher_runner::{
@@ -73,8 +73,8 @@ impl RuntimeHandle {
         self.send(RuntimeCommand::Refresh).await
     }
 
-    pub async fn dispatch(&self, issue: IssueKey) -> Result<()> {
-        self.send(RuntimeCommand::Dispatch { issue }).await
+    pub async fn dispatch(&self, issue: IssueKey, profile: Option<String>) -> Result<()> {
+        self.send(RuntimeCommand::Dispatch { issue, profile }).await
     }
 
     pub async fn send_input(
@@ -228,6 +228,11 @@ impl RuntimeService {
             repository: Some(repository.clone()),
             sources: source_statuses,
             selected_agent: config.agent.name.clone(),
+            prompt_profiles: config
+                .prompt_profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect(),
             ..RuntimeSnapshot::default()
         };
         let (snapshots, snapshot_rx) = watch::channel(snapshot.clone());
@@ -409,8 +414,8 @@ impl RuntimeService {
         }
         let (name, result, shutdown) = match command {
             RuntimeCommand::Refresh => unreachable!("refresh handled above"),
-            RuntimeCommand::Dispatch { issue } => {
-                let result = self.dispatch_issue(&issue).await;
+            RuntimeCommand::Dispatch { issue, profile } => {
+                let result = self.dispatch_issue(&issue, profile.as_deref()).await;
                 ("dispatch", result, false)
             },
             RuntimeCommand::SendInput { run_id, text } => {
@@ -457,7 +462,7 @@ impl RuntimeService {
         }
     }
 
-    async fn dispatch_issue(&mut self, key: &IssueKey) -> Result<()> {
+    async fn dispatch_issue(&mut self, key: &IssueKey, profile: Option<&str>) -> Result<()> {
         let canonical = key.canonical();
         if self
             .snapshot
@@ -477,9 +482,21 @@ impl RuntimeService {
         let backend = self.snapshot.selected_backend.ok_or_else(|| {
             Error::BackendUnavailable(backend_config_name(&self.config.backend).to_owned())
         })?;
+        let prompt = match profile {
+            Some(name) => {
+                let profile = self
+                    .config
+                    .prompt_profiles
+                    .iter()
+                    .find(|profile| profile.name == name)
+                    .ok_or_else(|| Error::PromptProfileNotFound(name.to_owned()))?;
+                render_prompt_template(profile, &issue).await?
+            },
+            None => issue_prompt(&issue),
+        };
         let request = DispatchRequest {
             repository: self.repository.clone(),
-            prompt: issue_prompt(&issue),
+            prompt,
             issue,
             agent: self.config.agent.name.clone(),
             branch: None,
@@ -1301,6 +1318,52 @@ fn issue_prompt(issue: &Issue) -> String {
     )
 }
 
+async fn render_prompt_template(profile: &PromptProfile, issue: &Issue) -> Result<String> {
+    let source = tokio::fs::read_to_string(&profile.path)
+        .await
+        .map_err(|source| Error::ReadPromptProfile {
+            profile: profile.name.clone(),
+            path: profile.path.clone(),
+            source,
+        })?;
+    if source.trim().is_empty() {
+        return Err(Error::EmptyPromptProfile(profile.name.clone()));
+    }
+    let mut environment = minijinja::Environment::new();
+    environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    environment
+        .add_template("prompt", &source)
+        .map_err(|source| Error::RenderPromptProfile {
+            profile: profile.name.clone(),
+            source,
+        })?;
+    let template =
+        environment
+            .get_template("prompt")
+            .map_err(|source| Error::RenderPromptProfile {
+                profile: profile.name.clone(),
+                source,
+            })?;
+    let rendered = template
+        .render(minijinja::context! {
+            issue_text => issue.description.as_deref().unwrap_or("(no issue description provided)"),
+            issue_title => issue.title.as_str(),
+            issue_link => issue.url.as_deref().unwrap_or("(no issue link available)"),
+            issue_identifier => issue.identifier.as_str(),
+            issue_repository => issue.key.repository.as_str(),
+            issue_provider => issue.key.provider.to_string(),
+        })
+        .map_err(|source| Error::RenderPromptProfile {
+            profile: profile.name.clone(),
+            source,
+        })?;
+    let rendered = rendered.trim().to_owned();
+    if rendered.is_empty() {
+        return Err(Error::EmptyRenderedPrompt(profile.name.clone()));
+    }
+    Ok(rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1676,6 +1739,7 @@ mod tests {
             superset_host: None,
             ssh: None,
             notifications: NotificationConfig { desktop: true },
+            prompt_profiles: Vec::new(),
         }
     }
 
@@ -1723,6 +1787,113 @@ mod tests {
             select_backend(&BackendConfig::Auto, &detections),
             Some(BackendKind::Herdr)
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_profiles_render_jinja_from_disk_on_every_dispatch() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-prompt-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let profile = PromptProfile {
+            name: "reviewer".to_owned(),
+            path: path.clone(),
+        };
+        let issue = issue("42", "Review dispatch", "open");
+        tokio::fs::write(
+            &path,
+            "Review {{ issue_title }} at {{ issue_link }}: {{ issue_text }}",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            render_prompt_template(&profile, &issue).await.unwrap(),
+            "Review Review dispatch at https://example.com/acme/widgets/issues/42: Description for 42"
+        );
+
+        tokio::fs::write(
+            &path,
+            "{% if issue_provider == 'github' %}Updated {{ issue_identifier }} in {{ issue_repository | upper }}{% endif %}",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            render_prompt_template(&profile, &issue).await.unwrap(),
+            "Updated #42 in ACME/WIDGETS"
+        );
+        tokio::fs::write(&path, "{{ unknown_value }}")
+            .await
+            .unwrap();
+        assert!(matches!(
+            render_prompt_template(&profile, &issue).await,
+            Err(Error::RenderPromptProfile { .. })
+        ));
+        tokio::fs::write(
+            &path,
+            "{% if issue_provider == 'gitlab' %}review{% endif %}",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            render_prompt_template(&profile, &issue).await,
+            Err(Error::EmptyRenderedPrompt(profile)) if profile == "reviewer"
+        ));
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn selected_prompt_profile_is_used_for_dispatch() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-dispatch-prompt-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        tokio::fs::write(&path, "Review {{ issue_title }}: {{ issue_text }}")
+            .await
+            .unwrap();
+        let store = Store::in_memory().await.unwrap();
+        let (source, _) = MockSource::new(vec![Ok(SyncResult {
+            issues: vec![issue("44", "Profile dispatch", "open")],
+            checkpoint: SyncCheckpoint::default(),
+            mode: SyncMode::Full,
+        })]);
+        let backend = MockBackend::new(BackendKind::Native, true);
+        let mut runtime_config = config();
+        runtime_config.prompt_profiles = vec![PromptProfile {
+            name: "reviewer".to_owned(),
+            path: path.clone(),
+        }];
+        let handle = RuntimeService::start_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store,
+            runner(&[Arc::clone(&backend)]),
+            runtime_config,
+            Arc::new(NoopNotifier),
+        );
+        let mut snapshots = handle.subscribe();
+        let ready = wait_for(&mut snapshots, |snapshot| snapshot.issues.len() == 1).await;
+        assert_eq!(ready.prompt_profiles, ["reviewer"]);
+
+        assert!(matches!(
+            handle
+                .dispatch(ready.issues[0].key.clone(), Some("missing".to_owned()))
+                .await,
+            Err(Error::PromptProfileNotFound(profile)) if profile == "missing"
+        ));
+        handle
+            .dispatch(ready.issues[0].key.clone(), Some("reviewer".to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(backend.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.requests.lock().unwrap()[0].prompt,
+            "Review Profile dispatch: Description for 44"
+        );
+        handle.shutdown().await.unwrap();
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test]
@@ -1874,8 +2045,8 @@ mod tests {
         assert_eq!(ready.selected_backend, Some(BackendKind::Superset));
         let issue_key = ready.issues[0].key.clone();
 
-        handle.dispatch(issue_key.clone()).await.unwrap();
-        handle.dispatch(issue_key).await.unwrap();
+        handle.dispatch(issue_key.clone(), None).await.unwrap();
+        handle.dispatch(issue_key, None).await.unwrap();
         wait_for(&mut snapshots, |snapshot| snapshot.runs.len() == 1).await;
         assert_eq!(superset.dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(native.dispatches.load(Ordering::SeqCst), 0);
@@ -2127,7 +2298,10 @@ mod tests {
         );
         let mut snapshots = handle.subscribe();
         let ready = wait_for(&mut snapshots, |snapshot| snapshot.issues.len() == 1).await;
-        handle.dispatch(ready.issues[0].key.clone()).await.unwrap();
+        handle
+            .dispatch(ready.issues[0].key.clone(), None)
+            .await
+            .unwrap();
 
         let gate = native.block_next_refresh();
         let refresh_handle = handle.clone();
@@ -2171,7 +2345,10 @@ mod tests {
         );
         let mut snapshots = handle.subscribe();
         let ready = wait_for(&mut snapshots, |snapshot| snapshot.issues.len() == 1).await;
-        handle.dispatch(ready.issues[0].key.clone()).await.unwrap();
+        handle
+            .dispatch(ready.issues[0].key.clone(), None)
+            .await
+            .unwrap();
 
         let gate = native.block_next_refresh();
         let refresh_handle = handle.clone();
@@ -2208,7 +2385,10 @@ mod tests {
         );
         let mut snapshots = handle.subscribe();
         let ready = wait_for(&mut snapshots, |snapshot| snapshot.issues.len() == 1).await;
-        handle.dispatch(ready.issues[0].key.clone()).await.unwrap();
+        handle
+            .dispatch(ready.issues[0].key.clone(), None)
+            .await
+            .unwrap();
         let preview = handle.preview_delete_worktree("run-1").await.unwrap();
         native.runs.lock().unwrap().remove("run-1");
 

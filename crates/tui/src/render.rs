@@ -27,12 +27,15 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(theme::bg())), area);
     app.reconcile_detail(snapshot);
+    app.reconcile_dispatch(snapshot);
     let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     match app.route {
         Route::Inbox => draw_inbox(frame, content, snapshot, app),
         Route::Detail => draw_detail(frame, content, snapshot, app),
     }
-    if app.route == Route::Inbox {
+    if app.dispatch_overlay.is_some() {
+        draw_dispatch_overlay(frame, content, snapshot, app);
+    } else if app.route == Route::Inbox {
         if app.sort_overlay {
             draw_sort_overlay(frame, content, app);
         } else if app.command_overlay {
@@ -839,6 +842,157 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+fn draw_dispatch_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    app: &AppState,
+) {
+    let Some(overlay) = app.dispatch_overlay.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).min(62);
+    let wanted_height = snapshot.prompt_profiles.len().saturating_add(6) as u16;
+    let height = area.height.saturating_sub(2).min(wanted_height.max(7));
+    if width == 0 || height == 0 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let horizontal_padding = if width >= 24 {
+        2
+    } else {
+        1
+    };
+    let vertical_padding = u16::from(height >= 5);
+    let panel = Block::new()
+        .style(Style::new().bg(theme::element()))
+        .padding(Padding::new(
+            horizontal_padding,
+            horizontal_padding,
+            vertical_padding,
+            vertical_padding,
+        ));
+    let inner = panel.inner(popup);
+    frame.render_widget(panel, popup);
+    if inner.is_empty() {
+        return;
+    }
+
+    let issue_title = snapshot
+        .issues
+        .iter()
+        .find(|issue| issue.key == overlay.issue_key)
+        .map_or("Selected issue", |issue| issue.title.as_str());
+    let selected_name = snapshot
+        .prompt_profiles
+        .get(overlay.cursor)
+        .map_or("unavailable", String::as_str);
+    let mut lines = if inner.height < 5 {
+        vec![Line::from(vec![
+            Span::styled("Prompt  ", Style::new().fg(theme::primary()).bold()),
+            Span::styled(
+                selected_name.to_owned(),
+                Style::new().fg(theme::text()).bold(),
+            ),
+            Span::styled(
+                "  Enter dispatch · Esc cancel",
+                Style::new().fg(theme::muted()),
+            ),
+        ])]
+    } else {
+        vec![
+            Line::styled(
+                format!(
+                    "Choose prompt · {}/{}",
+                    overlay.cursor + 1,
+                    snapshot.prompt_profiles.len()
+                ),
+                Style::new().fg(theme::primary()).bold(),
+            ),
+            Line::styled(
+                truncate(issue_title, inner.width as usize),
+                Style::new().fg(theme::muted()),
+            ),
+            Line::styled(
+                "↑/↓ select · Enter dispatch · 1-9 · Esc cancel",
+                Style::new().fg(theme::muted()),
+            ),
+            Line::raw(""),
+        ]
+    };
+    let visible_profiles = (inner.height as usize).saturating_sub(4).max(1);
+    let max_start = snapshot
+        .prompt_profiles
+        .len()
+        .saturating_sub(visible_profiles);
+    let start = overlay
+        .cursor
+        .saturating_sub(visible_profiles / 2)
+        .min(max_start);
+    if inner.height >= 5 {
+        lines.extend(
+            snapshot
+                .prompt_profiles
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible_profiles)
+                .map(|(index, name)| {
+                    let selected = index == overlay.cursor;
+                    Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "{} {}  ",
+                                if selected {
+                                    "›"
+                                } else {
+                                    " "
+                                },
+                                index + 1
+                            ),
+                            Style::new().fg(if selected {
+                                theme::primary()
+                            } else {
+                                theme::muted()
+                            }),
+                        ),
+                        Span::styled(
+                            name.clone(),
+                            Style::new()
+                                .fg(if selected {
+                                    theme::text()
+                                } else {
+                                    theme::muted()
+                                })
+                                .add_modifier(if selected {
+                                    ratatui::style::Modifier::BOLD
+                                } else {
+                                    ratatui::style::Modifier::empty()
+                                }),
+                        ),
+                    ])
+                }),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::element())),
+        inner,
+    );
+    render_bottom_edge(
+        popup,
+        theme::primary(),
+        theme::element(),
+        theme::bg(),
+        frame.buffer_mut(),
+    );
+}
+
 fn command_help_line(key: &'static str, action: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key:<30}"), Style::new().fg(theme::text()).bold()),
@@ -1354,6 +1508,54 @@ mod tests {
         assert!(text.contains("d · o · s"));
         assert!(text.contains("i · x · Esc"));
         assert!(text.contains("Ctrl+C"));
+    }
+
+    #[test]
+    fn dispatch_overlay_lists_prompt_profiles_for_the_stable_issue() {
+        let mut snapshot = normal_snapshot();
+        snapshot.prompt_profiles = vec![
+            "designer".to_owned(),
+            "implementer".to_owned(),
+            "reviewer".to_owned(),
+        ];
+        let mut app = AppState {
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                issue_key: snapshot.issues[0].key.clone(),
+                cursor: 1,
+            }),
+            ..AppState::default()
+        };
+
+        let text = render(90, 28, &snapshot, &mut app);
+
+        assert!(text.contains("Choose prompt"));
+        assert!(text.contains("Repair runtime dispatch"));
+        assert!(text.contains("designer"));
+        assert!(text.contains("implementer"));
+        assert!(text.contains("reviewer"));
+        assert!(text.contains("Enter dispatch"));
+    }
+
+    #[test]
+    fn dispatch_overlay_keeps_large_and_compact_selections_visible() {
+        let mut snapshot = normal_snapshot();
+        snapshot.prompt_profiles = (0..20).map(|index| format!("prompt-{index}")).collect();
+        let mut app = AppState {
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                issue_key: snapshot.issues[0].key.clone(),
+                cursor: 15,
+            }),
+            ..AppState::default()
+        };
+
+        let normal = render(70, 12, &snapshot, &mut app);
+        assert!(normal.contains("Choose prompt · 16/20"));
+        assert!(normal.contains("prompt-15"));
+
+        let compact = render(40, 5, &snapshot, &mut app);
+        assert!(compact.contains("Prompt"));
+        assert!(compact.contains("prompt-15"));
+        assert!(compact.contains("Enter dispatch"));
     }
 
     #[test]

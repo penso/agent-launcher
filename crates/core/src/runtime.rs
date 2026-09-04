@@ -19,6 +19,8 @@ pub struct RuntimeSnapshot {
     pub backends: Vec<BackendStatus>,
     pub selected_backend: Option<BackendKind>,
     pub selected_agent: String,
+    #[serde(default)]
+    pub prompt_profiles: Vec<String>,
     pub refreshing: bool,
     pub last_refreshed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -43,10 +45,22 @@ pub struct BackendStatus {
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
     Refresh,
-    Dispatch { issue: IssueKey },
-    SendInput { run_id: String, text: String },
-    Stop { run_id: String },
-    Open { run_id: String },
-    DeleteWorktree { preview: Box<WorktreeDeletePreview> },
+    Dispatch {
+        issue: IssueKey,
+        profile: Option<String>,
+    },
+    SendInput {
+        run_id: String,
+        text: String,
+    },
+    Stop {
+        run_id: String,
+    },
+    Open {
+        run_id: String,
+    },
+    DeleteWorktree {
+        preview: Box<WorktreeDeletePreview>,
+    },
     Shutdown,
 }

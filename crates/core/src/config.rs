@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub superset_host: Option<String>,
     pub ssh: Option<SshConfig>,
     pub notifications: NotificationConfig,
+    #[serde(skip)]
+    pub prompt_profiles: Vec<PromptProfile>,
 }
 
 impl Default for AppConfig {
@@ -22,8 +24,15 @@ impl Default for AppConfig {
             superset_host: None,
             ssh: None,
             notifications: NotificationConfig::default(),
+            prompt_profiles: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptProfile {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
