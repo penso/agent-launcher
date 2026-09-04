@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use agent_launcher_core::{BackendKind, Issue, RuntimeSnapshot};
+use agent_launcher_core::{BackendKind, Issue, RunState, RuntimeSnapshot};
 use ratatui::{
     Frame,
     layout::{Alignment, Margin, Rect},
@@ -377,7 +377,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
     let active = snapshot
         .runs
         .iter()
-        .filter(|run| run.state.is_active())
+        .filter(|run| run_is_working(run.state))
         .map(|run| run.issue_key.as_str())
         .collect::<HashSet<_>>();
     for (screen_row, row) in rows.iter().skip(app.scroll).take(visible_rows).enumerate() {
@@ -706,10 +706,10 @@ fn status_line<'a>(snapshot: &'a RuntimeSnapshot, app: &'a AppState) -> Line<'a>
             Span::styled(status, Style::new().fg(theme::muted())),
         ]);
     }
-    let active = snapshot
+    let working = snapshot
         .runs
         .iter()
-        .filter(|run| run.state.is_active())
+        .filter(|run| run_is_working(run.state))
         .count();
     if snapshot.refreshing {
         Line::from(vec![
@@ -719,13 +719,16 @@ fn status_line<'a>(snapshot: &'a RuntimeSnapshot, app: &'a AppState) -> Line<'a>
             ),
             Span::styled(" refreshing", Style::new().fg(theme::muted())),
         ])
-    } else if active > 0 {
+    } else if working > 0 {
         Line::from(vec![
             Span::styled(
                 theme::BRAILLE_SPINNER[app.tick as usize % theme::BRAILLE_SPINNER.len()],
                 Style::new().fg(theme::primary()),
             ),
-            Span::styled(format!(" {active} active"), Style::new().fg(theme::muted())),
+            Span::styled(
+                format!(" {working} working"),
+                Style::new().fg(theme::muted()),
+            ),
         ])
     } else {
         Line::from(vec![
@@ -733,6 +736,13 @@ fn status_line<'a>(snapshot: &'a RuntimeSnapshot, app: &'a AppState) -> Line<'a>
             Span::styled("ready", Style::new().fg(theme::muted())),
         ])
     }
+}
+
+fn run_is_working(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Provisioning | RunState::Starting | RunState::Running
+    )
 }
 
 fn shortcut_line(width: u16) -> Line<'static> {
@@ -1208,6 +1218,39 @@ mod tests {
         let search_line = text.lines().find(|line| line.contains("Repair█")).unwrap();
         assert!(search_line.contains("Repair█"));
         assert!(!search_line.contains('┃'));
+    }
+
+    #[test]
+    fn idle_agents_do_not_look_like_they_are_working() {
+        let mut snapshot = normal_snapshot();
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            id: "run-idle".to_owned(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: None,
+            agent: "opencode".to_owned(),
+            state: RunState::Idle,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        let mut app = AppState::default();
+
+        let text = render(112, 28, &snapshot, &mut app);
+        let issue_line = text
+            .lines()
+            .find(|line| line.contains("Repair runtime dispatch"))
+            .expect("issue should be visible");
+
+        assert!(issue_line.contains("idle"));
+        assert!(
+            theme::BRAILLE_SPINNER
+                .iter()
+                .all(|spinner| !issue_line.contains(spinner))
+        );
+        assert!(text.contains("● ready"));
+        assert!(!text.contains("1 working"));
     }
 
     #[test]
