@@ -619,7 +619,7 @@ impl RuntimeService {
             .snapshot
             .runs
             .iter()
-            .filter(|run| run.state.is_active())
+            .filter(|run| run.state.is_active() || run.state == RunState::Disconnected)
             .filter(|run| !self.run_refresh_unsupported.contains(&run.id))
             .map(|run| run.id.clone())
             .collect::<Vec<_>>();
@@ -1991,7 +1991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_active_run_missing_from_runner_is_persisted_as_disconnected() {
+    async fn restored_run_disconnects_when_missing_and_recovers() {
         let store = Store::in_memory().await.unwrap();
         let now = Utc::now();
         let run = RunSummary {
@@ -2011,7 +2011,7 @@ mod tests {
             repository(),
             Vec::new(),
             store.clone(),
-            runner(&[native]),
+            runner(&[Arc::clone(&native)]),
             config(),
             Arc::new(NoopNotifier),
         );
@@ -2034,6 +2034,24 @@ mod tests {
                 ..
             }
         ));
+
+        let mut reconnected = persisted;
+        reconnected.state = RunState::Idle;
+        reconnected.message = None;
+        native
+            .runs
+            .lock()
+            .unwrap()
+            .insert(reconnected.id.clone(), reconnected);
+        handle.refresh().await.unwrap();
+        let snapshot = wait_for(&mut snapshots, |snapshot| {
+            snapshot
+                .runs
+                .first()
+                .is_some_and(|run| run.state == RunState::Idle)
+        })
+        .await;
+        assert!(snapshot.runs[0].message.is_none());
         handle.shutdown().await.unwrap();
     }
 
