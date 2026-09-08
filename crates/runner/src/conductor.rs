@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use agent_launcher_core::{BackendKind, Repository, RunState, RunSummary, WorkspaceRef};
+use agent_launcher_core::{
+    BackendKind, Repository, RunState, RunSummary, WorkspaceRef, WorktreeInspection,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::{Client, RequestBuilder, Response};
@@ -236,6 +238,7 @@ impl Backend for ConductorBackend {
             manager_running: false,
             capabilities: self.capabilities(),
             message: result.err().map(|error| error.to_string()),
+            compute_targets: Vec::new(),
         })
     }
 
@@ -442,12 +445,17 @@ impl Backend for ConductorBackend {
         })
     }
 
-    async fn delete_worktree(&self, run_id: &str, _force: bool) -> Result<()> {
+    async fn delete_worktree(
+        &self,
+        run_id: &str,
+        _force: bool,
+        _expected: Option<&WorktreeInspection>,
+    ) -> Result<()> {
         let record = self.record(run_id).await?;
         let BackendSession::Conductor { workspace_id, .. } = record.session else {
             unreachable!()
         };
-        self.registry.begin_deletion(run_id, true).await?;
+        self.registry.begin_deletion(run_id, true, None).await?;
         match self
             .post_empty(api_endpoint(&self.config.api_url, &[
                 "workspaces",

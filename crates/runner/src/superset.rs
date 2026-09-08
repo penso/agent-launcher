@@ -1,6 +1,8 @@
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
-use agent_launcher_core::{BackendKind, Repository, RunState, RunSummary, WorkspaceRef};
+use agent_launcher_core::{
+    BackendKind, Repository, RunState, RunSummary, WorkspaceRef, WorktreeInspection,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
@@ -174,6 +176,7 @@ impl Backend for SupersetBackend {
                 manager_running: true,
                 capabilities: self.capabilities(),
                 message: None,
+                compute_targets: Vec::new(),
             }),
             Err(error) => Ok(BackendDetection {
                 backend: self.kind(),
@@ -181,6 +184,7 @@ impl Backend for SupersetBackend {
                 manager_running: false,
                 capabilities: self.capabilities(),
                 message: Some(error.to_string()),
+                compute_targets: Vec::new(),
             }),
         }
     }
@@ -322,7 +326,12 @@ impl Backend for SupersetBackend {
         })
     }
 
-    async fn delete_worktree(&self, run_id: &str, _force: bool) -> Result<()> {
+    async fn delete_worktree(
+        &self,
+        run_id: &str,
+        _force: bool,
+        _expected: Option<&WorktreeInspection>,
+    ) -> Result<()> {
         let record = self.record(run_id).await?;
         let BackendSession::Superset {
             workspace_id, host, ..
@@ -330,7 +339,7 @@ impl Backend for SupersetBackend {
         else {
             unreachable!()
         };
-        self.registry.begin_deletion(run_id, true).await?;
+        self.registry.begin_deletion(run_id, true, None).await?;
         if let Err(error) = self
             .command(workspace_delete_args(&workspace_id, host.as_deref()))
             .await

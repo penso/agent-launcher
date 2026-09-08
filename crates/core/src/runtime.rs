@@ -17,6 +17,8 @@ pub struct RuntimeSnapshot {
     pub run_events: HashMap<String, Vec<EventEnvelope>>,
     pub sources: Vec<SourceStatus>,
     pub backends: Vec<BackendStatus>,
+    #[serde(default)]
+    pub compute_targets: Vec<ComputeTargetStatus>,
     pub selected_backend: Option<BackendKind>,
     pub selected_agent: String,
     #[serde(default)]
@@ -24,6 +26,49 @@ pub struct RuntimeSnapshot {
     pub refreshing: bool,
     pub last_refreshed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComputeProvider {
+    Ssh,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComputeTargetAvailability {
+    Online,
+    Wakeable,
+    Offline,
+    Full,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ComputeTargetStatus {
+    pub id: String,
+    pub name: String,
+    pub provider: ComputeProvider,
+    pub availability: ComputeTargetAvailability,
+    pub active_runs: usize,
+    pub max_active_runs: Option<usize>,
+    pub cpu_percent: Option<f32>,
+    pub memory_percent: Option<f32>,
+    pub sampled_at: DateTime<Utc>,
+    pub message: Option<String>,
+}
+
+impl ComputeTargetStatus {
+    pub fn is_full(&self) -> bool {
+        self.max_active_runs
+            .is_some_and(|maximum| self.active_runs >= maximum)
+    }
+
+    pub fn is_dispatchable(&self) -> bool {
+        matches!(
+            self.availability,
+            ComputeTargetAvailability::Online | ComputeTargetAvailability::Wakeable
+        ) && !self.is_full()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,6 +93,7 @@ pub enum RuntimeCommand {
     Dispatch {
         issue: IssueKey,
         profile: Option<String>,
+        target: Option<String>,
     },
     SendInput {
         run_id: String,

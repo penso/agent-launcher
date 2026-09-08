@@ -15,26 +15,48 @@ name = "opencode"
 [notifications]
 desktop = true
 
-# Uncomment to run the native backend over SSH. The remote host must have Git and OpenCode.
+# Uncomment to run the native backend on a pool of SSH compute targets. Automatic placement
+# prefers fewer active launcher runs, then lower CPU/memory load. Use "random" for random
+# placement. A detached OpenCode server and remote Git worktree are created per issue.
+# [compute]
+# placement = "least-loaded"
+#
+# [[compute.targets]]
+# provider = "ssh"
+# id = "linux-builder"
+# name = "Linux builder"
+# host = "developer@linux-builder"
+# workspace_root = "~/.local/share/agent-launcher"
+# max_active_runs = 4
+#
+# [[compute.targets]]
+# provider = "ssh"
+# id = "mac-studio"
+# name = "Mac Studio"
+# host = "developer@mac-studio"
+# workspace_root = "/Users/developer/.local/share/agent-launcher"
+# max_active_runs = 2
+#
+# Legacy single-host configuration remains supported:
 # [ssh]
 # host = "buildbox"
 # workspace_root = "~/.local/share/agent-launcher"
 
 # Optionally wake remote compute before connecting. Choose one shape.
-# [ssh.wake]
+# [compute.targets.wake]
 # provider = "daytona"
 # sandbox = "coding-sandbox"
 
-# [ssh.wake]
+# [compute.targets.wake]
 # provider = "coder"
 # workspace = "coding-workspace"
 
-# [ssh.wake]
+# [compute.targets.wake]
 # provider = "azure"
 # resource_group = "agents"
 # vm = "worker-1"
 
-# [ssh.wake]
+# [compute.targets.wake]
 # provider = "command"
 # program = "my-wake-command"
 # args = ["--host", "buildbox"]

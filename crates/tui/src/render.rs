@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use agent_launcher_core::{BackendKind, Issue, RunState, RuntimeSnapshot};
+use agent_launcher_core::{
+    BackendKind, ComputeTargetAvailability, ComputeTargetStatus, Issue, RunState, RuntimeSnapshot,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Margin, Rect},
@@ -13,7 +15,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, Route},
+    app::{AppState, DispatchStage, Route},
     detail::draw_detail,
     format::{age_label, truncate},
     metrics::HostMetrics,
@@ -851,8 +853,12 @@ fn draw_dispatch_overlay(
     let Some(overlay) = app.dispatch_overlay.as_ref() else {
         return;
     };
-    let width = area.width.saturating_sub(2).min(62);
-    let wanted_height = snapshot.prompt_profiles.len().saturating_add(6) as u16;
+    let item_count = match &overlay.stage {
+        DispatchStage::Prompt => snapshot.prompt_profiles.len(),
+        DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
+    };
+    let width = area.width.saturating_sub(2).min(86);
+    let wanted_height = item_count.saturating_add(6) as u16;
     let height = area.height.saturating_sub(2).min(wanted_height.max(7));
     if width == 0 || height == 0 {
         return;
@@ -889,97 +895,18 @@ fn draw_dispatch_overlay(
         .iter()
         .find(|issue| issue.key == overlay.issue_key)
         .map_or("Selected issue", |issue| issue.title.as_str());
-    let selected_name = snapshot
-        .prompt_profiles
-        .get(overlay.cursor)
-        .map_or("unavailable", String::as_str);
-    let mut lines = if inner.height < 5 {
-        vec![Line::from(vec![
-            Span::styled("Prompt  ", Style::new().fg(theme::primary()).bold()),
-            Span::styled(
-                selected_name.to_owned(),
-                Style::new().fg(theme::text()).bold(),
-            ),
-            Span::styled(
-                "  Enter dispatch · Esc cancel",
-                Style::new().fg(theme::muted()),
-            ),
-        ])]
-    } else {
-        vec![
-            Line::styled(
-                format!(
-                    "Choose prompt · {}/{}",
-                    overlay.cursor + 1,
-                    snapshot.prompt_profiles.len()
-                ),
-                Style::new().fg(theme::primary()).bold(),
-            ),
-            Line::styled(
-                truncate(issue_title, inner.width as usize),
-                Style::new().fg(theme::muted()),
-            ),
-            Line::styled(
-                "↑/↓ select · Enter dispatch · 1-9 · Esc cancel",
-                Style::new().fg(theme::muted()),
-            ),
-            Line::raw(""),
-        ]
+    let lines = match &overlay.stage {
+        DispatchStage::Prompt => {
+            dispatch_prompt_lines(snapshot, overlay.cursor, issue_title, inner)
+        },
+        DispatchStage::Target { profile } => dispatch_target_lines(
+            snapshot,
+            overlay.cursor,
+            issue_title,
+            profile.as_deref(),
+            inner,
+        ),
     };
-    let visible_profiles = (inner.height as usize).saturating_sub(4).max(1);
-    let max_start = snapshot
-        .prompt_profiles
-        .len()
-        .saturating_sub(visible_profiles);
-    let start = overlay
-        .cursor
-        .saturating_sub(visible_profiles / 2)
-        .min(max_start);
-    if inner.height >= 5 {
-        lines.extend(
-            snapshot
-                .prompt_profiles
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(visible_profiles)
-                .map(|(index, name)| {
-                    let selected = index == overlay.cursor;
-                    Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{} {}  ",
-                                if selected {
-                                    "›"
-                                } else {
-                                    " "
-                                },
-                                index + 1
-                            ),
-                            Style::new().fg(if selected {
-                                theme::primary()
-                            } else {
-                                theme::muted()
-                            }),
-                        ),
-                        Span::styled(
-                            name.clone(),
-                            Style::new()
-                                .fg(if selected {
-                                    theme::text()
-                                } else {
-                                    theme::muted()
-                                })
-                                .add_modifier(if selected {
-                                    ratatui::style::Modifier::BOLD
-                                } else {
-                                    ratatui::style::Modifier::empty()
-                                }),
-                        ),
-                    ])
-                }),
-        );
-    }
     frame.render_widget(
         Paragraph::new(lines).style(Style::new().bg(theme::element())),
         inner,
@@ -991,6 +918,221 @@ fn draw_dispatch_overlay(
         theme::bg(),
         frame.buffer_mut(),
     );
+}
+
+fn dispatch_prompt_lines<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    cursor: usize,
+    issue_title: &str,
+    inner: Rect,
+) -> Vec<Line<'a>> {
+    let selected_name = snapshot
+        .prompt_profiles
+        .get(cursor)
+        .map_or("unavailable", String::as_str);
+    if inner.height < 5 {
+        return vec![Line::from(vec![
+            Span::styled("Prompt  ", Style::new().fg(theme::primary()).bold()),
+            Span::styled(
+                selected_name.to_owned(),
+                Style::new().fg(theme::text()).bold(),
+            ),
+            Span::styled(
+                "  Enter dispatch · Esc cancel",
+                Style::new().fg(theme::muted()),
+            ),
+        ])];
+    }
+
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "Choose prompt · {}/{}",
+                cursor + 1,
+                snapshot.prompt_profiles.len()
+            ),
+            Style::new().fg(theme::primary()).bold(),
+        ),
+        Line::styled(
+            truncate(issue_title, inner.width as usize),
+            Style::new().fg(theme::muted()),
+        ),
+        Line::styled(
+            "↑/↓ select · Enter dispatch · 1-9 · Esc cancel",
+            Style::new().fg(theme::muted()),
+        ),
+        Line::raw(""),
+    ];
+    let visible = (inner.height as usize).saturating_sub(4).max(1);
+    let start = cursor
+        .saturating_sub(visible / 2)
+        .min(snapshot.prompt_profiles.len().saturating_sub(visible));
+    lines.extend(
+        snapshot
+            .prompt_profiles
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, name)| dispatch_choice_line(index, cursor, true, name.clone())),
+    );
+    lines
+}
+
+fn dispatch_target_lines<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    cursor: usize,
+    issue_title: &str,
+    profile: Option<&str>,
+    inner: Rect,
+) -> Vec<Line<'a>> {
+    let automatic_enabled = snapshot
+        .compute_targets
+        .iter()
+        .any(ComputeTargetStatus::is_dispatchable);
+    let selected_name = if cursor == 0 {
+        "Automatic"
+    } else {
+        snapshot
+            .compute_targets
+            .get(cursor - 1)
+            .map_or("unavailable", |target| target.name.as_str())
+    };
+    if inner.height < 5 {
+        return vec![Line::from(vec![
+            Span::styled("Target  ", Style::new().fg(theme::primary()).bold()),
+            Span::styled(
+                selected_name.to_owned(),
+                Style::new().fg(theme::text()).bold(),
+            ),
+            Span::styled(
+                "  Enter dispatch · Esc cancel",
+                Style::new().fg(theme::muted()),
+            ),
+        ])];
+    }
+
+    let count = snapshot.compute_targets.len() + 1;
+    let subtitle = profile.map_or_else(
+        || issue_title.to_owned(),
+        |profile| {
+            format!(
+                "{} · {profile}",
+                truncate(issue_title, inner.width as usize)
+            )
+        },
+    );
+    let mut lines = vec![
+        Line::styled(
+            format!("Choose compute target · {}/{}", cursor + 1, count),
+            Style::new().fg(theme::primary()).bold(),
+        ),
+        Line::styled(
+            truncate(&subtitle, inner.width as usize),
+            Style::new().fg(theme::muted()),
+        ),
+        Line::styled(
+            "↑/↓ select · Enter dispatch · 1-9 · Esc cancel",
+            Style::new().fg(theme::muted()),
+        ),
+        Line::raw(""),
+    ];
+    let visible = (inner.height as usize).saturating_sub(4).max(1);
+    let start = cursor
+        .saturating_sub(visible / 2)
+        .min(count.saturating_sub(visible));
+    lines.extend((start..count).take(visible).map(|index| {
+        if index == 0 {
+            let status = if automatic_enabled {
+                "ready"
+            } else {
+                "unavailable"
+            };
+            dispatch_choice_line(
+                index,
+                cursor,
+                automatic_enabled,
+                format!("Automatic  {status}"),
+            )
+        } else {
+            let target = &snapshot.compute_targets[index - 1];
+            dispatch_choice_line(
+                index,
+                cursor,
+                target.is_dispatchable(),
+                target_summary(target),
+            )
+        }
+    }));
+    lines
+}
+
+fn dispatch_choice_line(
+    index: usize,
+    cursor: usize,
+    enabled: bool,
+    label: String,
+) -> Line<'static> {
+    let selected = index == cursor;
+    let color = if !enabled {
+        theme::secondary()
+    } else if selected {
+        theme::text()
+    } else {
+        theme::muted()
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(
+                "{} {}  ",
+                if selected {
+                    "›"
+                } else {
+                    " "
+                },
+                index + 1
+            ),
+            Style::new().fg(if selected {
+                theme::primary()
+            } else {
+                theme::muted()
+            }),
+        ),
+        Span::styled(
+            label,
+            Style::new().fg(color).add_modifier(if selected {
+                ratatui::style::Modifier::BOLD
+            } else {
+                ratatui::style::Modifier::empty()
+            }),
+        ),
+    ])
+}
+
+fn target_summary(target: &ComputeTargetStatus) -> String {
+    let status = if target.is_full() {
+        "full"
+    } else {
+        match target.availability {
+            ComputeTargetAvailability::Online => "online",
+            ComputeTargetAvailability::Wakeable => "wakeable",
+            ComputeTargetAvailability::Offline => "offline",
+            ComputeTargetAvailability::Full => "full",
+        }
+    };
+    let maximum = target
+        .max_active_runs
+        .map_or_else(|| "-".to_owned(), |maximum| maximum.to_string());
+    let cpu = target
+        .cpu_percent
+        .map_or_else(|| "-".to_owned(), |cpu| format!("{cpu:.0}%"));
+    let memory = target
+        .memory_percent
+        .map_or_else(|| "-".to_owned(), |memory| format!("{memory:.0}%"));
+    format!(
+        "{}  {status} · {}/{} active · CPU {cpu} · MEM {memory}",
+        target.name, target.active_runs, maximum
+    )
 }
 
 fn command_help_line(key: &'static str, action: &'static str) -> Line<'static> {
@@ -1274,8 +1416,9 @@ mod tests {
     use std::{collections::HashMap, path::PathBuf};
 
     use agent_launcher_core::{
-        BackendKind, BackendStatus, EventEnvelope, IssueKey, IssueProvider, OutputStream,
-        Repository, RepositoryRemote, RunEvent, RunState, RunSummary, SourceStatus, WorkspaceRef,
+        BackendKind, BackendStatus, ComputeProvider, ComputeTargetAvailability,
+        ComputeTargetStatus, EventEnvelope, IssueKey, IssueProvider, OutputStream, Repository,
+        RepositoryRemote, RunEvent, RunState, RunSummary, SourceStatus, WorkspaceRef,
         WorktreeDeleteAction, WorktreeDeletePreview,
     };
     use chrono::{Duration, Utc};
@@ -1335,6 +1478,26 @@ mod tests {
             selected_backend: Some(BackendKind::Superset),
             selected_agent: "opencode".to_owned(),
             ..RuntimeSnapshot::default()
+        }
+    }
+
+    fn compute_target(
+        id: &str,
+        availability: ComputeTargetAvailability,
+        active_runs: usize,
+        max_active_runs: Option<usize>,
+    ) -> ComputeTargetStatus {
+        ComputeTargetStatus {
+            id: id.to_owned(),
+            name: format!("Target {id}"),
+            provider: ComputeProvider::Ssh,
+            availability,
+            active_runs,
+            max_active_runs,
+            cpu_percent: Some(42.0),
+            memory_percent: Some(57.0),
+            sampled_at: Utc::now(),
+            message: None,
         }
     }
 
@@ -1522,6 +1685,7 @@ mod tests {
             dispatch_overlay: Some(crate::app::DispatchOverlay {
                 issue_key: snapshot.issues[0].key.clone(),
                 cursor: 1,
+                stage: crate::app::DispatchStage::Prompt,
             }),
             ..AppState::default()
         };
@@ -1544,6 +1708,7 @@ mod tests {
             dispatch_overlay: Some(crate::app::DispatchOverlay {
                 issue_key: snapshot.issues[0].key.clone(),
                 cursor: 15,
+                stage: crate::app::DispatchStage::Prompt,
             }),
             ..AppState::default()
         };
@@ -1556,6 +1721,36 @@ mod tests {
         assert!(compact.contains("Prompt"));
         assert!(compact.contains("prompt-15"));
         assert!(compact.contains("Enter dispatch"));
+    }
+
+    #[test]
+    fn target_overlay_lists_automatic_and_all_target_statuses() {
+        let mut snapshot = normal_snapshot();
+        snapshot.selected_backend = Some(BackendKind::Native);
+        snapshot.compute_targets = vec![
+            compute_target("ready", ComputeTargetAvailability::Online, 1, Some(3)),
+            compute_target("offline", ComputeTargetAvailability::Offline, 0, Some(2)),
+            compute_target("full", ComputeTargetAvailability::Online, 2, Some(2)),
+        ];
+        let mut app = AppState {
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                issue_key: snapshot.issues[0].key.clone(),
+                cursor: 0,
+                stage: crate::app::DispatchStage::Target {
+                    profile: Some("reviewer".to_owned()),
+                },
+            }),
+            ..AppState::default()
+        };
+
+        let text = render(100, 28, &snapshot, &mut app);
+
+        assert!(text.contains("Choose compute target"));
+        assert!(text.contains("Repair runtime dispatch · reviewer"));
+        assert!(text.contains("Automatic  ready"));
+        assert!(text.contains("Target ready  online · 1/3 active · CPU 42% · MEM 57%"));
+        assert!(text.contains("Target offline  offline · 0/2 active · CPU 42% · MEM 57%"));
+        assert!(text.contains("Target full  full · 2/2 active · CPU 42% · MEM 57%"));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use agent_launcher_core::{RunState, RunSummary};
+use agent_launcher_core::{BackendKind, RunState, RunSummary};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::{
     fs,
     process::Child,
@@ -24,7 +25,17 @@ pub(crate) enum BackendSession {
         base_url: String,
         remote: bool,
         #[serde(default)]
+        target_id: Option<String>,
+        #[serde(default)]
+        remote_workspace_path: Option<String>,
+        #[serde(default)]
+        remote_port: Option<u16>,
+        #[serde(default)]
+        server_password: Option<String>,
+        #[serde(default)]
         process_id: Option<u32>,
+        #[serde(default)]
+        initial_prompt: Option<Value>,
         #[serde(default)]
         pending_permission_id: Option<String>,
         #[serde(default)]
@@ -64,12 +75,17 @@ pub(crate) struct RunRecord {
 pub(crate) struct DeletionState {
     pub force: bool,
     pub completed: bool,
+    #[serde(default)]
+    pub expected_inspection: Option<agent_launcher_core::WorktreeInspection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingDeletion {
     pub run_id: String,
+    pub backend: Option<BackendKind>,
+    pub force: bool,
     pub completed: bool,
+    pub expected_inspection: Option<agent_launcher_core::WorktreeInspection>,
 }
 
 pub(crate) struct ManagedChild {
@@ -138,7 +154,14 @@ impl SessionRegistry {
             .filter_map(|(run_id, record)| {
                 record.deletion.as_ref().map(|deletion| PendingDeletion {
                     run_id: run_id.clone(),
+                    backend: record
+                        .summary
+                        .workspace
+                        .as_ref()
+                        .map(|workspace| workspace.backend),
+                    force: deletion.force,
                     completed: deletion.completed,
+                    expected_inspection: deletion.expected_inspection.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -146,16 +169,52 @@ impl SessionRegistry {
         deletions
     }
 
+    pub async fn has_other_workspace_owner(&self, run_id: &str) -> bool {
+        let records = self.records.read().await;
+        let Some(workspace) = records
+            .get(run_id)
+            .and_then(|record| record.summary.workspace.as_ref())
+        else {
+            return false;
+        };
+        records.iter().any(|(other_id, record)| {
+            other_id != run_id
+                && record.deletion.is_none()
+                && matches!(
+                    record.summary.state,
+                    RunState::Provisioning
+                        | RunState::Starting
+                        | RunState::Running
+                        | RunState::NeedsInput
+                        | RunState::Idle
+                        | RunState::Failed
+                        | RunState::Disconnected
+                )
+                && record.summary.workspace.as_ref().is_some_and(|other| {
+                    workspace.backend == other.backend
+                        && workspace.host == other.host
+                        && (workspace.id == other.id || workspace.path == other.path)
+                })
+        })
+    }
+
     pub async fn finalize_deletion(&self, run_id: &str) -> Result<()> {
         self.remove(run_id).await.map(|_| ())
     }
 
     pub(crate) async fn insert(&self, record: RunRecord) -> Result<()> {
-        self.records
-            .write()
-            .await
-            .insert(record.summary.id.clone(), record);
-        self.persist().await
+        let run_id = record.summary.id.clone();
+        let previous = self.records.write().await.insert(run_id.clone(), record);
+        if let Err(error) = self.persist().await {
+            let mut records = self.records.write().await;
+            if let Some(previous) = previous {
+                records.insert(run_id, previous);
+            } else {
+                records.remove(&run_id);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) async fn get(&self, run_id: &str) -> Result<RunRecord> {
@@ -179,6 +238,48 @@ impl SessionRegistry {
                 ))
             .then(|| record.clone())
         })
+    }
+
+    pub(crate) async fn native_target_active_runs(
+        &self,
+        target_id: &str,
+        destination: &str,
+    ) -> usize {
+        self.records
+            .read()
+            .await
+            .values()
+            .filter(|record| {
+                let BackendSession::Native {
+                    remote: true,
+                    target_id: persisted_target,
+                    ..
+                } = &record.session
+                else {
+                    return false;
+                };
+                let belongs_to_target = persisted_target.as_deref() == Some(target_id)
+                    || (persisted_target.is_none()
+                        && record
+                            .summary
+                            .workspace
+                            .as_ref()
+                            .and_then(|workspace| workspace.host.as_deref())
+                            == Some(destination));
+                belongs_to_target
+                    && (record.deletion.is_some()
+                        || matches!(
+                            record.summary.state,
+                            RunState::Provisioning
+                                | RunState::Starting
+                                | RunState::Running
+                                | RunState::NeedsInput
+                                | RunState::Idle
+                                | RunState::Failed
+                                | RunState::Disconnected
+                        ))
+            })
+            .count()
     }
 
     pub(crate) async fn update_summary(&self, summary: RunSummary) -> Result<()> {
@@ -221,7 +322,12 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub(crate) async fn begin_deletion(&self, run_id: &str, force: bool) -> Result<()> {
+    pub(crate) async fn begin_deletion(
+        &self,
+        run_id: &str,
+        force: bool,
+        expected_inspection: Option<agent_launcher_core::WorktreeInspection>,
+    ) -> Result<()> {
         let mut records = self.records.write().await;
         let record = records
             .get_mut(run_id)
@@ -230,6 +336,7 @@ impl SessionRegistry {
         record.deletion = Some(DeletionState {
             force,
             completed: false,
+            expected_inspection,
         });
         drop(records);
         if let Err(error) = self.persist().await {
@@ -278,13 +385,43 @@ impl SessionRegistry {
         Ok(())
     }
 
+    pub async fn fail_deletion(&self, run_id: &str, message: String) -> Result<RunSummary> {
+        let mut records = self.records.write().await;
+        let record = records
+            .get_mut(run_id)
+            .ok_or_else(|| Error::RunNotFound(run_id.to_owned()))?;
+        let previous = record.clone();
+        record.deletion = None;
+        record.summary.state = RunState::Failed;
+        record.summary.message = Some(message);
+        record.summary.updated_at = chrono::Utc::now();
+        let summary = record.summary.clone();
+        drop(records);
+        if let Err(error) = self.persist().await {
+            self.records
+                .write()
+                .await
+                .insert(run_id.to_owned(), previous);
+            return Err(error);
+        }
+        Ok(summary)
+    }
+
     pub(crate) async fn deletion_pending(&self, run_id: &str) -> bool {
         self.records.read().await.get(run_id).is_some_and(|record| {
             record
                 .deletion
                 .as_ref()
-                .is_some_and(|state| state.completed)
+                .is_some_and(|deletion| deletion.completed)
         })
+    }
+
+    pub(crate) async fn deletion_in_progress(&self, run_id: &str) -> bool {
+        self.records
+            .read()
+            .await
+            .get(run_id)
+            .is_some_and(|record| record.deletion.is_some())
     }
 
     pub(crate) async fn remove(&self, run_id: &str) -> Result<RunRecord> {
@@ -337,6 +474,12 @@ impl SessionRegistry {
         fs::create_dir_all(parent).await?;
         let temporary = self.path.with_extension(format!("tmp-{}", Uuid::new_v4()));
         fs::write(&temporary, bytes).await?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary, {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o600)
+        })
+        .await?;
         fs::rename(&temporary, &self.path).await?;
         Ok(())
     }
@@ -344,7 +487,7 @@ impl SessionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use agent_launcher_core::{BackendKind, RunState, WorkspaceRef};
+    use agent_launcher_core::{BackendKind, RunState, WorkspaceRef, WorktreeInspection};
     use chrono::Utc;
 
     use super::*;
@@ -379,6 +522,38 @@ mod tests {
             },
             deletion: None,
         }
+    }
+
+    fn native_record(
+        id: &str,
+        state: RunState,
+        target_id: Option<&str>,
+        destination: &str,
+    ) -> RunRecord {
+        let mut record = conductor_record(id, state, "unused");
+        record.summary.workspace = Some(WorkspaceRef {
+            backend: BackendKind::Native,
+            id: format!("workspace-{id}"),
+            host: Some(destination.into()),
+            path: Some(format!("/srv/workspaces/{id}").into()),
+            branch: format!("agent/{id}"),
+        });
+        record.session = BackendSession::Native {
+            base_url: "http://127.0.0.1:31234/".into(),
+            remote: true,
+            target_id: target_id.map(str::to_owned),
+            remote_workspace_path: Some(format!("/srv/workspaces/{id}")),
+            remote_port: Some(38123),
+            server_password: Some("secret".into()),
+            process_id: None,
+            initial_prompt: None,
+            pending_permission_id: None,
+            pending_question_id: None,
+            pending_question_count: 0,
+            pending_question_prompt: None,
+            last_message_id: None,
+        };
+        record
     }
 
     #[tokio::test]
@@ -446,8 +621,13 @@ mod tests {
             .insert(conductor_record("deleted", RunState::Running, "dispatch"))
             .await
             .expect("record should persist");
+        let expected = WorktreeInspection {
+            has_uncommitted_changes: true,
+            fingerprint: Some("confirmed-state".into()),
+            ..WorktreeInspection::default()
+        };
         registry
-            .begin_deletion("deleted", true)
+            .begin_deletion("deleted", true, Some(expected.clone()))
             .await
             .expect("deletion intent should persist");
         drop(registry);
@@ -458,15 +638,20 @@ mod tests {
         assert!(reloaded.summaries().await.is_empty());
         assert_eq!(reloaded.pending_deletions().await, [PendingDeletion {
             run_id: "deleted".into(),
+            backend: Some(BackendKind::Conductor),
+            force: true,
             completed: false,
+            expected_inspection: Some(expected),
         }]);
+        assert!(reloaded.deletion_in_progress("deleted").await);
+        assert!(!reloaded.deletion_pending("deleted").await);
         reloaded
             .cancel_deletion("deleted")
             .await
             .expect("incomplete deletion should be recoverable");
         assert_eq!(reloaded.summaries().await.len(), 1);
         reloaded
-            .begin_deletion("deleted", true)
+            .begin_deletion("deleted", true, None)
             .await
             .expect("deletion should restart");
         reloaded
@@ -480,13 +665,46 @@ mod tests {
             .expect("registry should reload again");
         assert_eq!(reloaded.pending_deletions().await, [PendingDeletion {
             run_id: "deleted".into(),
+            backend: Some(BackendKind::Conductor),
+            force: true,
             completed: true,
+            expected_inspection: None,
         }]);
+        assert!(reloaded.deletion_in_progress("deleted").await);
+        assert!(reloaded.deletion_pending("deleted").await);
         reloaded
             .finalize_deletion("deleted")
             .await
             .expect("tombstone should be removable");
         assert!(reloaded.pending_deletions().await.is_empty());
+        let _ = fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn deletion_recovery_detects_another_live_workspace_owner() {
+        let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        let mut target = conductor_record("target", RunState::Failed, "target");
+        let mut other = conductor_record("other", RunState::Disconnected, "other");
+        let workspace = WorkspaceRef {
+            backend: BackendKind::Native,
+            id: "shared-workspace".into(),
+            host: Some("buildbox".into()),
+            path: Some("/srv/shared-workspace".into()),
+            branch: "agent/target".into(),
+        };
+        target.summary.workspace = Some(workspace.clone());
+        other.summary.workspace = Some(WorkspaceRef {
+            branch: "agent/other".into(),
+            ..workspace
+        });
+        registry.insert(target).await.unwrap();
+        registry.insert(other).await.unwrap();
+        registry.begin_deletion("target", true, None).await.unwrap();
+
+        assert!(registry.has_other_workspace_owner("target").await);
+        registry.remove("other").await.unwrap();
+        assert!(!registry.has_other_workspace_owner("target").await);
         let _ = fs::remove_file(path).await;
     }
 
@@ -499,7 +717,12 @@ mod tests {
         }))
         .expect("legacy native session should load");
         assert!(matches!(native, BackendSession::Native {
+            target_id: None,
+            remote_workspace_path: None,
+            remote_port: None,
+            server_password: None,
             process_id: None,
+            initial_prompt: None,
             pending_permission_id: None,
             pending_question_id: None,
             pending_question_count: 0,
@@ -548,8 +771,16 @@ mod tests {
         let mut record = conductor_record("native", RunState::Running, "unused");
         record.session = BackendSession::Native {
             base_url: "http://127.0.0.1:31234/".into(),
-            remote: false,
+            remote: true,
+            target_id: Some("builder".into()),
+            remote_workspace_path: Some("~/.local/share/agent-launcher/workspaces/issue".into()),
+            remote_port: Some(38123),
+            server_password: Some("secret".into()),
             process_id: Some(4321),
+            initial_prompt: Some(serde_json::json!({
+                "messageID": "msg_initial",
+                "parts": [{"type": "text", "text": "Fix it"}]
+            })),
             pending_permission_id: None,
             pending_question_id: None,
             pending_question_count: 0,
@@ -560,6 +791,14 @@ mod tests {
             .insert(record)
             .await
             .expect("native record should persist");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).await.unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         drop(registry);
 
         let reloaded = SessionRegistry::load(Some(path.clone()))
@@ -572,10 +811,117 @@ mod tests {
                 .expect("record should exist")
                 .session,
             BackendSession::Native {
+                target_id: Some(ref target_id),
                 process_id: Some(4321),
+                initial_prompt: Some(ref initial_prompt),
+                remote_workspace_path: Some(ref path),
+                remote_port: Some(38123),
+                server_password: Some(ref password),
                 ..
-            }
+            } if target_id == "builder" && initial_prompt["messageID"] == "msg_initial" && path == "~/.local/share/agent-launcher/workspaces/issue" && password == "secret"
         ));
+        let _ = fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn native_capacity_counts_resumable_and_deleting_runs() {
+        let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        registry
+            .insert(native_record(
+                "running",
+                RunState::Running,
+                Some("builder"),
+                "new-host",
+            ))
+            .await
+            .unwrap();
+        registry
+            .insert(native_record(
+                "failed",
+                RunState::Failed,
+                Some("builder"),
+                "new-host",
+            ))
+            .await
+            .unwrap();
+        registry
+            .insert(native_record(
+                "legacy",
+                RunState::Disconnected,
+                None,
+                "new-host",
+            ))
+            .await
+            .unwrap();
+        registry
+            .insert(native_record(
+                "cancelled",
+                RunState::Cancelled,
+                Some("builder"),
+                "new-host",
+            ))
+            .await
+            .unwrap();
+        registry
+            .begin_deletion("cancelled", true, None)
+            .await
+            .unwrap();
+        registry
+            .insert(native_record(
+                "other",
+                RunState::Running,
+                Some("other"),
+                "other-host",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .native_target_active_runs("builder", "new-host")
+                .await,
+            4
+        );
+        assert_eq!(
+            registry
+                .native_target_active_runs("other", "other-host")
+                .await,
+            1
+        );
+        let _ = fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn failed_deletion_becomes_visible_and_retains_capacity() {
+        let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        registry
+            .insert(native_record(
+                "failed-delete",
+                RunState::Cancelled,
+                Some("builder"),
+                "builder",
+            ))
+            .await
+            .unwrap();
+        registry
+            .begin_deletion("failed-delete", true, None)
+            .await
+            .unwrap();
+
+        let summary = registry
+            .fail_deletion("failed-delete", "host unavailable".into())
+            .await
+            .unwrap();
+        assert_eq!(summary.state, RunState::Failed);
+        assert_eq!(registry.summaries().await.len(), 1);
+        assert_eq!(
+            registry
+                .native_target_active_runs("builder", "builder")
+                .await,
+            1
+        );
         let _ = fs::remove_file(path).await;
     }
 

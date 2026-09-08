@@ -1,4 +1,6 @@
-use agent_launcher_core::{Issue, IssueKey, RunSummary, RuntimeSnapshot, WorktreeDeletePreview};
+use agent_launcher_core::{
+    BackendKind, Issue, IssueKey, RunSummary, RuntimeSnapshot, WorktreeDeletePreview,
+};
 
 use crate::{
     activity::AgentActivity,
@@ -29,6 +31,13 @@ pub(crate) struct DeleteOverlay {
 pub(crate) struct DispatchOverlay {
     pub issue_key: IssueKey,
     pub cursor: usize,
+    pub stage: DispatchStage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DispatchStage {
+    Prompt,
+    Target { profile: Option<String> },
 }
 
 #[derive(Default)]
@@ -108,21 +117,45 @@ impl AppState {
     }
 
     pub fn reconcile_dispatch(&mut self, snapshot: &RuntimeSnapshot) -> bool {
-        let Some(overlay) = self.dispatch_overlay.as_mut() else {
+        let Some(overlay) = self.dispatch_overlay.as_ref() else {
             return false;
         };
         if !snapshot
             .issues
             .iter()
             .any(|issue| issue.key == overlay.issue_key)
-            || snapshot.prompt_profiles.is_empty()
         {
             self.dispatch_overlay = None;
             self.status_message =
-                Some("prompt chooser closed because its issue or profiles are unavailable".into());
+                Some("dispatch chooser closed because its issue is unavailable".into());
             return true;
         }
-        overlay.cursor = overlay.cursor.min(snapshot.prompt_profiles.len() - 1);
+        let (count, unavailable) = match &overlay.stage {
+            DispatchStage::Prompt => (
+                snapshot.prompt_profiles.len(),
+                snapshot
+                    .prompt_profiles
+                    .is_empty()
+                    .then_some("prompt chooser closed because its profiles are unavailable"),
+            ),
+            DispatchStage::Target { .. }
+                if snapshot.selected_backend != Some(BackendKind::Native)
+                    || snapshot.compute_targets.is_empty() =>
+            {
+                (
+                    0,
+                    Some("compute target chooser closed because targets are unavailable"),
+                )
+            },
+            DispatchStage::Target { .. } => (snapshot.compute_targets.len() + 1, None),
+        };
+        if let Some(message) = unavailable {
+            self.dispatch_overlay = None;
+            self.status_message = Some(message.into());
+            return true;
+        }
+        let overlay = self.dispatch_overlay.as_mut().expect("overlay exists");
+        overlay.cursor = overlay.cursor.min(count - 1);
         false
     }
 

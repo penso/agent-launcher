@@ -8,6 +8,7 @@ use agent_launcher_core::{
     AppConfig, BackendConfig, BackendKind, BackendStatus, EventEnvelope, Issue, IssueKey,
     IssueProvider, OutputStream, PromptProfile, Repository, RunEvent, RunState, RunSummary,
     RuntimeCommand, RuntimeSnapshot, SourceStatus, WorktreeDeleteAction, WorktreeDeletePreview,
+    WorktreeInspection,
 };
 use agent_launcher_issues::{IssueSource, SyncCheckpoint, SyncMode};
 use agent_launcher_runner::{
@@ -26,6 +27,7 @@ use crate::{DesktopNotifier, Error, NoopNotifier, NotifyRustNotifier, Result};
 
 const COMMAND_CAPACITY: usize = 64;
 const RUN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const TARGET_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_IN_MEMORY_EVENTS: usize = 256;
 
 type RuntimeJoin = JoinHandle<Result<()>>;
@@ -41,6 +43,7 @@ pub struct RuntimeHandle {
     commands: mpsc::Sender<CommandRequest>,
     snapshots: watch::Receiver<RuntimeSnapshot>,
     task: Arc<Mutex<Option<RuntimeJoin>>>,
+    runner: Arc<Runner>,
 }
 
 impl RuntimeHandle {
@@ -74,7 +77,21 @@ impl RuntimeHandle {
     }
 
     pub async fn dispatch(&self, issue: IssueKey, profile: Option<String>) -> Result<()> {
-        self.send(RuntimeCommand::Dispatch { issue, profile }).await
+        self.dispatch_on_target(issue, profile, None).await
+    }
+
+    pub async fn dispatch_on_target(
+        &self,
+        issue: IssueKey,
+        profile: Option<String>,
+        target: Option<String>,
+    ) -> Result<()> {
+        self.send(RuntimeCommand::Dispatch {
+            issue,
+            profile,
+            target,
+        })
+        .await
     }
 
     pub async fn send_input(
@@ -123,21 +140,21 @@ impl RuntimeHandle {
         } else {
             WorktreeDeleteAction::Delete
         };
-        let (
-            has_uncommitted_changes,
-            has_ignored_files,
-            unpushed_commits,
-            inspection_warning,
-            inspection_fingerprint,
-        ) = inspect_worktree(workspace.host.as_deref(), workspace.path.as_deref()).await;
+        let inspection = inspect_worktree(
+            &self.runner,
+            &run_id,
+            workspace.host.as_deref(),
+            workspace.path.as_deref(),
+        )
+        .await;
         Ok(WorktreeDeletePreview {
             run,
             action,
-            has_uncommitted_changes,
-            has_ignored_files,
-            unpushed_commits,
-            inspection_warning,
-            inspection_fingerprint,
+            has_uncommitted_changes: inspection.has_uncommitted_changes,
+            has_ignored_files: inspection.has_ignored_files,
+            unpushed_commits: inspection.unpushed_commits,
+            inspection_warning: inspection.warning,
+            inspection_fingerprint: inspection.fingerprint,
         })
     }
 
@@ -242,6 +259,7 @@ impl RuntimeService {
             commands: command_tx,
             snapshots: snapshot_rx,
             task: Arc::clone(&task),
+            runner: Arc::clone(&runner),
         };
         (
             Self {
@@ -312,6 +330,9 @@ impl RuntimeService {
         let mut run_tick =
             tokio::time::interval_at(Instant::now() + RUN_POLL_INTERVAL, RUN_POLL_INTERVAL);
         run_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut target_tick =
+            tokio::time::interval_at(Instant::now() + TARGET_POLL_INTERVAL, TARGET_POLL_INTERVAL);
+        target_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -323,6 +344,7 @@ impl RuntimeService {
                 }
                 _ = issue_tick.tick() => self.launch_source_refreshes(),
                 _ = run_tick.tick() => self.launch_run_refreshes(),
+                _ = target_tick.tick() => self.launch_detection(),
                 Some(result) = self.work.join_next(), if !self.work.is_empty() => {
                     match result {
                         Ok(result) => self.handle_work_result(result).await,
@@ -414,8 +436,14 @@ impl RuntimeService {
         }
         let (name, result, shutdown) = match command {
             RuntimeCommand::Refresh => unreachable!("refresh handled above"),
-            RuntimeCommand::Dispatch { issue, profile } => {
-                let result = self.dispatch_issue(&issue, profile.as_deref()).await;
+            RuntimeCommand::Dispatch {
+                issue,
+                profile,
+                target,
+            } => {
+                let result = self
+                    .dispatch_issue(&issue, profile.as_deref(), target.as_deref())
+                    .await;
                 ("dispatch", result, false)
             },
             RuntimeCommand::SendInput { run_id, text } => {
@@ -449,6 +477,9 @@ impl RuntimeService {
             },
             RuntimeCommand::Shutdown => ("shutdown", Ok(()), true),
         };
+        if result.is_ok() && matches!(name, "dispatch" | "stop" | "delete-worktree") {
+            self.launch_detection();
+        }
         self.record_command_result(name, &result);
         let _ = acknowledge.send(result);
         shutdown
@@ -462,14 +493,22 @@ impl RuntimeService {
         }
     }
 
-    async fn dispatch_issue(&mut self, key: &IssueKey, profile: Option<&str>) -> Result<()> {
+    async fn dispatch_issue(
+        &mut self,
+        key: &IssueKey,
+        profile: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<()> {
         let canonical = key.canonical();
-        if self
-            .snapshot
-            .runs
-            .iter()
-            .any(|run| run.issue_key == canonical && run.state.is_active())
-        {
+        if self.snapshot.runs.iter().any(|run| {
+            run.issue_key == canonical
+                && (run.state.is_active()
+                    || (matches!(run.state, RunState::Disconnected | RunState::Failed)
+                        && run
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|workspace| workspace.backend == BackendKind::Native)))
+        }) {
             return Ok(());
         }
         let issue = self
@@ -504,6 +543,7 @@ impl RuntimeService {
             base_branch: None,
             model: self.config.agent.model.clone(),
             effort: self.config.agent.effort.clone(),
+            target: target.map(str::to_owned),
         };
         let result = self.runner.dispatch(backend, request).await?;
         let mut run = result.run;
@@ -513,7 +553,12 @@ impl RuntimeService {
             run.updated_at = Utc::now();
             self.run_refresh_unsupported.insert(run.id.clone());
         }
-        self.store.insert_run(&run).await?;
+        if let Err(error) = self.store.insert_run(&run).await {
+            self.next_sequences.insert(run.id.clone(), 0);
+            self.upsert_snapshot_run(run);
+            self.publish();
+            return Err(error.into());
+        }
         self.next_sequences.insert(run.id.clone(), 0);
         self.upsert_snapshot_run(run);
         self.publish();
@@ -533,29 +578,44 @@ impl RuntimeService {
             .workspace
             .as_ref()
             .ok_or_else(|| Error::WorkspaceUnavailable(run_id.clone()))?;
+        if let Some(active_run) = self.snapshot.runs.iter().find(|other| {
+            other.id != *run_id
+                && (other.state.is_active()
+                    || (matches!(other.state, RunState::Disconnected | RunState::Failed)
+                        && workspace.backend == BackendKind::Native))
+                && other.workspace.as_ref().is_some_and(|other_workspace| {
+                    same_physical_workspace(workspace, other_workspace)
+                })
+        }) {
+            return Err(Error::WorkspaceInUse {
+                run_id: run_id.clone(),
+                active_run_id: active_run.id.clone(),
+            });
+        }
         if preview.run.workspace.as_ref() != Some(workspace) {
             return Err(Error::WorktreeChanged(run_id.clone()));
         }
-        let (
-            has_uncommitted_changes,
-            has_ignored_files,
-            unpushed_commits,
-            inspection_warning,
-            inspection_fingerprint,
-        ) = inspect_worktree(workspace.host.as_deref(), workspace.path.as_deref()).await;
-        if has_uncommitted_changes != preview.has_uncommitted_changes
-            || has_ignored_files != preview.has_ignored_files
-            || unpushed_commits != preview.unpushed_commits
-            || inspection_warning != preview.inspection_warning
-            || inspection_fingerprint != preview.inspection_fingerprint
+        let inspection = inspect_worktree(
+            &self.runner,
+            run_id,
+            workspace.host.as_deref(),
+            workspace.path.as_deref(),
+        )
+        .await;
+        if inspection.has_uncommitted_changes != preview.has_uncommitted_changes
+            || inspection.has_ignored_files != preview.has_ignored_files
+            || inspection.unpushed_commits != preview.unpushed_commits
+            || inspection.warning != preview.inspection_warning
+            || inspection.fingerprint != preview.inspection_fingerprint
         {
             return Err(Error::WorktreeChanged(run_id.clone()));
         }
         let backend = workspace.backend;
         let deletion_pending = self.runner.deletion_pending(run_id).await;
+        let deletion_in_progress = self.runner.deletion_in_progress(run_id).await;
         self.invalidate_run_refresh(run_id);
         self.run_refresh_pending.remove(run_id);
-        if !deletion_pending
+        if !deletion_in_progress
             && (run.state.is_active() || backend == BackendKind::Native)
             && backend != BackendKind::Conductor
             && self.runner.supports(backend, Capability::Stop)?
@@ -568,26 +628,25 @@ impl RuntimeService {
             {
                 return Err(error.into());
             }
-            let stopped_inspection =
-                inspect_worktree(workspace.host.as_deref(), workspace.path.as_deref()).await;
-            if stopped_inspection
-                != (
-                    has_uncommitted_changes,
-                    has_ignored_files,
-                    unpushed_commits,
-                    inspection_warning.clone(),
-                    inspection_fingerprint.clone(),
-                )
-            {
+            let stopped_inspection = inspect_worktree(
+                &self.runner,
+                run_id,
+                workspace.host.as_deref(),
+                workspace.path.as_deref(),
+            )
+            .await;
+            if stopped_inspection != inspection {
                 return Err(Error::WorktreeChanged(run_id.clone()));
             }
         }
-        let force = has_uncommitted_changes
-            || has_ignored_files
-            || unpushed_commits > 0
-            || inspection_warning.is_some();
+        let force = inspection.has_uncommitted_changes
+            || inspection.has_ignored_files
+            || inspection.unpushed_commits > 0
+            || inspection.warning.is_some();
         if !deletion_pending {
-            self.runner.delete_worktree(backend, run_id, force).await?;
+            self.runner
+                .delete_worktree(backend, run_id, force, Some(&inspection))
+                .await?;
         }
         if let Err(error) = self.store.delete_run(run_id).await
             && !matches!(error, StoreError::RunNotFound(_))
@@ -847,9 +906,20 @@ impl RuntimeService {
             sequence = sequence.saturating_add(1);
         }
 
-        self.store
+        if let Err(error) = self
+            .store
             .update_run_with_events(&status.run, &events)
-            .await?;
+            .await
+        {
+            if matches!(error, StoreError::RunNotFound(_)) {
+                self.store.upsert_run(&status.run).await?;
+                self.store
+                    .update_run_with_events(&status.run, &events)
+                    .await?;
+            } else {
+                return Err(error.into());
+            }
+        }
         self.next_sequences.insert(status.run.id.clone(), sequence);
         if let Some(output) = changed_output {
             self.last_outputs.insert(status.run.id.clone(), output);
@@ -924,6 +994,10 @@ impl RuntimeService {
                 message: detection.message.clone(),
             })
             .collect();
+        self.snapshot.compute_targets = detections
+            .iter()
+            .find(|detection| detection.backend == BackendKind::Native)
+            .map_or_else(Vec::new, |detection| detection.compute_targets.clone());
 
         self.errors.retain(|key, _| !key.starts_with("backend:"));
         if selected.is_none() {
@@ -1055,40 +1129,35 @@ impl RuntimeHandle {
 }
 
 async fn inspect_worktree(
+    runner: &Runner,
+    run_id: &str,
     host: Option<&str>,
     path: Option<&std::path::Path>,
-) -> (bool, bool, u64, Option<String>, Option<String>) {
+) -> WorktreeInspection {
     if let Some(host) = host {
-        return (
-            false,
-            false,
-            0,
-            Some(format!(
-                "Could not inspect changes on remote host {host}; confirm only if remote work may be discarded."
-            )),
-            None,
-        );
+        return runner.inspect_worktree(run_id).await.unwrap_or_else(|error| {
+            WorktreeInspection {
+                warning: Some(format!(
+                    "Could not inspect changes on remote host {host}: {error}; confirm only if remote work may be discarded."
+                )),
+                ..WorktreeInspection::default()
+            }
+        });
     }
     let Some(path) = path else {
-        return (
-            false,
-            false,
-            0,
-            Some("The manager did not provide a local worktree path, so changes could not be inspected.".into()),
-            None,
-        );
+        return WorktreeInspection {
+            warning: Some("The manager did not provide a local worktree path, so changes could not be inspected.".into()),
+            ..WorktreeInspection::default()
+        };
     };
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return (
-            false,
-            false,
-            0,
-            Some(format!(
+        return WorktreeInspection {
+            warning: Some(format!(
                 "The worktree path {} is unavailable, so changes could not be inspected.",
                 path.display()
             )),
-            None,
-        );
+            ..WorktreeInspection::default()
+        };
     }
 
     let status = git_output(path, &[
@@ -1117,14 +1186,23 @@ async fn inspect_worktree(
         .flatten()
         .collect::<Vec<_>>()
         .join("; ");
-    (
+    WorktreeInspection {
         has_uncommitted_changes,
         has_ignored_files,
         unpushed_commits,
-        (!errors.is_empty())
+        warning: (!errors.is_empty())
             .then(|| format!("Worktree safety inspection was incomplete: {errors}")),
-        inspection_fingerprint,
-    )
+        fingerprint: inspection_fingerprint,
+    }
+}
+
+fn same_physical_workspace(
+    left: &agent_launcher_core::WorkspaceRef,
+    right: &agent_launcher_core::WorkspaceRef,
+) -> bool {
+    left.backend == right.backend
+        && left.host == right.host
+        && (left.id == right.id || left.path == right.path)
 }
 
 async fn worktree_fingerprint(path: &std::path::Path) -> std::result::Result<String, String> {
@@ -1548,6 +1626,7 @@ mod tests {
                     && matches!(self.kind, BackendKind::Superset | BackendKind::Herdr),
                 capabilities: self.capabilities(),
                 message: (!self.available).then(|| "mock unavailable".to_owned()),
+                compute_targets: Vec::new(),
             })
         }
 
@@ -1657,6 +1736,7 @@ mod tests {
             &self,
             run_id: &str,
             _force: bool,
+            _expected: Option<&WorktreeInspection>,
         ) -> agent_launcher_runner::Result<()> {
             self.runs
                 .lock()
@@ -1737,6 +1817,7 @@ mod tests {
                 effort: Some("high".to_owned()),
             },
             superset_host: None,
+            compute: None,
             ssh: None,
             notifications: NotificationConfig { desktop: true },
             prompt_profiles: Vec::new(),
@@ -1776,6 +1857,7 @@ mod tests {
                 && matches!(backend, BackendKind::Superset | BackendKind::Herdr),
             capabilities: BackendCapabilities::default(),
             message: None,
+            compute_targets: Vec::new(),
         };
         let detections = [
             detection(BackendKind::Native, true),
@@ -1883,7 +1965,11 @@ mod tests {
             Err(Error::PromptProfileNotFound(profile)) if profile == "missing"
         ));
         handle
-            .dispatch(ready.issues[0].key.clone(), Some("reviewer".to_owned()))
+            .dispatch_on_target(
+                ready.issues[0].key.clone(),
+                Some("reviewer".to_owned()),
+                Some("builder".to_owned()),
+            )
             .await
             .unwrap();
 
@@ -1891,6 +1977,10 @@ mod tests {
         assert_eq!(
             backend.requests.lock().unwrap()[0].prompt,
             "Review Profile dispatch: Description for 44"
+        );
+        assert_eq!(
+            backend.requests.lock().unwrap()[0].target.as_deref(),
+            Some("builder")
         );
         handle.shutdown().await.unwrap();
         let _ = tokio::fs::remove_file(path).await;
@@ -2433,6 +2523,8 @@ mod tests {
             "user.name=Agent Launcher",
             "-c",
             "user.email=agent-launcher@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "--quiet",
             "-m",
@@ -2461,5 +2553,23 @@ mod tests {
         let ignored_second = worktree_fingerprint(&path).await.unwrap();
         assert_ne!(ignored_first, ignored_second);
         let _ = tokio::fs::remove_dir_all(path).await;
+    }
+
+    #[test]
+    fn physical_workspace_identity_ignores_mutable_branch_metadata() {
+        let left = WorkspaceRef {
+            backend: BackendKind::Native,
+            id: "workspace-1".into(),
+            host: Some("buildbox".into()),
+            path: Some("/srv/workspace-1".into()),
+            branch: "agent/first".into(),
+        };
+        let mut right = left.clone();
+        right.branch = "agent/renamed".into();
+        assert!(same_physical_workspace(&left, &right));
+
+        right.path = Some("/srv/workspace-2".into());
+        right.id = "workspace-2".into();
+        assert!(!same_physical_workspace(&left, &right));
     }
 }

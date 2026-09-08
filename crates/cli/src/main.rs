@@ -1,11 +1,14 @@
 #[cfg(feature = "tui")]
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 #[cfg(feature = "tui")]
-use agent_launcher_core::{AppConfig, PromptProfile};
+use agent_launcher_core::{
+    AppConfig, BackendKind, ComputePlacement, ComputeTargetConfig, PromptProfile,
+};
 #[cfg(feature = "tui")]
 use agent_launcher_issues::sources_from_cwd_with_remote;
 #[cfg(feature = "tui")]
@@ -112,29 +115,7 @@ async fn run(remote_url: Option<&str>) -> Result<(), Error> {
 
     let store = Store::open(data_dir.join("state.sqlite3")).await?;
     let registry = SessionRegistry::load(Some(data_dir.join("runner-sessions.json"))).await?;
-    for deletion in registry.pending_deletions().await {
-        if deletion.completed {
-            if let Err(error) = store.delete_run(&deletion.run_id).await
-                && !matches!(error, StoreError::RunNotFound(_))
-            {
-                return Err(error.into());
-            }
-            registry.finalize_deletion(&deletion.run_id).await?;
-        } else {
-            registry.cancel_deletion(&deletion.run_id).await?;
-        }
-    }
-    for run in registry.summaries().await {
-        store.upsert_run(&run).await?;
-    }
-    let native_config = NativeConfig {
-        ssh: config.ssh.as_ref().map(|ssh| NativeSshConfig {
-            destination: ssh.host.clone(),
-            workspace_root: ssh.workspace_root.clone(),
-            wake: ssh.wake.clone(),
-        }),
-        ..NativeConfig::default()
-    };
+    let native_config = native_config(&config);
     let backends: Vec<Arc<dyn Backend>> = vec![
         Arc::new(SupersetBackend::new(
             SupersetConfig {
@@ -155,6 +136,76 @@ async fn run(remote_url: Option<&str>) -> Result<(), Error> {
         )),
     ];
     let runner = Arc::new(Runner::new(backends));
+    for deletion in registry.pending_deletions().await {
+        if !deletion.completed {
+            if deletion.backend == Some(BackendKind::Native) {
+                if registry.has_other_workspace_owner(&deletion.run_id).await {
+                    registry.cancel_deletion(&deletion.run_id).await?;
+                    continue;
+                }
+                let Some(expected) = deletion.expected_inspection.as_ref() else {
+                    let message = "could not safely resume worktree deletion because the original inspection was not persisted".to_owned();
+                    eprintln!("agent-launcher: {message} ({})", deletion.run_id);
+                    let run = registry.fail_deletion(&deletion.run_id, message).await?;
+                    store.upsert_run(&run).await?;
+                    continue;
+                };
+                if expected.warning.is_some() || expected.fingerprint.is_none() {
+                    let message = "could not safely resume worktree deletion because the original inspection was incomplete; review and confirm deletion again".to_owned();
+                    eprintln!("agent-launcher: {message} ({})", deletion.run_id);
+                    let run = registry.fail_deletion(&deletion.run_id, message).await?;
+                    store.upsert_run(&run).await?;
+                    continue;
+                }
+                let current = match runner.inspect_worktree(&deletion.run_id).await {
+                    Ok(inspection) => inspection,
+                    Err(error) => {
+                        let message = format!(
+                            "could not safely resume worktree deletion because inspection failed: {error}"
+                        );
+                        eprintln!("agent-launcher: {message} ({})", deletion.run_id);
+                        let run = registry.fail_deletion(&deletion.run_id, message).await?;
+                        store.upsert_run(&run).await?;
+                        continue;
+                    },
+                };
+                if &current != expected {
+                    let message = "worktree changed after deletion was confirmed; review and confirm deletion again".to_owned();
+                    eprintln!("agent-launcher: {message} ({})", deletion.run_id);
+                    let run = registry.fail_deletion(&deletion.run_id, message).await?;
+                    store.upsert_run(&run).await?;
+                    continue;
+                }
+                if let Err(error) = runner
+                    .delete_worktree(
+                        BackendKind::Native,
+                        &deletion.run_id,
+                        deletion.force,
+                        Some(expected),
+                    )
+                    .await
+                {
+                    let message = format!("could not resume worktree deletion: {error}");
+                    eprintln!("agent-launcher: {message} ({})", deletion.run_id,);
+                    let run = registry.fail_deletion(&deletion.run_id, message).await?;
+                    store.upsert_run(&run).await?;
+                    continue;
+                }
+            } else {
+                registry.cancel_deletion(&deletion.run_id).await?;
+                continue;
+            }
+        }
+        if let Err(error) = store.delete_run(&deletion.run_id).await
+            && !matches!(error, StoreError::RunNotFound(_))
+        {
+            return Err(error.into());
+        }
+        registry.finalize_deletion(&deletion.run_id).await?;
+    }
+    for run in registry.summaries().await {
+        store.upsert_run(&run).await?;
+    }
     let runtime = RuntimeService::start(repository, sources, store, runner, config);
     let tui_result = agent_launcher_tui::run(runtime.clone()).await;
     let shutdown_result = runtime.shutdown().await;
@@ -178,6 +229,11 @@ fn validate_config(config: &AppConfig) -> Result<(), Error> {
     {
         return Err(Error::Usage("superset_host cannot be empty".to_owned()));
     }
+    if config.ssh.is_some() && config.compute.is_some() {
+        return Err(Error::Usage(
+            "configure either legacy [ssh] or [compute], not both".to_owned(),
+        ));
+    }
     if let Some(ssh) = &config.ssh {
         if ssh.host.trim().is_empty() {
             return Err(Error::Usage("ssh.host cannot be empty".to_owned()));
@@ -186,6 +242,57 @@ fn validate_config(config: &AppConfig) -> Result<(), Error> {
             return Err(Error::Usage(
                 "ssh.workspace_root cannot be empty".to_owned(),
             ));
+        }
+    }
+    if let Some(compute) = &config.compute {
+        if compute.targets.is_empty() {
+            return Err(Error::Usage(
+                "compute.targets must contain at least one target".to_owned(),
+            ));
+        }
+        let mut ids = HashSet::new();
+        for target in &compute.targets {
+            if target.id().trim().is_empty() {
+                return Err(Error::Usage("compute target id cannot be empty".to_owned()));
+            }
+            if !ids.insert(target.id()) {
+                return Err(Error::Usage(format!(
+                    "compute target id `{}` is duplicated",
+                    target.id()
+                )));
+            }
+            if target.name().trim().is_empty() {
+                return Err(Error::Usage(format!(
+                    "compute target `{}` name cannot be empty",
+                    target.id()
+                )));
+            }
+            if target.max_active_runs() == Some(0) {
+                return Err(Error::Usage(format!(
+                    "compute target `{}` max_active_runs must be greater than zero",
+                    target.id()
+                )));
+            }
+            match target {
+                ComputeTargetConfig::Ssh {
+                    host,
+                    workspace_root,
+                    ..
+                } => {
+                    if host.trim().is_empty() {
+                        return Err(Error::Usage(format!(
+                            "compute target `{}` host cannot be empty",
+                            target.id()
+                        )));
+                    }
+                    if workspace_root.as_os_str().is_empty() {
+                        return Err(Error::Usage(format!(
+                            "compute target `{}` workspace_root cannot be empty",
+                            target.id()
+                        )));
+                    }
+                },
+            }
         }
     }
     if matches!(
@@ -199,6 +306,50 @@ fn validate_config(config: &AppConfig) -> Result<(), Error> {
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "tui")]
+fn native_config(config: &AppConfig) -> NativeConfig {
+    let (placement, ssh_targets) = if let Some(compute) = &config.compute {
+        let targets = compute
+            .targets
+            .iter()
+            .map(|target| match target {
+                ComputeTargetConfig::Ssh {
+                    id,
+                    name,
+                    host,
+                    workspace_root,
+                    max_active_runs,
+                    wake,
+                } => NativeSshConfig {
+                    id: id.clone(),
+                    name: name.clone().unwrap_or_else(|| id.clone()),
+                    destination: host.clone(),
+                    workspace_root: workspace_root.clone(),
+                    max_active_runs: *max_active_runs,
+                    wake: wake.clone(),
+                },
+            })
+            .collect();
+        (compute.placement, targets)
+    } else if let Some(ssh) = &config.ssh {
+        (ComputePlacement::LeastLoaded, vec![NativeSshConfig {
+            id: "default".to_owned(),
+            name: ssh.host.clone(),
+            destination: ssh.host.clone(),
+            workspace_root: ssh.workspace_root.clone(),
+            max_active_runs: None,
+            wake: ssh.wake.clone(),
+        }])
+    } else {
+        (ComputePlacement::LeastLoaded, Vec::new())
+    };
+    NativeConfig {
+        ssh_targets,
+        placement,
+        ..NativeConfig::default()
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -419,6 +570,100 @@ mod tests {
         let mut config = AppConfig::default();
         config.agent.name.clear();
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn validates_and_maps_named_compute_targets() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [compute]
+            placement = "random"
+
+            [[compute.targets]]
+            provider = "ssh"
+            id = "linux"
+            name = "Linux builder"
+            host = "developer@linux"
+            max_active_runs = 4
+
+            [[compute.targets]]
+            provider = "ssh"
+            id = "mac"
+            host = "developer@mac"
+            "#,
+        )
+        .unwrap();
+        validate_config(&config).unwrap();
+        let native = native_config(&config);
+        assert_eq!(native.placement, ComputePlacement::Random);
+        assert_eq!(native.ssh_targets.len(), 2);
+        assert_eq!(native.ssh_targets[0].id, "linux");
+        assert_eq!(native.ssh_targets[0].name, "Linux builder");
+        assert_eq!(native.ssh_targets[0].max_active_runs, Some(4));
+        assert_eq!(native.ssh_targets[1].name, "mac");
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_compute_configuration() {
+        let both: AppConfig = toml::from_str(
+            r#"
+            [ssh]
+            host = "legacy"
+
+            [compute]
+            [[compute.targets]]
+            provider = "ssh"
+            id = "builder"
+            host = "builder"
+            "#,
+        )
+        .unwrap();
+        assert!(validate_config(&both).is_err());
+
+        let duplicate: AppConfig = toml::from_str(
+            r#"
+            [compute]
+            [[compute.targets]]
+            provider = "ssh"
+            id = "same"
+            host = "one"
+            [[compute.targets]]
+            provider = "ssh"
+            id = "same"
+            host = "two"
+            "#,
+        )
+        .unwrap();
+        assert!(validate_config(&duplicate).is_err());
+
+        let zero: AppConfig = toml::from_str(
+            r#"
+            [compute]
+            [[compute.targets]]
+            provider = "ssh"
+            id = "builder"
+            host = "builder"
+            max_active_runs = 0
+            "#,
+        )
+        .unwrap();
+        assert!(validate_config(&zero).is_err());
+    }
+
+    #[test]
+    fn maps_legacy_ssh_to_the_default_target() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [ssh]
+            host = "developer@legacy"
+            "#,
+        )
+        .unwrap();
+        validate_config(&config).unwrap();
+        let native = native_config(&config);
+        assert_eq!(native.ssh_targets.len(), 1);
+        assert_eq!(native.ssh_targets[0].id, "default");
+        assert_eq!(native.ssh_targets[0].destination, "developer@legacy");
     }
 
     #[test]

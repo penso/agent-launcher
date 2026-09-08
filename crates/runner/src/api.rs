@@ -1,6 +1,8 @@
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
-use agent_launcher_core::{BackendKind, Issue, Repository, RunSummary};
+use agent_launcher_core::{
+    BackendKind, ComputeTargetStatus, Issue, Repository, RunSummary, WorktreeInspection,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -48,6 +50,8 @@ pub struct BackendDetection {
     pub manager_running: bool,
     pub capabilities: BackendCapabilities,
     pub message: Option<String>,
+    #[serde(default)]
+    pub compute_targets: Vec<ComputeTargetStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +65,7 @@ pub struct DispatchRequest {
     pub base_branch: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub target: Option<String>,
 }
 
 impl DispatchRequest {
@@ -113,6 +118,18 @@ pub enum Error {
     ExecutableNotFound(String),
     #[error("backend {0} is unavailable")]
     BackendUnavailable(BackendKind),
+    #[error("compute target is not configured: {0}")]
+    ComputeTargetNotFound(String),
+    #[error("compute target {target} is full ({active}/{maximum} active runs)")]
+    ComputeTargetAtCapacity {
+        target: String,
+        active: usize,
+        maximum: usize,
+    },
+    #[error("no configured compute target has available capacity")]
+    NoComputeTargetCapacity,
+    #[error("no configured compute target is currently available")]
+    NoComputeTargetAvailable,
     #[error("backend {backend} does not support {capability:?}")]
     UnsupportedCapability {
         backend: BackendKind,
@@ -164,9 +181,23 @@ pub trait Backend: Send + Sync {
     async fn send_input(&self, run_id: &str, text: &str) -> Result<()>;
     async fn stop(&self, run_id: &str) -> Result<()>;
     async fn open(&self, run_id: &str) -> Result<OpenResult>;
-    async fn delete_worktree(&self, run_id: &str, force: bool) -> Result<()>;
+    async fn inspect_worktree(&self, _run_id: &str) -> Result<WorktreeInspection> {
+        Err(Error::UnsupportedCapability {
+            backend: self.kind(),
+            capability: Capability::DeleteWorktree,
+        })
+    }
+    async fn delete_worktree(
+        &self,
+        run_id: &str,
+        force: bool,
+        expected: Option<&WorktreeInspection>,
+    ) -> Result<()>;
     async fn deletion_pending(&self, _run_id: &str) -> bool {
         false
+    }
+    async fn deletion_in_progress(&self, run_id: &str) -> bool {
+        self.deletion_pending(run_id).await
     }
     async fn finalize_deletion(&self, _run_id: &str) -> Result<()> {
         Ok(())
@@ -202,6 +233,7 @@ impl Runner {
                     manager_running: false,
                     capabilities: backend.capabilities(),
                     message: Some(error.to_string()),
+                    compute_targets: Vec::new(),
                 }),
             }
         }
@@ -213,6 +245,11 @@ impl Runner {
         backend: BackendKind,
         request: DispatchRequest,
     ) -> Result<DispatchResult> {
+        if backend != BackendKind::Native && request.target.is_some() {
+            return Err(Error::InvalidRequest(format!(
+                "backend {backend} does not support compute target selection"
+            )));
+        }
         self.backend(backend)?.dispatch(request).await
     }
 
@@ -236,13 +273,21 @@ impl Runner {
         backend.open(run_id).await
     }
 
+    pub async fn inspect_worktree(&self, run_id: &str) -> Result<WorktreeInspection> {
+        let backend = self.backend_for_run(run_id).await?;
+        backend.inspect_worktree(run_id).await
+    }
+
     pub async fn delete_worktree(
         &self,
         backend: BackendKind,
         run_id: &str,
         force: bool,
+        expected: Option<&WorktreeInspection>,
     ) -> Result<()> {
-        self.backend(backend)?.delete_worktree(run_id, force).await
+        self.backend(backend)?
+            .delete_worktree(run_id, force, expected)
+            .await
     }
 
     pub fn supports(&self, backend: BackendKind, capability: Capability) -> Result<bool> {
@@ -252,6 +297,15 @@ impl Runner {
     pub async fn deletion_pending(&self, run_id: &str) -> bool {
         for backend in &self.backends {
             if backend.deletion_pending(run_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub async fn deletion_in_progress(&self, run_id: &str) -> bool {
+        for backend in &self.backends {
+            if backend.deletion_in_progress(run_id).await {
                 return true;
             }
         }

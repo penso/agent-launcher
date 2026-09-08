@@ -1,6 +1,9 @@
 use std::{future::Future, io, time::Duration};
 
-use agent_launcher_core::{RunEvent, RuntimeSnapshot, WorktreeDeletePreview};
+use agent_launcher_core::{
+    BackendKind, ComputeTargetAvailability, RunEvent, RunState, RuntimeSnapshot,
+    WorktreeDeletePreview,
+};
 use agent_launcher_runtime::RuntimeHandle;
 use crossterm::{
     cursor::Show,
@@ -16,7 +19,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     Error,
-    app::{AppState, DeleteOverlay, DispatchOverlay, InputOverlay, Route},
+    app::{AppState, DeleteOverlay, DispatchOverlay, DispatchStage, InputOverlay, Route},
     metrics::HostMetricsSampler,
     render::draw,
     rows::{IssueSort, display_rows_matching},
@@ -434,24 +437,49 @@ fn dispatch_selected(
     let Some(issue_key) = dispatch_target(app, snapshot) else {
         return;
     };
-    if snapshot
-        .runs
-        .iter()
-        .any(|run| run.issue_key == issue_key.canonical() && run.state.is_active())
-    {
-        app.status_message = Some("run already active".to_owned());
+    if let Some(run) = snapshot.runs.iter().find(|run| {
+        run.issue_key == issue_key.canonical()
+            && (run.state.is_active()
+                || (matches!(run.state, RunState::Failed | RunState::Disconnected)
+                    && run
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|workspace| workspace.backend == BackendKind::Native)))
+    }) {
+        app.status_message = Some(if run.state.is_active() {
+            "run already active".to_owned()
+        } else {
+            "existing native run must be resumed or deleted before dispatching again".to_owned()
+        });
         return;
     }
-    if snapshot.prompt_profiles.len() > 1 {
+    if let Some(overlay) = staged_dispatch_overlay(issue_key.clone(), snapshot) {
         app.status_message = None;
-        app.dispatch_overlay = Some(DispatchOverlay {
-            issue_key,
-            cursor: 0,
-        });
+        app.dispatch_overlay = Some(overlay);
         return;
     }
     let profile = snapshot.prompt_profiles.first().cloned();
     start_dispatch(app, runtime, actions, issue_key, profile);
+}
+
+fn staged_dispatch_overlay(
+    issue_key: agent_launcher_core::IssueKey,
+    snapshot: &RuntimeSnapshot,
+) -> Option<DispatchOverlay> {
+    let stage = if snapshot.prompt_profiles.len() > 1 {
+        DispatchStage::Prompt
+    } else if has_target_stage(snapshot) {
+        DispatchStage::Target {
+            profile: snapshot.prompt_profiles.first().cloned(),
+        }
+    } else {
+        return None;
+    };
+    Some(DispatchOverlay {
+        issue_key,
+        cursor: 0,
+        stage,
+    })
 }
 
 fn handle_dispatch_key(
@@ -461,30 +489,25 @@ fn handle_dispatch_key(
     runtime: &RuntimeHandle,
     actions: &UiActionSender,
 ) -> bool {
-    let profile_count = snapshot.prompt_profiles.len();
+    let option_count = dispatch_option_count(app, snapshot);
     match key.code {
         KeyCode::Esc => app.dispatch_overlay = None,
-        KeyCode::Up if profile_count > 0 => {
-            if let Some(overlay) = app.dispatch_overlay.as_mut() {
-                overlay.cursor = overlay.cursor.checked_sub(1).unwrap_or(profile_count - 1);
-            }
-        },
-        KeyCode::Down if profile_count > 0 => {
-            if let Some(overlay) = app.dispatch_overlay.as_mut() {
-                overlay.cursor = (overlay.cursor + 1) % profile_count;
-            }
-        },
+        KeyCode::Up if option_count > 0 => move_dispatch_cursor(app, snapshot, false),
+        KeyCode::Down if option_count > 0 => move_dispatch_cursor(app, snapshot, true),
         KeyCode::Char(character @ '1'..='9') => {
             let index = character as usize - '1' as usize;
-            if index < profile_count {
+            if index < option_count {
+                if let Some(overlay) = app.dispatch_overlay.as_mut() {
+                    overlay.cursor = index;
+                }
                 dispatch_from_overlay(app, snapshot, runtime, actions, index);
             }
         },
-        KeyCode::Enter if profile_count > 0 => {
+        KeyCode::Enter if option_count > 0 => {
             let index = app
                 .dispatch_overlay
                 .as_ref()
-                .map_or(0, |overlay| overlay.cursor.min(profile_count - 1));
+                .map_or(0, |overlay| overlay.cursor.min(option_count - 1));
             dispatch_from_overlay(app, snapshot, runtime, actions, index);
         },
         _ => {},
@@ -497,16 +520,149 @@ fn dispatch_from_overlay(
     snapshot: &RuntimeSnapshot,
     runtime: &RuntimeHandle,
     actions: &UiActionSender,
-    profile_index: usize,
+    index: usize,
 ) {
-    let Some(overlay) = app.dispatch_overlay.take() else {
+    let Some(stage) = app
+        .dispatch_overlay
+        .as_ref()
+        .map(|overlay| overlay.stage.clone())
+    else {
         return;
     };
-    let Some(profile) = snapshot.prompt_profiles.get(profile_index).cloned() else {
+    match stage {
+        DispatchStage::Prompt => {
+            if let Some((issue_key, profile)) = select_prompt(app, snapshot, index) {
+                start_dispatch(app, runtime, actions, issue_key, Some(profile));
+            }
+        },
+        DispatchStage::Target { profile } => {
+            let Ok(target) = select_target(app, snapshot, index) else {
+                return;
+            };
+            let issue_key = app
+                .dispatch_overlay
+                .as_ref()
+                .expect("overlay exists")
+                .issue_key
+                .clone();
+            app.dispatch_overlay = None;
+            start_dispatch_on_target(app, runtime, actions, issue_key, profile, target);
+        },
+    }
+}
+
+fn select_target(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    index: usize,
+) -> Result<Option<String>, ()> {
+    if index == 0 {
+        if snapshot
+            .compute_targets
+            .iter()
+            .any(|target| target.is_dispatchable())
+        {
+            return Ok(None);
+        }
+        app.status_message =
+            Some("automatic target unavailable: no compute targets are dispatchable".into());
+        return Err(());
+    }
+    let Some(target) = snapshot.compute_targets.get(index - 1) else {
+        app.status_message = Some("selected compute target is no longer available".into());
+        return Err(());
+    };
+    if !target.is_dispatchable() {
+        app.status_message = Some(target_unavailable_message(target));
+        return Err(());
+    }
+    Ok(Some(target.id.clone()))
+}
+
+fn select_prompt(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    index: usize,
+) -> Option<(agent_launcher_core::IssueKey, String)> {
+    let Some(profile) = snapshot.prompt_profiles.get(index).cloned() else {
         app.status_message = Some("selected prompt profile is no longer available".into());
+        return None;
+    };
+    let overlay = app.dispatch_overlay.as_mut()?;
+    if has_target_stage(snapshot) {
+        overlay.cursor = 0;
+        overlay.stage = DispatchStage::Target {
+            profile: Some(profile),
+        };
+        app.status_message = None;
+        None
+    } else {
+        let issue_key = overlay.issue_key.clone();
+        app.dispatch_overlay = None;
+        Some((issue_key, profile))
+    }
+}
+
+fn has_target_stage(snapshot: &RuntimeSnapshot) -> bool {
+    snapshot.selected_backend == Some(BackendKind::Native) && !snapshot.compute_targets.is_empty()
+}
+
+fn dispatch_option_count(app: &AppState, snapshot: &RuntimeSnapshot) -> usize {
+    app.dispatch_overlay
+        .as_ref()
+        .map_or(0, |overlay| match &overlay.stage {
+            DispatchStage::Prompt => snapshot.prompt_profiles.len(),
+            DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
+        })
+}
+
+fn move_dispatch_cursor(app: &mut AppState, snapshot: &RuntimeSnapshot, forward: bool) {
+    let Some(overlay) = app.dispatch_overlay.as_mut() else {
         return;
     };
-    start_dispatch(app, runtime, actions, overlay.issue_key, Some(profile));
+    let count = match &overlay.stage {
+        DispatchStage::Prompt => snapshot.prompt_profiles.len(),
+        DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
+    };
+    for distance in 1..=count {
+        let candidate = if forward {
+            (overlay.cursor + distance) % count
+        } else {
+            (overlay.cursor + count - distance % count) % count
+        };
+        let enabled = match &overlay.stage {
+            DispatchStage::Prompt => true,
+            DispatchStage::Target { .. } if candidate == 0 => snapshot
+                .compute_targets
+                .iter()
+                .any(|target| target.is_dispatchable()),
+            DispatchStage::Target { .. } => {
+                snapshot.compute_targets[candidate - 1].is_dispatchable()
+            },
+        };
+        if enabled {
+            overlay.cursor = candidate;
+            break;
+        }
+    }
+}
+
+fn target_unavailable_message(target: &agent_launcher_core::ComputeTargetStatus) -> String {
+    if let Some(message) = target.message.as_deref() {
+        return format!("{} unavailable: {message}", target.name);
+    }
+    let status = if target.is_full() {
+        "full"
+    } else {
+        match target.availability {
+            ComputeTargetAvailability::Offline => "offline",
+            ComputeTargetAvailability::Full => "full",
+            ComputeTargetAvailability::Online | ComputeTargetAvailability::Wakeable => {
+                "unavailable"
+            },
+        }
+    };
+    format!("{} is {status}", target.name)
 }
 
 fn start_dispatch(
@@ -524,6 +680,27 @@ fn start_dispatch(
     let runtime = runtime.clone();
     spawn_runtime_action(actions, "agent dispatched", None, async move {
         runtime.dispatch(issue_key, profile).await
+    });
+}
+
+fn start_dispatch_on_target(
+    app: &mut AppState,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+    issue_key: agent_launcher_core::IssueKey,
+    profile: Option<String>,
+    target: Option<String>,
+) {
+    let status = match (profile.as_deref(), target.as_deref()) {
+        (Some(profile), Some(target)) => format!("dispatching {profile} on {target}..."),
+        (None, Some(target)) => format!("dispatching agent on {target}..."),
+        (Some(profile), None) => format!("dispatching {profile}..."),
+        (None, None) => "dispatching agent...".to_owned(),
+    };
+    app.status_message = Some(status);
+    let runtime = runtime.clone();
+    spawn_runtime_action(actions, "agent dispatched", None, async move {
+        runtime.dispatch_on_target(issue_key, profile, target).await
     });
 }
 
@@ -779,8 +956,9 @@ impl Drop for TerminalCleanup {
 #[cfg(test)]
 mod tests {
     use agent_launcher_core::{
-        Issue, IssueKey, IssueProvider, RunState, RunSummary, RuntimeSnapshot,
-        WorktreeDeleteAction, WorktreeDeletePreview,
+        BackendKind, ComputeProvider, ComputeTargetAvailability, ComputeTargetStatus, Issue,
+        IssueKey, IssueProvider, RunState, RunSummary, RuntimeSnapshot, WorktreeDeleteAction,
+        WorktreeDeletePreview,
     };
     use chrono::{Duration, Utc};
 
@@ -806,6 +984,26 @@ mod tests {
             priority: None,
             created_at: Some(Utc::now() - age),
             updated_at: None,
+        }
+    }
+
+    fn compute_target(
+        id: &str,
+        availability: ComputeTargetAvailability,
+        active_runs: usize,
+        max_active_runs: Option<usize>,
+    ) -> ComputeTargetStatus {
+        ComputeTargetStatus {
+            id: id.to_owned(),
+            name: format!("Target {id}"),
+            provider: ComputeProvider::Ssh,
+            availability,
+            active_runs,
+            max_active_runs,
+            cpu_percent: Some(25.0),
+            memory_percent: Some(50.0),
+            sampled_at: Utc::now(),
+            message: None,
         }
     }
 
@@ -986,6 +1184,7 @@ mod tests {
             dispatch_overlay: Some(DispatchOverlay {
                 issue_key: selected.key,
                 cursor: 0,
+                stage: DispatchStage::Prompt,
             }),
             ..AppState::default()
         };
@@ -998,6 +1197,164 @@ mod tests {
         assert!(app.reconcile_dispatch(&snapshot));
         assert!(app.dispatch_overlay.is_none());
         assert!(app.status_message.as_deref().unwrap().contains("closed"));
+    }
+
+    #[test]
+    fn prompt_selection_advances_to_targets_and_preserves_issue_and_profile() {
+        let selected = issue("2", Duration::zero());
+        let selected_key = selected.key.clone();
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected],
+            prompt_profiles: vec!["implementer".to_owned(), "reviewer".to_owned()],
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![compute_target(
+                "local",
+                ComputeTargetAvailability::Online,
+                0,
+                Some(2),
+            )],
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState {
+            dispatch_overlay: Some(DispatchOverlay {
+                issue_key: selected_key.clone(),
+                cursor: 0,
+                stage: DispatchStage::Prompt,
+            }),
+            ..AppState::default()
+        };
+
+        assert_eq!(select_prompt(&mut app, &snapshot, 1), None);
+
+        let overlay = app.dispatch_overlay.as_ref().unwrap();
+        assert_eq!(overlay.issue_key, selected_key);
+        assert_eq!(overlay.cursor, 0);
+        assert_eq!(overlay.stage, DispatchStage::Target {
+            profile: Some("reviewer".to_owned())
+        });
+    }
+
+    #[test]
+    fn target_navigation_skips_offline_and_full_targets() {
+        let selected = issue("2", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![
+                compute_target("offline", ComputeTargetAvailability::Offline, 0, Some(2)),
+                compute_target("ready", ComputeTargetAvailability::Online, 0, Some(2)),
+                compute_target("full", ComputeTargetAvailability::Online, 2, Some(2)),
+            ],
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState {
+            dispatch_overlay: Some(DispatchOverlay {
+                issue_key: selected.key,
+                cursor: 0,
+                stage: DispatchStage::Target { profile: None },
+            }),
+            ..AppState::default()
+        };
+
+        move_dispatch_cursor(&mut app, &snapshot, true);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 2);
+        move_dispatch_cursor(&mut app, &snapshot, true);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 0);
+        move_dispatch_cursor(&mut app, &snapshot, false);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn selecting_a_disabled_target_reports_status_and_keeps_overlay() {
+        let selected = issue("2", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![ComputeTargetStatus {
+                message: Some("host unreachable".to_owned()),
+                ..compute_target("offline", ComputeTargetAvailability::Offline, 0, Some(2))
+            }],
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState {
+            dispatch_overlay: Some(DispatchOverlay {
+                issue_key: selected.key,
+                cursor: 1,
+                stage: DispatchStage::Target {
+                    profile: Some("reviewer".to_owned()),
+                },
+            }),
+            ..AppState::default()
+        };
+
+        assert_eq!(select_target(&mut app, &snapshot, 1), Err(()));
+        assert!(app.dispatch_overlay.is_some());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Target offline unavailable: host unreachable")
+        );
+    }
+
+    #[test]
+    fn native_targets_open_immediately_for_zero_or_one_prompt_profile() {
+        let selected = issue("2", Duration::zero());
+        let mut snapshot = RuntimeSnapshot {
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![compute_target(
+                "local",
+                ComputeTargetAvailability::Online,
+                0,
+                Some(2),
+            )],
+            ..RuntimeSnapshot::default()
+        };
+
+        let overlay = staged_dispatch_overlay(selected.key.clone(), &snapshot).unwrap();
+        assert_eq!(overlay.stage, DispatchStage::Target { profile: None });
+
+        snapshot.prompt_profiles = vec!["implementer".to_owned()];
+        let overlay = staged_dispatch_overlay(selected.key.clone(), &snapshot).unwrap();
+        assert_eq!(overlay.stage, DispatchStage::Target {
+            profile: Some("implementer".to_owned())
+        });
+
+        snapshot.selected_backend = Some(BackendKind::Superset);
+        assert!(staged_dispatch_overlay(selected.key, &snapshot).is_none());
+    }
+
+    #[test]
+    fn target_stage_keeps_selected_profile_when_profiles_refresh() {
+        let selected = issue("2", Duration::zero());
+        let mut app = AppState {
+            dispatch_overlay: Some(DispatchOverlay {
+                issue_key: selected.key.clone(),
+                cursor: 1,
+                stage: DispatchStage::Target {
+                    profile: Some("reviewer".to_owned()),
+                },
+            }),
+            ..AppState::default()
+        };
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected],
+            prompt_profiles: vec!["replacement".to_owned()],
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![compute_target(
+                "ready",
+                ComputeTargetAvailability::Online,
+                0,
+                Some(2),
+            )],
+            ..RuntimeSnapshot::default()
+        };
+
+        assert!(!app.reconcile_dispatch(&snapshot));
+        assert_eq!(
+            app.dispatch_overlay.as_ref().unwrap().stage,
+            DispatchStage::Target {
+                profile: Some("reviewer".to_owned())
+            }
+        );
     }
 
     #[tokio::test]

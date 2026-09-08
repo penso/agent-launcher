@@ -53,6 +53,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dirs",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

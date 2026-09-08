@@ -1,6 +1,8 @@
 use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
-use agent_launcher_core::{BackendKind, Repository, RunState, RunSummary, WorkspaceRef};
+use agent_launcher_core::{
+    BackendKind, Repository, RunState, RunSummary, WorkspaceRef, WorktreeInspection,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::Deserialize;
@@ -155,6 +157,7 @@ impl Backend for HerdrBackend {
             manager_running,
             capabilities: self.capabilities(),
             message: result.err().map(|error| error.to_string()),
+            compute_targets: Vec::new(),
         })
     }
 
@@ -342,12 +345,17 @@ impl Backend for HerdrBackend {
         })
     }
 
-    async fn delete_worktree(&self, run_id: &str, force: bool) -> Result<()> {
+    async fn delete_worktree(
+        &self,
+        run_id: &str,
+        force: bool,
+        _expected: Option<&WorktreeInspection>,
+    ) -> Result<()> {
         let record = self.record(run_id).await?;
         let BackendSession::Herdr { workspace_id, .. } = record.session else {
             unreachable!()
         };
-        self.registry.begin_deletion(run_id, force).await?;
+        self.registry.begin_deletion(run_id, force, None).await?;
         if let Err(error) = self
             .command(worktree_remove_args(&workspace_id, force))
             .await

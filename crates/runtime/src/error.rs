@@ -57,6 +57,12 @@ pub enum Error {
     #[error("run `{0}` has no workspace")]
     WorkspaceUnavailable(String),
 
+    #[error("worktree for run `{run_id}` is still used by active run `{active_run_id}`")]
+    WorkspaceInUse {
+        run_id: String,
+        active_run_id: String,
+    },
+
     #[error(
         "worktree `{0}` changed after it was inspected; review the updated warnings and confirm again"
     )]
