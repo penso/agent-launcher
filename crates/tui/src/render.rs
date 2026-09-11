@@ -189,18 +189,49 @@ fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if inner.height < 2 {
         return;
     }
+    let demo = std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY").is_some();
+    let show_timeline = inner.height >= 3 && inner.width >= 32;
+    let graph = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height - 1 - u16::from(show_timeline),
+    );
+    let data = if demo {
+        demo_activity(graph.width, app.tick)
+    } else {
+        app.agent_activity.sparkline(graph.width as usize)
+    };
+    let color = if demo {
+        theme::primary()
+    } else {
+        activity_color(app)
+    };
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
+            Span::styled("agent activity", Style::new().fg(color).bold()),
             Span::styled(
-                "agent activity",
-                Style::new().fg(activity_color(app)).bold(),
+                if demo {
+                    "  ·  demo"
+                } else {
+                    "  ·  live"
+                },
+                Style::new().fg(theme::muted()),
             ),
-            Span::styled("  ·  live", Style::new().fg(theme::muted())),
         ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let status = if inner.width < 64 && app.agent_activity.attention > 0 {
+    let status = if demo {
+        let working = data.last().copied().unwrap_or(0).div_ceil(25);
+        if working == 0 {
+            "quiet · 15m".to_owned()
+        } else if inner.width < 64 {
+            format!("{working}w · 15m")
+        } else {
+            format!("{working} working · 15m")
+        }
+    } else if inner.width < 64 && app.agent_activity.attention > 0 {
         format!(
             "{}w · {}! · 15m",
             app.agent_activity.working, app.agent_activity.attention
@@ -228,20 +259,32 @@ fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
-    let graph = Rect::new(
-        inner.x,
-        inner.y + 1,
-        inner.width,
-        inner.height.saturating_sub(1),
-    );
-    let data = app.agent_activity.sparkline(graph.width as usize);
-    frame.render_widget(
-        Sparkline::default()
-            .data(&data)
-            .max(100)
-            .style(Style::new().fg(activity_color(app)).bg(theme::panel())),
-        graph,
-    );
+    // Color encodes intensity, not run status: historical samples only store a score.
+    for (column, value) in data.iter().enumerate() {
+        let bar_color = match value {
+            0..=24 => ratatui::style::Color::Rgb(131, 165, 152),
+            25..=49 => theme::done(),
+            50..=74 => ratatui::style::Color::Rgb(215, 185, 112),
+            _ => theme::primary(),
+        };
+        frame.render_widget(
+            Sparkline::default()
+                .data(std::slice::from_ref(value))
+                .max(100)
+                .style(Style::new().fg(bar_color).bg(theme::panel())),
+            Rect::new(graph.x + column as u16, graph.y, 1, graph.height),
+        );
+    }
+    if show_timeline {
+        for (index, label) in ["-15m", "-10m", "-5m", "now"].iter().enumerate() {
+            let width = label.len() as u16;
+            let x = graph.x + (graph.width - width) * index as u16 / 3;
+            frame.render_widget(
+                Paragraph::new(*label).style(Style::new().fg(theme::muted())),
+                Rect::new(x, graph.bottom(), width, 1),
+            );
+        }
+    }
     render_bottom_edge(
         area,
         theme::primary(),
@@ -249,6 +292,20 @@ fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         theme::bg(),
         frame.buffer_mut(),
     );
+}
+
+fn demo_activity(width: u16, tick: u32) -> Vec<u64> {
+    let samples = [
+        0, 0, 4, 9, 6, 8, 28, 52, 34, 38, 36, 41, 18, 8, 3, 0, 0, 0, 6, 22, 68, 44, 48, 46, 72, 92,
+        58, 54, 61, 32, 12, 16, 10, 8, 11, 6, 0, 0, 3, 8, 14, 42, 38, 45, 40, 43, 64, 48, 22, 9, 6,
+        0, 0, 4, 18, 76, 32, 24, 28, 26, 44, 58, 52, 56, 54, 80, 96, 62, 42, 46, 38, 18, 12, 8, 16,
+        34, 52, 48, 56, 50, 68, 58, 62, 54, 74, 60, 48, 52, 46, 58,
+    ];
+    // Advance one terminal column every 960ms using the existing animation ticker.
+    let offset = (tick / 12) as usize;
+    (0..width as usize)
+        .map(|column| samples[((column + offset) * samples.len() / width as usize) % samples.len()])
+        .collect()
 }
 
 fn activity_color(app: &AppState) -> ratatui::style::Color {
@@ -265,7 +322,19 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if area.is_empty() {
         return;
     }
-    let cursor = if (app.tick / 6).is_multiple_of(2) {
+    if app.search_query.is_empty() {
+        frame.render_widget(
+            Paragraph::new("Search issues… type to filter").style(Style::new().fg(theme::muted())),
+            area,
+        );
+        return;
+    }
+    let focused = !app.command_overlay
+        && !app.sort_overlay
+        && app.dispatch_overlay.is_none()
+        && app.input_overlay.is_none()
+        && app.delete_overlay.is_none();
+    let cursor = if focused && (app.tick / 6).is_multiple_of(2) {
         "█"
     } else {
         " "
@@ -1607,7 +1676,7 @@ mod tests {
         assert!(text.contains(theme::LAUNCHER_LOGO[0]));
         assert!(!text.contains("agents · issues · workspaces"));
         assert!(!text.contains("Filter issues..."));
-        assert!(text.contains('█'));
+        assert!(text.contains("Search issues… type to filter"));
         assert!(text.contains("Inbox · 1 source · newest first"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
@@ -1649,9 +1718,50 @@ mod tests {
 
         assert!(before.contains("agent activity  ·  live"));
         assert!(before.contains("quiet · 15m"));
+        for label in ["-15m", "-10m", "-5m", "now"] {
+            assert!(before.contains(label));
+        }
         assert_ne!(before, after);
         assert!(after.contains("1 working · 15m"));
         assert!(after.contains("Repair runtime dispatch"));
+    }
+
+    #[test]
+    fn demo_activity_scrolls_and_keeps_scores_bounded() {
+        assert!(demo_activity(0, 0).is_empty());
+        for width in [1, 32, 90, 180] {
+            let before = demo_activity(width, 0);
+            assert_eq!(before, demo_activity(width, 11));
+            let after = demo_activity(width, 12);
+            assert_eq!(before[1..], after[..after.len() - 1]);
+            assert!(
+                demo_activity(width, u32::MAX)
+                    .iter()
+                    .all(|score| *score <= 100)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_search_shows_placeholder_without_cursor() {
+        let text = render(112, 48, &normal_snapshot(), &mut AppState::default());
+        let line = text
+            .lines()
+            .find(|line| line.contains("Search issues…"))
+            .unwrap();
+        assert!(line.contains("type to filter"));
+        assert!(!line.contains('█'));
+    }
+
+    #[test]
+    fn search_cursor_is_hidden_under_an_overlay() {
+        let mut app = AppState {
+            search_query: "Repair".to_owned(),
+            command_overlay: true,
+            ..AppState::default()
+        };
+        let text = render(112, 48, &normal_snapshot(), &mut app);
+        assert!(!text.contains("Repair█"));
     }
 
     #[test]
@@ -1852,7 +1962,7 @@ mod tests {
         let text = render(36, 12, &normal_snapshot(), &mut AppState::default());
         assert!(text.contains("agent launcher"));
         assert!(!text.contains("Filter issues..."));
-        assert!(text.contains('█'));
+        assert!(text.contains("Search issues… type to filter"));
         assert!(text.contains("Inbox · 1 source · newest first"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));

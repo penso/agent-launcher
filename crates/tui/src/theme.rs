@@ -9,23 +9,23 @@ pub(crate) const LAUNCHER_LOGO: &[&str] = &[
 ];
 
 pub(crate) const fn bg() -> Color {
-    Color::Rgb(10, 10, 10)
+    Color::Rgb(40, 40, 40)
 }
 
 pub(crate) const fn element() -> Color {
-    Color::Rgb(30, 30, 30)
+    Color::Rgb(80, 73, 69)
 }
 
 pub(crate) const fn panel() -> Color {
-    Color::Rgb(20, 20, 20)
+    Color::Rgb(60, 56, 54)
 }
 
 pub(crate) const fn text() -> Color {
-    Color::Rgb(238, 238, 238)
+    Color::Rgb(235, 219, 178)
 }
 
 pub(crate) const fn muted() -> Color {
-    Color::Rgb(128, 128, 128)
+    Color::Rgb(168, 153, 132)
 }
 
 pub(crate) const fn primary() -> Color {
@@ -33,7 +33,7 @@ pub(crate) const fn primary() -> Color {
 }
 
 pub(crate) const fn secondary() -> Color {
-    Color::Rgb(112, 112, 112)
+    Color::Rgb(146, 131, 116)
 }
 
 pub(crate) const fn error() -> Color {
@@ -41,9 +41,9 @@ pub(crate) const fn error() -> Color {
 }
 
 pub(crate) const fn border() -> Color {
-    Color::Rgb(72, 72, 72)
+    Color::Rgb(102, 92, 84)
 }
 
 pub(crate) const fn done() -> Color {
-    Color::Rgb(0, 128, 128)
+    Color::Rgb(142, 192, 124)
 }
