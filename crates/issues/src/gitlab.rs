@@ -217,6 +217,7 @@ struct GitLabIssue {
 impl GitLabIssue {
     fn into_issue(self, source: &SourceKey) -> Issue {
         Issue {
+            pull_request: None,
             key: IssueKey {
                 provider: source.provider,
                 host: source.host.clone(),

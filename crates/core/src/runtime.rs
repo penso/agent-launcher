@@ -95,6 +95,10 @@ pub enum RuntimeCommand {
         profile: Option<String>,
         target: Option<String>,
     },
+    Review {
+        issue: IssueKey,
+        target: Option<String>,
+    },
     SendInput {
         run_id: String,
         text: String,

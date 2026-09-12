@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS issues (
     blocked_by_json TEXT NOT NULL,
     priority INTEGER,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    pull_request_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS issues_source_idx ON issues(source);
@@ -123,7 +124,24 @@ impl Store {
             .max_connections(max_connections)
             .connect_with(options)
             .await?;
-        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::raw_sql(SCHEMA).execute(&mut *transaction).await?;
+        let columns = sqlx::query("PRAGMA table_info(issues)")
+            .fetch_all(&mut *transaction)
+            .await?;
+        if !columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "pull_request_json")
+        {
+            sqlx::query("ALTER TABLE issues ADD COLUMN pull_request_json TEXT")
+                .execute(&mut *transaction)
+                .await?;
+            // Legacy GitHub checkpoints cover issues only; force a full PR bootstrap.
+            sqlx::query("DELETE FROM source_checkpoints WHERE source GLOB 'github:*'")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
         Ok(Self { pool })
     }
 
@@ -131,6 +149,7 @@ impl Store {
     ///
     /// Existing issues from other sources are left untouched. Supplied issues
     /// are upserted by [`IssueKey::canonical`].
+    /// For combined sources, callers must supply both issues and pull requests.
     pub async fn replace_issues(&self, source: &str, issues: &[Issue]) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM issues WHERE source = ?")
@@ -161,7 +180,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT provider, host, repository, native_id, identifier, title, description, \
              state, url, author, labels_json, parent_id, blocked_by_json, priority, \
-             created_at, updated_at FROM issues ORDER BY canonical_key ASC",
+             created_at, updated_at, pull_request_json FROM issues ORDER BY canonical_key ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -427,8 +446,8 @@ async fn upsert_issue(
     sqlx::query(
         "INSERT INTO issues (canonical_key, source, provider, host, repository, native_id, \
          identifier, title, description, state, url, author, labels_json, parent_id, \
-         blocked_by_json, priority, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         blocked_by_json, priority, created_at, updated_at, pull_request_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(canonical_key) DO UPDATE SET source = excluded.source, \
          provider = excluded.provider, host = excluded.host, repository = excluded.repository, \
          native_id = excluded.native_id, identifier = excluded.identifier, title = excluded.title, \
@@ -436,7 +455,7 @@ async fn upsert_issue(
          author = excluded.author, labels_json = excluded.labels_json, \
          parent_id = excluded.parent_id, blocked_by_json = excluded.blocked_by_json, \
          priority = excluded.priority, created_at = excluded.created_at, \
-         updated_at = excluded.updated_at",
+         updated_at = excluded.updated_at, pull_request_json = excluded.pull_request_json",
     )
     .bind(issue.key.canonical())
     .bind(source)
@@ -456,6 +475,7 @@ async fn upsert_issue(
     .bind(issue.priority)
     .bind(issue.created_at)
     .bind(issue.updated_at)
+    .bind(serialize_optional(issue.pull_request.as_ref())?)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -484,6 +504,10 @@ fn issue_from_row(row: &SqliteRow) -> Result<Issue> {
         priority: row.try_get("priority")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        pull_request: row
+            .try_get::<Option<String>, _>("pull_request_json")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
     })
 }
 
@@ -577,6 +601,7 @@ mod tests {
 
     fn issue(provider: IssueProvider, native_id: &str, title: &str) -> Issue {
         Issue {
+            pull_request: None,
             key: IssueKey {
                 provider,
                 host: "example.com".to_string(),
@@ -646,6 +671,137 @@ mod tests {
         expected.sort_by_key(|value| value.key.canonical());
         assert_eq!(loaded, expected);
         assert!(!loaded.contains(&github_one));
+    }
+
+    #[tokio::test]
+    async fn pr_metadata_and_identity_survive_cache_updates() {
+        let store = Store::in_memory().await.unwrap();
+        let mut ordinary = issue(IssueProvider::Github, "123", "Issue");
+        ordinary.identifier = "#123".into();
+        let mut pr = ordinary.clone();
+        pr.key.native_id = "pr/123".into();
+        pr.state = "draft".into();
+        pr.pull_request = Some(agent_launcher_core::PullRequestMetadata {
+            number: 123,
+            additions: None,
+            deletions: Some(0),
+            base_ref: "main".into(),
+            head_ref: "feature".into(),
+            base_sha: "base-sha".into(),
+            head_sha: "head-sha".into(),
+            head_repository: Some("contributor/widgets".into()),
+        });
+        assert_ne!(ordinary.key.canonical(), pr.key.canonical());
+        store
+            .replace_issues("github", &[ordinary.clone(), pr.clone()])
+            .await
+            .unwrap();
+        assert_eq!(store.load_issues().await.unwrap(), vec![
+            ordinary.clone(),
+            pr.clone()
+        ]);
+
+        let mut updated = ordinary.clone();
+        updated.title = "Updated issue".into();
+        store
+            .upsert_issues("github", &[updated.clone()])
+            .await
+            .unwrap();
+        assert_eq!(store.load_issues().await.unwrap(), vec![
+            updated,
+            pr.clone()
+        ]);
+
+        pr.state = "merged".into();
+        pr.pull_request.as_mut().unwrap().additions = Some(20);
+        pr.pull_request.as_mut().unwrap().head_repository = None;
+        store
+            .replace_issues("github", &[ordinary.clone(), pr.clone()])
+            .await
+            .unwrap();
+        assert_eq!(store.load_issues().await.unwrap(), vec![ordinary, pr]);
+    }
+
+    #[test]
+    fn legacy_serialized_issues_default_to_no_pr_metadata() {
+        let expected = issue(IssueProvider::Github, "123", "Existing issue");
+        let mut value = serde_json::to_value(&expected).unwrap();
+        value.as_object_mut().unwrap().remove("pull_request");
+        assert_eq!(serde_json::from_value::<Issue>(value).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn only_legacy_metadata_migration_invalidates_github_checkpoints() {
+        for legacy in [true, false] {
+            let path = std::env::temp_dir().join(format!(
+                "agent-launcher-pr-migration-{}-{}.sqlite",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+            let schema = if legacy {
+                SCHEMA.replace(",\n    pull_request_json TEXT", "")
+            } else {
+                SCHEMA.to_owned()
+            };
+            sqlx::raw_sql(&schema).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO issues (canonical_key, source, provider, host, repository, native_id, identifier, title, state, labels_json, blocked_by_json) VALUES ('github:github.com:acme/app:1', 'github', 'github', 'github.com', 'acme/app', '1', '#1', 'Legacy', 'open', '[]', '[]')")
+            .execute(&pool).await.unwrap();
+            let checkpoint =
+                json!({"updated_at": Utc::now(), "last_full_at": Utc::now(), "etag": null});
+            let sources = [
+                "github:github.com:acme/app",
+                "github:git.example.com:acme/empty",
+                "gitlab:gitlab.com:acme/app",
+                "beads:localhost:repo",
+            ];
+            for source in sources {
+                sqlx::query("INSERT INTO source_checkpoints VALUES (?, ?)")
+                    .bind(source)
+                    .bind(checkpoint.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+
+            // Reopening twice also exercises migration idempotence.
+            for reopen in 0..2 {
+                let store = Store::open(&path).await.unwrap();
+                let issues = store.load_issues().await.unwrap();
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].title, "Legacy");
+                assert!(issues[0].pull_request.is_none());
+                for source in sources {
+                    let invalidated = legacy && reopen == 0 && source.starts_with("github:");
+                    assert_eq!(
+                        store.source_checkpoint(source).await.unwrap(),
+                        if invalidated {
+                            None
+                        } else {
+                            Some(checkpoint.clone())
+                        },
+                        "legacy={legacy}, reopen={reopen}, source={source}"
+                    );
+                    store
+                        .set_source_checkpoint(source, &checkpoint)
+                        .await
+                        .unwrap();
+                }
+                store.pool.close().await;
+            }
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[tokio::test]

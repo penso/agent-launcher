@@ -15,6 +15,30 @@ pub(crate) enum Route {
     Detail,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum InboxTab {
+    #[default]
+    Issues,
+    PullRequests,
+}
+
+impl InboxTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Issues => "Issues",
+            Self::PullRequests => "PRs",
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct InactiveList {
+    selected: usize,
+    scroll: usize,
+    search_query: String,
+    issue_sort: IssueSort,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct InputOverlay {
     pub run_id: String,
@@ -42,7 +66,10 @@ pub(crate) enum DispatchStage {
 
 #[derive(Default)]
 pub(crate) struct AppState {
+    pub mouse: crate::mouse::MouseGeometry,
     pub route: Route,
+    pub tab: InboxTab,
+    pub inactive_list: InactiveList,
     pub selected: usize,
     pub detail_issue_key: Option<IssueKey>,
     pub scroll: usize,
@@ -67,12 +94,41 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    pub fn switch_tab(&mut self) {
+        self.tab = match self.tab {
+            InboxTab::Issues => InboxTab::PullRequests,
+            InboxTab::PullRequests => InboxTab::Issues,
+        };
+        std::mem::swap(&mut self.selected, &mut self.inactive_list.selected);
+        std::mem::swap(&mut self.scroll, &mut self.inactive_list.scroll);
+        std::mem::swap(&mut self.search_query, &mut self.inactive_list.search_query);
+        std::mem::swap(&mut self.issue_sort, &mut self.inactive_list.issue_sort);
+    }
+
+    pub fn rows(&self, snapshot: &RuntimeSnapshot) -> Vec<crate::rows::DisplayRow> {
+        display_rows_matching(
+            snapshot,
+            &self.search_query,
+            self.issue_sort,
+            self.tab == InboxTab::PullRequests,
+        )
+    }
+
+    pub fn reconcile_lists(&mut self, previous: &RuntimeSnapshot, next: &RuntimeSnapshot) {
+        // Reconcile the hidden tab too, before its old snapshot is discarded.
+        for _ in 0..2 {
+            let key = self.selected_issue(previous).map(|issue| issue.key.clone());
+            self.reconcile_selection(next, key.as_ref());
+            self.switch_tab();
+        }
+    }
+
     pub fn reconcile_selection(
         &mut self,
         snapshot: &RuntimeSnapshot,
         selected_key: Option<&IssueKey>,
     ) {
-        let rows = display_rows_matching(snapshot, &self.search_query, self.issue_sort);
+        let rows = self.rows(snapshot);
         if let Some(position) = selected_key.and_then(|key| {
             rows.iter()
                 .position(|row| snapshot.issues[row.issue_idx].key == *key)
@@ -85,7 +141,7 @@ impl AppState {
     }
 
     pub fn selected_issue<'a>(&self, snapshot: &'a RuntimeSnapshot) -> Option<&'a Issue> {
-        display_rows_matching(snapshot, &self.search_query, self.issue_sort)
+        self.rows(snapshot)
             .get(self.selected)
             .and_then(|row| snapshot.issues.get(row.issue_idx))
     }

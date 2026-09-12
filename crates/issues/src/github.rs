@@ -1,6 +1,10 @@
-use std::env;
+use std::{
+    collections::HashMap,
+    env,
+    process::{Command, Output, Stdio},
+};
 
-use agent_launcher_core::{Issue, IssueKey, IssueProvider, RepositoryRemote};
+use agent_launcher_core::{Issue, IssueKey, IssueProvider, PullRequestMetadata, RepositoryRemote};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{
@@ -15,7 +19,10 @@ use crate::{Error, IssueSource, SourceKey, SyncCheckpoint, SyncMode, SyncResult}
 
 const INCREMENTAL_OVERLAP: Duration = Duration::minutes(5);
 const FULL_RECONCILIATION_INTERVAL: Duration = Duration::hours(6);
+const MAX_PR_DETAILS_PER_SYNC: usize = 10;
 
+/// Synchronizes issues and pull requests under one source key. Full results
+/// contain both open issues and open/draft PRs; deltas include closed transitions.
 pub struct GitHubSource {
     key: SourceKey,
     client: Client,
@@ -23,14 +30,39 @@ pub struct GitHubSource {
 }
 
 impl GitHubSource {
+    fn pulls_endpoint(&self) -> Url {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .expect("GitHub API base URL")
+            .pop()
+            .push("pulls");
+        url
+    }
+
+    async fn pull_request(&self, number: u64) -> Result<Issue, Error> {
+        // Construct detail URLs locally rather than trusting URLs in API payloads.
+        let mut url = self.pulls_endpoint();
+        url.path_segments_mut()
+            .expect("GitHub API base URL")
+            .push(&number.to_string());
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(http_status_error(response).await);
+        }
+        let record: GitHubPullRequest =
+            serde_json::from_slice(&response.bytes().await?).map_err(|error| Error::Json {
+                source: "GitHub",
+                error,
+            })?;
+        Ok(record.into_issue(&self.key))
+    }
+
     pub fn from_remote(remote: RepositoryRemote) -> Result<Self, Error> {
-        let token = if is_public_github_host(&remote.host) {
-            env::var("GH_TOKEN")
-                .or_else(|_| env::var("GITHUB_TOKEN"))
-                .ok()
-        } else {
-            None
-        };
+        let token = resolve_token(
+            &remote.host,
+            |name| env::var(name).ok(),
+            |command| command.output(),
+        );
         Self::new(remote.host, remote.repository, token.as_deref())
     }
 
@@ -42,10 +74,9 @@ impl GitHubSource {
             HeaderValue::from_static("application/vnd.github+json"),
         );
         if let Some(token) = token {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {token}"))?,
-            );
+            let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
         }
         let client = Client::builder()
             .user_agent("agent-launcher")
@@ -73,10 +104,12 @@ impl IssueSource for GitHubSource {
 
     async fn sync(&self, checkpoint: Option<&SyncCheckpoint>) -> Result<SyncResult, Error> {
         let now = Utc::now();
-        let full = checkpoint
-            .and_then(|value| value.last_full_at)
-            .is_none_or(|last_full| now - last_full >= FULL_RECONCILIATION_INTERVAL);
+        let full = checkpoint.and_then(|value| value.updated_at).is_none()
+            || checkpoint
+                .and_then(|value| value.last_full_at)
+                .is_none_or(|last_full| now - last_full >= FULL_RECONCILIATION_INTERVAL);
         let mut issues = Vec::new();
+        let mut pr_indices = HashMap::new();
         let mut updated_at = checkpoint.and_then(|value| value.updated_at);
         let mut page = 1_u32;
 
@@ -117,6 +150,9 @@ impl IssueSource for GitHubSource {
                 updated_at = newest(updated_at, Some(record.updated_at));
                 if record.pull_request.is_none() {
                     issues.push(record.into_issue(&self.key));
+                } else if !full {
+                    pr_indices.insert(record.number, issues.len());
+                    issues.push(record.into_pull_request(&self.key));
                 }
             }
 
@@ -124,6 +160,61 @@ impl IssueSource for GitHubSource {
                 break;
             }
             page += 1;
+        }
+
+        {
+            // Checkpoints do not prove cache completeness (e.g. older issue-only
+            // clients). Reconcile all open PRs even when issues are incremental.
+            let mut page = 1_u32;
+            loop {
+                let mut url = self.pulls_endpoint();
+                url.query_pairs_mut()
+                    .append_pair("state", "open")
+                    .append_pair("per_page", "100")
+                    .append_pair("page", &page.to_string());
+                let response = self.client.get(url).send().await?;
+                if !response.status().is_success() {
+                    return Err(http_status_error(response).await);
+                }
+                let has_next = github_has_next(response.headers());
+                let records: Vec<GitHubPullRequest> =
+                    serde_json::from_slice(&response.bytes().await?).map_err(|error| {
+                        Error::Json {
+                            source: "GitHub",
+                            error,
+                        }
+                    })?;
+                for record in records {
+                    let number = record.issue.number;
+                    let issue = record.into_issue(&self.key);
+                    if let Some(&index) = pr_indices.get(&number) {
+                        issues[index] = issue;
+                    } else {
+                        pr_indices.insert(number, issues.len());
+                        issues.push(issue);
+                    }
+                }
+                if !has_next {
+                    break;
+                }
+                page += 1;
+            }
+        }
+
+        // Finish mandatory pagination first and bound optional quota use even
+        // when GitHub has not yet returned a rate-limit error.
+        for issue in issues
+            .iter_mut()
+            .filter(|issue| issue.pull_request.is_some())
+            .take(MAX_PR_DETAILS_PER_SYNC)
+        {
+            if let Some(metadata) = &issue.pull_request {
+                match self.pull_request(metadata.number).await {
+                    Ok(detail) => *issue = detail,
+                    Err(Error::GitHubRateLimit { .. }) => break,
+                    Err(error) => return Err(error),
+                }
+            }
         }
 
         Ok(SyncResult {
@@ -148,6 +239,36 @@ impl IssueSource for GitHubSource {
 
 fn is_public_github_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("github.com")
+}
+
+fn resolve_token(
+    host: &str,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+    mut run: impl FnMut(&mut Command) -> std::io::Result<Output>,
+) -> Option<String> {
+    if is_public_github_host(host)
+        && let Some(token) = lookup("GH_TOKEN").or_else(|| lookup("GITHUB_TOKEN"))
+    {
+        return Some(token);
+    }
+    let mut command = Command::new("gh");
+    command.args(["auth", "token", "--hostname", &host.to_ascii_lowercase()]);
+    // Ask for stored host credentials, never gh's generic environment overrides.
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
+    command.stdin(Stdio::null()).stderr(Stdio::null());
+    let output = run(&mut command).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!token.is_empty()).then_some(token)
 }
 
 fn redirect_policy(has_credentials: bool) -> redirect::Policy {
@@ -203,11 +324,36 @@ fn github_has_next(headers: &HeaderMap) -> bool {
 
 async fn http_status_error(response: reqwest::Response) -> Error {
     let status = response.status();
+    let host = match response.url().host_str() {
+        Some("api.github.com") => "github.com",
+        Some(host) => host,
+        None => "github.com",
+    }
+    .to_owned();
     let url = response.url().to_string();
+    let limited = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .is_some_and(|v| v == "0")
+        || response.headers().contains_key("retry-after");
     let body = response
         .text()
         .await
         .unwrap_or_else(|error| error.to_string());
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "GitHub API request failed".to_owned());
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (limited || message.to_ascii_lowercase().contains("rate limit")))
+    {
+        return Error::GitHubRateLimit { status, url, host };
+    }
+    let mut body: String = message.chars().take(300).collect();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        body.push_str("; check GitHub authentication and repository access");
+    }
     Error::HttpStatus { status, url, body }
 }
 
@@ -234,11 +380,33 @@ struct GitHubIssue {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     pull_request: Option<serde_json::Value>,
+    #[serde(default)]
+    draft: bool,
 }
 
 impl GitHubIssue {
+    fn into_pull_request(self, source: &SourceKey) -> Issue {
+        let merged = self
+            .pull_request
+            .as_ref()
+            .and_then(|pr| pr.get("merged_at"))
+            .is_some_and(|value| !value.is_null());
+        GitHubPullRequest {
+            draft: self.draft,
+            issue: self,
+            merged,
+            merged_at: None,
+            additions: None,
+            deletions: None,
+            base: GitHubPullRequestRef::default(),
+            head: GitHubPullRequestRef::default(),
+        }
+        .into_issue(source)
+    }
+
     fn into_issue(self, source: &SourceKey) -> Issue {
         Issue {
+            pull_request: None,
             key: IssueKey {
                 provider: source.provider,
                 host: source.host.clone(),
@@ -262,6 +430,63 @@ impl GitHubIssue {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitHubPullRequest {
+    #[serde(flatten)]
+    issue: GitHubIssue,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    merged: bool,
+    merged_at: Option<DateTime<Utc>>,
+    additions: Option<u64>,
+    deletions: Option<u64>,
+    base: GitHubPullRequestRef,
+    head: GitHubPullRequestRef,
+}
+
+impl GitHubPullRequest {
+    fn into_issue(self, source: &SourceKey) -> Issue {
+        let number = self.issue.number;
+        let mut issue = self.issue.into_issue(source);
+        issue.key.native_id = format!("pr/{number}");
+        issue.state = if self.merged || self.merged_at.is_some() {
+            "merged"
+        } else if issue.state == "closed" {
+            "closed"
+        } else if self.draft {
+            "draft"
+        } else {
+            "open"
+        }
+        .to_owned();
+        issue.pull_request = Some(PullRequestMetadata {
+            number,
+            additions: self.additions,
+            deletions: self.deletions,
+            base_ref: self.base.reference,
+            head_ref: self.head.reference,
+            base_sha: self.base.sha,
+            head_sha: self.head.sha,
+            head_repository: self.head.repo.map(|repo| repo.full_name),
+        });
+        issue
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GitHubPullRequestRef {
+    #[serde(rename = "ref")]
+    reference: String,
+    sha: String,
+    repo: Option<GitHubRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepository {
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GitHubUser {
     login: String,
 }
@@ -274,10 +499,407 @@ struct GitHubLabel {
 #[cfg(test)]
 mod tests {
     use agent_launcher_core::IssueProvider;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
 
-    use super::{GitHubIssue, is_public_github_host, same_origin};
-    use crate::SourceKey;
+    use super::{GitHubIssue, GitHubPullRequest, GitHubSource, is_public_github_host, same_origin};
+    use crate::{IssueSource, SourceKey, SyncCheckpoint, SyncMode};
+
+    fn pr_payload(number: u64) -> Value {
+        json!({
+            "number": number, "title": "Review me", "body": "Details",
+            "state": "open", "html_url": format!("https://github.com/acme/app/pull/{number}"),
+            "user": {"login": "octocat"}, "labels": [{"name": "review"}],
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
+            "base": {"ref": "main", "sha": "base-sha"},
+            "head": {"ref": "feature", "sha": "head-sha", "repo": {"full_name": "fork/app"}},
+            "additions": 12, "deletions": 0
+        })
+    }
+
+    async fn mock_source(
+        responses: Vec<(&'static str, u16, bool, Value)>,
+    ) -> (GitHubSource, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for (path, status, next, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 1024];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("GET {path}")), "{request}");
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-token\r\n")
+                );
+                let body = body.to_string();
+                // The adapter must not follow an untrusted pagination URL with credentials.
+                let link = if next {
+                    "Link: <https://untrusted.example/page>; rel=\"next\"\r\n"
+                } else {
+                    ""
+                };
+                socket.write_all(format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{link}Connection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let mut source =
+            GitHubSource::new("github.com".into(), "acme/app".into(), Some("test-token")).unwrap();
+        source.endpoint = Url::parse(&format!("http://{address}/repos/acme/app/issues")).unwrap();
+        (source, task)
+    }
+
+    #[test]
+    fn maps_pr_metadata_states_and_missing_counts() {
+        let source = SourceKey {
+            provider: IssueProvider::Github,
+            host: "github.com".into(),
+            repository: "acme/app".into(),
+        };
+        for (state, draft, merged, expected) in [
+            ("open", false, false, "open"),
+            ("open", true, false, "draft"),
+            ("closed", true, false, "closed"),
+            ("closed", true, true, "merged"),
+        ] {
+            let mut payload = pr_payload(7);
+            payload["state"] = json!(state);
+            payload["draft"] = json!(draft);
+            payload["merged"] = json!(merged);
+            let issue = serde_json::from_value::<GitHubPullRequest>(payload)
+                .unwrap()
+                .into_issue(&source);
+            assert_eq!(issue.state, expected);
+            assert_eq!(issue.key.native_id, "pr/7");
+            assert_eq!(issue.identifier, "#7");
+            assert_eq!(issue.author.as_deref(), Some("octocat"));
+            assert_eq!(issue.labels, ["review"]);
+            let metadata = issue.pull_request.unwrap();
+            assert_eq!(metadata.number, 7);
+            assert_eq!(metadata.additions, Some(12));
+            assert_eq!(metadata.deletions, Some(0));
+            assert_eq!(metadata.base_ref, "main");
+            assert_eq!(metadata.head_ref, "feature");
+            assert_eq!(metadata.base_sha, "base-sha");
+            assert_eq!(metadata.head_sha, "head-sha");
+            assert_eq!(metadata.head_repository.as_deref(), Some("fork/app"));
+        }
+        let mut payload = pr_payload(7);
+        payload.as_object_mut().unwrap().remove("additions");
+        payload["deletions"] = Value::Null;
+        payload["head"]["repo"] = Value::Null;
+        payload["merged_at"] = json!("2026-01-03T00:00:00Z");
+        let issue = serde_json::from_value::<GitHubPullRequest>(payload)
+            .unwrap()
+            .into_issue(&source);
+        assert_eq!(issue.state, "merged");
+        let metadata = issue.pull_request.unwrap();
+        assert_eq!(metadata.additions, None);
+        assert_eq!(metadata.deletions, None);
+        assert_eq!(metadata.head_repository, None);
+    }
+
+    #[tokio::test]
+    async fn full_sync_filters_stubs_and_paginates_issues_and_prs_with_authenticated_details() {
+        let mut stub = pr_payload(7);
+        stub["pull_request"] = json!({"url": "https://untrusted.example/pr"});
+        let (source, server) = mock_source(vec![
+            (
+                "/repos/acme/app/issues?state=open&per_page=100&page=1 ",
+                200,
+                true,
+                json!([stub]),
+            ),
+            (
+                "/repos/acme/app/issues?state=open&per_page=100&page=2 ",
+                200,
+                false,
+                json!([pr_payload(1)]),
+            ),
+            (
+                "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                200,
+                true,
+                json!([pr_payload(7)]),
+            ),
+            (
+                "/repos/acme/app/pulls?state=open&per_page=100&page=2 ",
+                200,
+                false,
+                json!([pr_payload(8)]),
+            ),
+            ("/repos/acme/app/pulls/7 ", 200, false, pr_payload(7)),
+            ("/repos/acme/app/pulls/8 ", 200, false, pr_payload(8)),
+        ])
+        .await;
+        let result = source.sync(None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(result.mode, SyncMode::Full);
+        assert_eq!(
+            result
+                .issues
+                .iter()
+                .map(|issue| issue.key.native_id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "pr/7", "pr/8"]
+        );
+        assert!(result.issues[0].pull_request.is_none());
+        assert_eq!(
+            result.issues[1].pull_request.as_ref().unwrap().additions,
+            Some(12)
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_sync_fetches_closed_pr_details() {
+        let mut stub = pr_payload(7);
+        stub["pull_request"] = json!({});
+        let mut detail = pr_payload(7);
+        detail["state"] = json!("closed");
+        detail["merged"] = json!(true);
+        let (source, server) = mock_source(vec![
+            (
+                "/repos/acme/app/issues?state=all&per_page=100&page=1&since=",
+                200,
+                false,
+                json!([stub]),
+            ),
+            (
+                "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                200,
+                false,
+                json!([]),
+            ),
+            ("/repos/acme/app/pulls/7 ", 200, false, detail),
+        ])
+        .await;
+        let result = source
+            .sync(Some(&SyncCheckpoint {
+                updated_at: Some(chrono::Utc::now()),
+                last_full_at: Some(chrono::Utc::now()),
+                etag: None,
+            }))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.mode, SyncMode::Delta);
+        assert_eq!(result.issues[0].state, "merged");
+        assert_eq!(result.issues[0].key.native_id, "pr/7");
+    }
+
+    #[tokio::test]
+    async fn recent_checkpoint_discovers_unchanged_paginated_prs_with_bounded_details() {
+        for changed_pr in [false, true] {
+            let checkpoint = SyncCheckpoint {
+                updated_at: Some(chrono::Utc::now()),
+                last_full_at: Some(chrono::Utc::now()),
+                etag: None,
+            };
+            let mut stub = pr_payload(1);
+            stub["pull_request"] = json!({});
+            let mut closed = pr_payload(300);
+            closed["state"] = json!("closed");
+            closed["pull_request"] = json!({"merged_at": "2026-01-03T00:00:00Z"});
+            let deltas = if changed_pr {
+                json!([stub])
+            } else {
+                json!([])
+            };
+            let mut responses = vec![
+                (
+                    "/repos/acme/app/issues?state=all&per_page=100&page=1&since=",
+                    200,
+                    true,
+                    deltas,
+                ),
+                (
+                    "/repos/acme/app/issues?state=all&per_page=100&page=2&since=",
+                    200,
+                    false,
+                    json!([closed, pr_payload(301)]),
+                ),
+                (
+                    "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                    200,
+                    true,
+                    json!((1..=100).map(pr_payload).collect::<Vec<_>>()),
+                ),
+                (
+                    "/repos/acme/app/pulls?state=open&per_page=100&page=2 ",
+                    200,
+                    true,
+                    json!((101..=200).map(pr_payload).collect::<Vec<_>>()),
+                ),
+                (
+                    "/repos/acme/app/pulls?state=open&per_page=100&page=3 ",
+                    200,
+                    false,
+                    json!((201..=205).map(pr_payload).collect::<Vec<_>>()),
+                ),
+            ];
+            let numbers = if changed_pr {
+                vec![1, 300, 2, 3, 4, 5, 6, 7, 8, 9]
+            } else {
+                vec![300, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            };
+            assert_eq!(numbers.len(), super::MAX_PR_DETAILS_PER_SYNC);
+            for number in numbers {
+                let mut detail = pr_payload(number);
+                if number == 300 {
+                    detail["state"] = json!("closed");
+                    detail["merged"] = json!(true);
+                }
+                responses.push(("/repos/acme/app/pulls/", 200, false, detail));
+            }
+            let (source, server) = mock_source(responses).await;
+            let result = source.sync(Some(&checkpoint)).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(result.mode, SyncMode::Delta);
+            assert_eq!(result.checkpoint, checkpoint);
+            assert_eq!(result.issues.len(), 207);
+            let keys = result
+                .issues
+                .iter()
+                .map(|issue| issue.key.canonical())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(keys.len(), result.issues.len());
+            for number in 1..=205 {
+                let issue = result
+                    .issues
+                    .iter()
+                    .find(|issue| issue.key.native_id == format!("pr/{number}"))
+                    .unwrap();
+                assert_eq!(issue.state, "open");
+                assert_eq!(issue.pull_request.as_ref().unwrap().base_ref, "main");
+                assert_eq!(issue.key.host, "github.com");
+                assert_eq!(issue.key.repository, "acme/app");
+            }
+            assert_eq!(
+                result
+                    .issues
+                    .iter()
+                    .find(|issue| issue.key.native_id == "pr/300")
+                    .unwrap()
+                    .state,
+                "merged"
+            );
+            assert!(
+                result
+                    .issues
+                    .iter()
+                    .find(|issue| issue.key.native_id == "301")
+                    .unwrap()
+                    .pull_request
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_cursor_or_expired_checkpoint_uses_open_only_full_reconciliation() {
+        for missing_cursor in [false, true] {
+            let checkpoint = SyncCheckpoint {
+                updated_at: (!missing_cursor).then(chrono::Utc::now),
+                last_full_at: Some(
+                    chrono::Utc::now()
+                        - if missing_cursor {
+                            chrono::Duration::zero()
+                        } else {
+                            chrono::Duration::hours(7)
+                        },
+                ),
+                etag: None,
+            };
+            let (source, server) = mock_source(vec![
+                (
+                    "/repos/acme/app/issues?state=open&per_page=100&page=1 ",
+                    200,
+                    false,
+                    json!([]),
+                ),
+                (
+                    "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                    200,
+                    false,
+                    json!([]),
+                ),
+            ])
+            .await;
+            let result = source.sync(Some(&checkpoint)).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(result.mode, SyncMode::Full);
+            assert!(result.checkpoint.last_full_at >= checkpoint.last_full_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_pr_pagination_failure_does_not_advance_checkpoint() {
+        let (source, server) = mock_source(vec![
+            (
+                "/repos/acme/app/issues?state=all&per_page=100&page=1&since=",
+                200,
+                false,
+                json!([]),
+            ),
+            (
+                "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                200,
+                true,
+                json!([pr_payload(1)]),
+            ),
+            (
+                "/repos/acme/app/pulls?state=open&per_page=100&page=2 ",
+                500,
+                false,
+                json!({}),
+            ),
+        ])
+        .await;
+        assert!(
+            source
+                .sync(Some(&SyncCheckpoint {
+                    updated_at: Some(chrono::Utc::now()),
+                    last_full_at: Some(chrono::Utc::now()),
+                    etag: None,
+                }))
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_pr_requests_never_return_partial_full_replacements() {
+        for (detail_failure, status) in [(false, 500), (true, 500), (true, 403), (true, 401)] {
+            let mut responses = vec![(
+                "/repos/acme/app/issues?",
+                200,
+                false,
+                json!([pr_payload(1)]),
+            )];
+            if detail_failure {
+                responses.push(("/repos/acme/app/pulls?", 200, false, json!([pr_payload(7)])));
+                responses.push(("/repos/acme/app/pulls/7 ", status, false, json!({})));
+            } else {
+                responses.push(("/repos/acme/app/pulls?", status, false, json!({})));
+            }
+            let (source, server) = mock_source(responses).await;
+            assert!(source.sync(None).await.is_err());
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn converts_github_issue() {
@@ -330,6 +952,225 @@ mod tests {
         assert!(is_public_github_host("GITHUB.COM"));
         assert!(!is_public_github_host("github.com.example.org"));
         assert!(!is_public_github_host("github.com:443"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn token_resolution_preserves_precedence_and_scopes_the_command() {
+        use std::{
+            os::unix::process::ExitStatusExt,
+            process::{ExitStatus, Output},
+        };
+
+        for (gh, github, expected) in [
+            (Some("first"), Some("second"), "first"),
+            (None, Some("second"), "second"),
+        ] {
+            let token = super::resolve_token(
+                "GITHUB.COM",
+                |name| {
+                    if name == "GH_TOKEN" {
+                        gh
+                    } else {
+                        github
+                    }
+                    .map(str::to_owned)
+                },
+                |_| panic!("environment token must take precedence"),
+            );
+            assert_eq!(token.as_deref(), Some(expected));
+        }
+        for host in [
+            "github.com",
+            "github.com.example.org",
+            "ghe.example.org",
+            "github.com:443",
+        ] {
+            for (status, stdout, expected) in [
+                (
+                    0,
+                    b" stored-test-token\n".as_slice(),
+                    Some("stored-test-token"),
+                ),
+                (0, b"\n".as_slice(), None),
+                (0, b"\xff".as_slice(), None),
+                (1, b"ignored".as_slice(), None),
+            ] {
+                let token = super::resolve_token(
+                    host,
+                    |name| {
+                        assert_eq!(
+                            host, "github.com",
+                            "must not read generic env for other hosts: {name}"
+                        );
+                        None
+                    },
+                    |command| {
+                        assert_eq!(command.get_program(), "gh");
+                        assert_eq!(command.get_args().collect::<Vec<_>>(), [
+                            "auth",
+                            "token",
+                            "--hostname",
+                            host
+                        ]);
+                        for name in [
+                            "GH_TOKEN",
+                            "GITHUB_TOKEN",
+                            "GH_ENTERPRISE_TOKEN",
+                            "GITHUB_ENTERPRISE_TOKEN",
+                        ] {
+                            assert!(
+                                command
+                                    .get_envs()
+                                    .any(|(key, value)| key == name && value.is_none())
+                            );
+                        }
+                        Ok(Output {
+                            status: ExitStatus::from_raw(status << 8),
+                            stdout: stdout.to_vec(),
+                            stderr: Vec::new(),
+                        })
+                    },
+                );
+                assert_eq!(token.as_deref(), expected);
+            }
+        }
+        assert!(
+            super::resolve_token(
+                "github.com",
+                |_| None,
+                |_| Err(std::io::ErrorKind::NotFound.into())
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_details_keep_paginated_lists_and_stop_enrichment() {
+        for status in [403, 429] {
+            let mut draft = pr_payload(7);
+            draft["draft"] = json!(true);
+            for field in ["additions", "deletions"] {
+                draft.as_object_mut().unwrap().remove(field);
+            }
+            let mut other = draft.clone();
+            other["number"] = json!(8);
+            let (source, server) = mock_source(vec![
+                (
+                    "/repos/acme/app/issues?",
+                    200,
+                    false,
+                    json!([pr_payload(1)]),
+                ),
+                (
+                    "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                    200,
+                    true,
+                    json!([draft]),
+                ),
+                (
+                    "/repos/acme/app/pulls?state=open&per_page=100&page=2 ",
+                    200,
+                    false,
+                    json!([other]),
+                ),
+                (
+                    "/repos/acme/app/pulls/7 ",
+                    status,
+                    false,
+                    json!({"message": "API rate limit exceeded"}),
+                ),
+            ])
+            .await;
+            let result = source.sync(None).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(result.mode, SyncMode::Full);
+            assert!(result.checkpoint.last_full_at.is_some());
+            assert_eq!(result.issues.len(), 3);
+            for issue in &result.issues[1..] {
+                assert_eq!(issue.state, "draft");
+                let metadata = issue.pull_request.as_ref().unwrap();
+                assert_eq!(metadata.additions, None);
+                assert_eq!(metadata.deletions, None);
+                assert_eq!(metadata.base_ref, "main");
+                assert_eq!(metadata.head_repository.as_deref(), Some("fork/app"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_rate_limit_keeps_stub_state_and_unknown_counts() {
+        let mut merged = pr_payload(7);
+        merged["state"] = json!("closed");
+        merged["pull_request"] = json!({"merged_at": "2026-01-03T00:00:00Z"});
+        let mut draft = pr_payload(8);
+        draft["draft"] = json!(true);
+        draft["pull_request"] = json!({});
+        let (source, server) = mock_source(vec![
+            (
+                "/repos/acme/app/issues?state=all",
+                200,
+                false,
+                json!([merged, draft]),
+            ),
+            (
+                "/repos/acme/app/pulls?state=open&per_page=100&page=1 ",
+                200,
+                false,
+                json!([]),
+            ),
+            (
+                "/repos/acme/app/pulls/7 ",
+                403,
+                false,
+                json!({"message": "You have exceeded a secondary rate limit."}),
+            ),
+        ])
+        .await;
+        let result = source
+            .sync(Some(&SyncCheckpoint {
+                updated_at: Some(chrono::Utc::now()),
+                last_full_at: Some(chrono::Utc::now()),
+                etag: None,
+            }))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.mode, SyncMode::Delta);
+        assert_eq!(result.issues[0].state, "merged");
+        assert_eq!(result.issues[1].state, "draft");
+        for issue in result.issues {
+            let metadata = issue.pull_request.unwrap();
+            assert_eq!(metadata.additions, None);
+            assert_eq!(metadata.deletions, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_rate_limits_are_fatal_and_actionable() {
+        for pulls in [false, true] {
+            let mut responses = Vec::new();
+            if pulls {
+                responses.push(("/repos/acme/app/issues?", 200, false, json!([])));
+            }
+            responses.push((
+                if pulls {
+                    "/repos/acme/app/pulls?"
+                } else {
+                    "/repos/acme/app/issues?"
+                },
+                403,
+                false,
+                json!({"message": "API rate limit exceeded", "extra": "x".repeat(10000)}),
+            ));
+            let (source, server) = mock_source(responses).await;
+            let error = source.sync(None).await.unwrap_err();
+            server.await.unwrap();
+            assert!(matches!(error, crate::Error::GitHubRateLimit { .. }));
+            let text = error.to_string();
+            assert!(text.contains("gh auth login --hostname"));
+            assert!(text.len() < 500);
+        }
     }
 
     #[test]

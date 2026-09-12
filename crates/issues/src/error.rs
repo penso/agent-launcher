@@ -48,6 +48,15 @@ pub enum Error {
         body: String,
     },
 
+    #[error(
+        "GitHub rate limit ({status}) from {url}; wait for the limit to reset; authenticate with `gh auth login --hostname {host}` or check the configured token (GH_TOKEN/GITHUB_TOKEN on github.com)"
+    )]
+    GitHubRateLimit {
+        status: StatusCode,
+        url: String,
+        host: String,
+    },
+
     #[error("invalid {source} JSON: {error}")]
     Json {
         source: &'static str,

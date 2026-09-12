@@ -27,6 +27,12 @@ pub enum Error {
     #[error("issue was not found: {0:?}")]
     IssueNotFound(IssueKey),
 
+    #[error("pull requests must use Review, not Dispatch: {0:?}")]
+    DispatchRequiresIssue(IssueKey),
+
+    #[error("Review requires a pull request: {0:?}")]
+    ReviewRequiresPullRequest(IssueKey),
+
     #[error("prompt profile was not found: {0}")]
     PromptProfileNotFound(String),
 

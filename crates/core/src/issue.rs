@@ -65,12 +65,27 @@ fn canonical_component(value: &str) -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PullRequestMetadata {
+    pub number: u64,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    /// Repository containing the head branch, in `owner/name` form when available.
+    pub head_repository: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Issue {
     pub key: IssueKey,
     pub identifier: String,
     pub title: String,
     pub description: Option<String>,
     pub state: String,
+    #[serde(default)]
+    pub pull_request: Option<PullRequestMetadata>,
     pub url: Option<String>,
     pub author: Option<String>,
     pub labels: Vec<String>,

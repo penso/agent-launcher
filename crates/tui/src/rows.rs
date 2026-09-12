@@ -41,8 +41,14 @@ pub(crate) struct DisplayRow {
     pub context_only: bool,
 }
 
-pub(crate) fn display_rows(snapshot: &RuntimeSnapshot, sort: IssueSort) -> Vec<DisplayRow> {
-    let mut ordered = (0..snapshot.issues.len()).collect::<Vec<_>>();
+pub(crate) fn display_rows(
+    snapshot: &RuntimeSnapshot,
+    sort: IssueSort,
+    pull_requests: bool,
+) -> Vec<DisplayRow> {
+    let mut ordered = (0..snapshot.issues.len())
+        .filter(|&idx| snapshot.issues[idx].pull_request.is_some() == pull_requests)
+        .collect::<Vec<_>>();
     ordered.sort_by(|&left, &right| {
         let left = &snapshot.issues[left];
         let right = &snapshot.issues[right];
@@ -108,8 +114,9 @@ pub(crate) fn display_rows_matching(
     snapshot: &RuntimeSnapshot,
     query: &str,
     sort: IssueSort,
+    pull_requests: bool,
 ) -> Vec<DisplayRow> {
-    let rows = display_rows(snapshot, sort);
+    let rows = display_rows(snapshot, sort, pull_requests);
     let query = query.trim();
     if query.is_empty() {
         return rows;
@@ -207,7 +214,11 @@ fn parent_indices(snapshot: &RuntimeSnapshot) -> Vec<Option<usize>> {
                     .get(&identity)
                     .or_else(|| identifiers.get(&identity))
                     .copied()
-                    .filter(|parent| *parent != idx)
+                    .filter(|parent| {
+                        *parent != idx
+                            && issue.pull_request.is_none()
+                            && snapshot.issues[*parent].pull_request.is_none()
+                    })
             })
         })
         .collect()
@@ -246,6 +257,12 @@ fn searchable_text(snapshot: &RuntimeSnapshot, issue_idx: usize) -> String {
     fields.extend(issue.author.iter().cloned());
     fields.extend(issue.labels.iter().cloned());
     fields.extend(issue.blocked_by.iter().cloned());
+    if let Some(pr) = &issue.pull_request {
+        fields.push(pr.number.to_string());
+        fields.push(pr.base_ref.clone());
+        fields.push(pr.head_ref.clone());
+        fields.extend(pr.head_repository.iter().cloned());
+    }
     let issue_key = issue.key.canonical();
     for run in snapshot
         .runs
@@ -300,6 +317,7 @@ mod tests {
             title: title.to_owned(),
             description: None,
             state: "open".to_owned(),
+            pull_request: None,
             url: None,
             author: None,
             labels: Vec::new(),
@@ -328,7 +346,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
 
-        let rows = display_rows_matching(&snapshot, "authn", IssueSort::Newest);
+        let rows = display_rows_matching(&snapshot, "authn", IssueSort::Newest, false);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].issue_idx, 0);
         assert!(rows[0].context_only);
@@ -353,7 +371,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
 
-        let rows = display_rows(&snapshot, IssueSort::Newest);
+        let rows = display_rows(&snapshot, IssueSort::Newest, false);
         let repository_child = rows.iter().find(|row| row.issue_idx == 2).unwrap();
         let other_child = rows.iter().find(|row| row.issue_idx == 3).unwrap();
         assert_eq!(repository_child.depth, 1);
@@ -384,7 +402,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
         let ids = |sort| {
-            display_rows(&snapshot, sort)
+            display_rows(&snapshot, sort, false)
                 .into_iter()
                 .map(|row| snapshot.issues[row.issue_idx].key.native_id.as_str())
                 .collect::<Vec<_>>()

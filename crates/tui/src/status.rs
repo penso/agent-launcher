@@ -8,7 +8,7 @@ pub(crate) fn issue_icon(state: &str) -> &'static str {
         "open" | "opened" | "in_progress" | "in progress" | "started" => "●",
         "todo" | "unstarted" | "backlog" => "○",
         "waiting" | "blocked" => "◷",
-        "closed" | "done" | "completed" => "✓",
+        "closed" | "merged" | "done" | "completed" => "✓",
         "cancelled" | "canceled" => "⊘",
         "draft" => "◌",
         _ => "·",
@@ -17,7 +17,7 @@ pub(crate) fn issue_icon(state: &str) -> &'static str {
 
 pub(crate) fn issue_color(state: &str) -> Color {
     match state.to_ascii_lowercase().as_str() {
-        "closed" | "done" | "completed" => theme::done(),
+        "closed" | "merged" | "done" | "completed" => theme::done(),
         "draft" => theme::error(),
         "open" | "opened" | "in_progress" | "in progress" | "started" | "todo" | "unstarted"
         | "backlog" | "waiting" | "blocked" => theme::primary(),

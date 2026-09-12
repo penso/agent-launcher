@@ -15,11 +15,11 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, DispatchStage, Route},
+    app::{AppState, DispatchStage, InboxTab, Route},
     detail::draw_detail,
     format::{age_label, truncate},
     metrics::HostMetrics,
-    rows::{DisplayRow, IssueSort, display_rows_matching, hierarchy_prefix},
+    rows::{DisplayRow, IssueSort, hierarchy_prefix},
     status::{issue_color, issue_icon, run_color, run_label},
     theme,
     widgets::render_bottom_edge,
@@ -30,6 +30,18 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
     frame.render_widget(Block::new().style(Style::new().bg(theme::bg())), area);
     app.reconcile_detail(snapshot);
     app.reconcile_dispatch(snapshot);
+    app.mouse = crate::mouse::MouseGeometry {
+        screen: area,
+        route: app.route,
+        tab: app.tab,
+        blocked: app.input_overlay.is_some()
+            || app.delete_overlay.is_some()
+            || app.dispatch_overlay.is_some()
+            || app.command_overlay
+            || app.sort_overlay,
+        ..Default::default()
+    };
+    app.visible_rows = 0;
     let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     match app.route {
         Route::Inbox => draw_inbox(frame, content, snapshot, app),
@@ -41,10 +53,11 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
         if app.sort_overlay {
             draw_sort_overlay(frame, content, app);
         } else if app.command_overlay {
-            draw_command_overlay(frame, content);
+            draw_command_overlay(frame, content, app);
         }
     }
     draw_footer(frame, area, snapshot, &app.host_metrics);
+    app.mouse.scroll = app.scroll;
 }
 
 fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &mut AppState) {
@@ -125,6 +138,8 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
 fn draw_tiny_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
     let message = if let Some(error) = snapshot.error.as_deref() {
         error
+    } else if !snapshot.initialized {
+        "Loading sources..."
     } else if no_source_detected(snapshot) {
         "No issue source\nAdd a git remote or .beads\nrestart agent-launcher"
     } else {
@@ -322,19 +337,29 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if area.is_empty() {
         return;
     }
-    if app.search_query.is_empty() {
-        frame.render_widget(
-            Paragraph::new("Search issues… type to filter").style(Style::new().fg(theme::muted())),
-            area,
-        );
-        return;
-    }
     let focused = !app.command_overlay
         && !app.sort_overlay
         && app.dispatch_overlay.is_none()
         && app.input_overlay.is_none()
         && app.delete_overlay.is_none();
-    let cursor = if focused && (app.tick / 6).is_multiple_of(2) {
+    if app.search_query.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if app.tab == InboxTab::PullRequests {
+                "Search PRs…"
+            } else {
+                "Search issues…"
+            })
+            .style(Style::new().fg(theme::muted())),
+            area,
+        );
+        if focused {
+            frame.buffer_mut()[(area.x, area.y)]
+                .set_fg(theme::panel())
+                .set_bg(theme::text());
+        }
+        return;
+    }
+    let cursor = if focused {
         "█"
     } else {
         " "
@@ -376,11 +401,38 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
         },
         app.issue_sort.label()
     );
+    let mut tabs = Vec::new();
+    let mut x = inner.x;
+    for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+        if !tabs.is_empty() {
+            tabs.push(Span::raw("  "));
+            x += 2;
+        }
+        let label = format!(" {} ", tab.label());
+        let width = label.len() as u16;
+        app.mouse
+            .tabs
+            .push((Rect::new(x, inner.y, width, 1).intersection(inner), tab));
+        x += width;
+        tabs.push(Span::styled(
+            label,
+            if app.tab == tab {
+                Style::new().fg(theme::bg()).bg(theme::primary()).bold()
+            } else {
+                Style::new().fg(theme::text()).bg(theme::element())
+            },
+        ));
+    }
+    tabs.push(Span::styled(
+        if inner.width >= 62 {
+            format!("  {metadata}")
+        } else {
+            String::new()
+        },
+        Style::new().fg(theme::muted()),
+    ));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Inbox", Style::new().fg(theme::primary()).bold()),
-            Span::styled(format!(" · {metadata}"), Style::new().fg(theme::muted())),
-        ])),
+        Paragraph::new(Line::from(tabs)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
@@ -414,9 +466,14 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         app.visible_rows = 0;
         return;
     }
-    let rows = display_rows_matching(snapshot, &app.search_query, app.issue_sort);
+    let rows = app.rows(snapshot);
     app.selected = app.selected.min(rows.len().saturating_sub(1));
-    let visible_rows = area.height.saturating_sub(1) as usize;
+    let row_height = if app.tab == InboxTab::PullRequests {
+        2
+    } else {
+        1
+    };
+    let visible_rows = area.height.saturating_sub(1) as usize / row_height;
     app.visible_rows = visible_rows;
     let max_scroll = rows.len().saturating_sub(visible_rows);
     app.scroll = app.scroll.min(max_scroll);
@@ -431,8 +488,22 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
 
     let scrollbar_width = u16::from(rows.len() > visible_rows) * 2;
     let table_width = area.width.saturating_sub(scrollbar_width);
+    app.mouse.list = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        (visible_rows * row_height) as u16,
+    );
     let columns = Columns::for_width(table_width);
-    draw_table_header(frame, Rect::new(area.x, area.y, table_width, 1), columns);
+    if app.tab == InboxTab::PullRequests {
+        frame.render_widget(
+            Paragraph::new("  PR / title · author · +/- · status")
+                .style(Style::new().fg(theme::muted())),
+            Rect::new(area.x, area.y, table_width, 1),
+        );
+    } else {
+        draw_table_header(frame, Rect::new(area.x, area.y, table_width, 1), columns);
+    }
     if rows.is_empty() {
         draw_empty_state(
             frame,
@@ -444,6 +515,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             ),
             snapshot,
             &app.search_query,
+            app.tab,
         );
         return;
     }
@@ -459,9 +531,20 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         let Some(issue) = snapshot.issues.get(row.issue_idx) else {
             continue;
         };
+        let row_area = Rect::new(
+            area.x,
+            area.y + 1 + (screen_row * row_height) as u16,
+            table_width,
+            row_height as u16,
+        );
+        app.mouse.rows.push((row_area, index, issue.key.clone()));
+        if issue.pull_request.is_some() {
+            draw_pr_row(frame, row_area, issue, index == app.selected);
+            continue;
+        }
         draw_table_row(
             frame,
-            Rect::new(area.x, area.y + 1 + screen_row as u16, table_width, 1),
+            row_area,
             snapshot,
             issue,
             *row,
@@ -662,14 +745,67 @@ fn draw_table_row(
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, query: &str) {
+fn draw_pr_row(frame: &mut Frame<'_>, area: Rect, issue: &Issue, selected: bool) {
+    let pr = issue.pull_request.as_ref().expect("PR row");
+    let bg = if selected {
+        theme::element()
+    } else {
+        theme::panel()
+    };
+    let marker = if selected {
+        "▶"
+    } else {
+        " "
+    };
+    let title = format!("{marker} #{} {}", pr.number, issue.title);
+    let additions = pr
+        .additions
+        .map_or_else(|| "?".to_owned(), |n| n.to_string());
+    let deletions = pr
+        .deletions
+        .map_or_else(|| "?".to_owned(), |n| n.to_string());
+    let changes = format!("+{additions} -{deletions}");
+    let state = truncate(&issue.state, 7);
+    let author_width = (area.width as usize).saturating_sub(changes.len() + state.len() + 4);
+    let author = truncate(issue.author.as_deref().unwrap_or("unknown"), author_width);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                truncate(&title, area.width as usize),
+                Style::new().fg(theme::text()).bold(),
+            ),
+            Line::from(vec![
+                Span::styled(
+                    format!("  {author:<author_width$} "),
+                    Style::new().fg(theme::muted()),
+                ),
+                Span::styled(format!("+{additions}"), Style::new().fg(theme::done())),
+                Span::styled(format!(" -{deletions} "), Style::new().fg(theme::error())),
+                Span::styled(state, Style::new().fg(issue_color(&issue.state))),
+            ]),
+        ])
+        .style(Style::new().bg(bg)),
+        area,
+    );
+}
+
+fn draw_empty_state(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    query: &str,
+    tab: InboxTab,
+) {
     let mut lines = vec![Line::from(vec![
         Span::styled("● ", Style::new().fg(theme::primary())),
         Span::styled("Tip", Style::new().fg(theme::text()).bold()),
     ])];
     if !query.is_empty() {
         lines.push(Line::styled(
-            "No matching issues. Backspace edits · Esc clears.",
+            format!(
+                "No matching {}. Backspace edits · Ctrl+G, c clears.",
+                tab.label()
+            ),
             Style::new().fg(theme::muted()),
         ));
     } else if let Some(error) = snapshot.error.as_deref() {
@@ -681,6 +817,11 @@ fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
             "Press Ctrl+G, then r to retry.",
             Style::new().fg(theme::muted()),
         ));
+    } else if !snapshot.initialized || snapshot.refreshing {
+        lines.push(Line::styled(
+            format!("Loading {}...", tab.label()),
+            Style::new().fg(theme::primary()),
+        ));
     } else if no_source_detected(snapshot) {
         lines.push(Line::styled(
             "No issue source. Add a GitHub/GitLab remote or initialize .beads.",
@@ -690,14 +831,9 @@ fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
             "Restart agent-launcher after adding it.",
             Style::new().fg(theme::muted()),
         ));
-    } else if snapshot.refreshing {
-        lines.push(Line::styled(
-            "Refreshing issue sources...",
-            Style::new().fg(theme::primary()),
-        ));
     } else {
         lines.push(Line::styled(
-            "Inbox clear. Press Ctrl+G, then r to refresh.",
+            format!("No {}. Press Ctrl+G, then r to refresh.", tab.label()),
             Style::new().fg(theme::muted()),
         ));
     }
@@ -729,7 +865,7 @@ fn draw_empty_state(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
 }
 
 fn draw_legends(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
-    let rows = display_rows_matching(snapshot, &app.search_query, app.issue_sort);
+    let rows = app.rows(snapshot);
     let start = if rows.is_empty() {
         0
     } else {
@@ -849,7 +985,7 @@ fn shortcut_line(width: u16) -> Line<'static> {
     )
 }
 
-fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect) {
+fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let width = area.width.saturating_sub(2).min(64);
     let height = area.height.saturating_sub(2).min(21);
     if width == 0 || height == 0 {
@@ -881,20 +1017,34 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect) {
             Style::new().fg(theme::muted()),
         ),
         Line::raw(""),
-        command_help_line("d", "dispatch selected issue"),
+        command_help_line(
+            "d",
+            if app.tab == InboxTab::PullRequests {
+                "review selected PR"
+            } else {
+                "dispatch selected issue"
+            },
+        ),
         command_help_line("r", "refresh issue sources"),
         command_help_line("s", "choose issue sorting"),
         command_help_line("c", "clear search"),
         command_help_line("q", "quit agent-launcher"),
-        command_help_line("?", "keep this keybind sheet open"),
+        command_help_line("Tab / BackTab", "switch Issues / PRs"),
         Line::raw(""),
         Line::styled("Inbox", Style::new().fg(theme::primary()).bold()),
-        command_help_line("↑/↓ · PgUp/PgDn · Home/End", "navigate issues"),
-        command_help_line("Enter", "open issue details"),
+        command_help_line("↑/↓ · PgUp/PgDn · Home/End", "navigate; wheel scrolls"),
+        command_help_line("Enter / click row", "open issue or PR details"),
         command_help_line("Backspace", "edit search"),
         command_help_line("Esc", "quit from the main inbox"),
         Line::styled("Details", Style::new().fg(theme::primary()).bold()),
-        command_help_line("d · o · s", "dispatch · open · stop"),
+        command_help_line(
+            "d · o · s",
+            if app.tab == InboxTab::PullRequests {
+                "review PR · open · stop"
+            } else {
+                "dispatch · open · stop"
+            },
+        ),
         command_help_line("i · x · Esc", "input · delete · back"),
         command_help_line("Ctrl+C", "quit from anywhere"),
     ];
@@ -964,7 +1114,11 @@ fn draw_dispatch_overlay(
         .iter()
         .find(|issue| issue.key == overlay.issue_key)
         .map_or("Selected issue", |issue| issue.title.as_str());
-    let lines = match &overlay.stage {
+    let review = snapshot
+        .issues
+        .iter()
+        .any(|issue| issue.key == overlay.issue_key && issue.pull_request.is_some());
+    let mut lines = match &overlay.stage {
         DispatchStage::Prompt => {
             dispatch_prompt_lines(snapshot, overlay.cursor, issue_title, inner)
         },
@@ -974,8 +1128,13 @@ fn draw_dispatch_overlay(
             issue_title,
             profile.as_deref(),
             inner,
+            review,
         ),
     };
+    if let Some(status) = &app.status_message {
+        let index = usize::from(lines.len() > 1);
+        lines[index] = Line::styled(status.clone(), Style::new().fg(theme::error()));
+    }
     frame.render_widget(
         Paragraph::new(lines).style(Style::new().bg(theme::element())),
         inner,
@@ -1054,6 +1213,7 @@ fn dispatch_target_lines<'a>(
     issue_title: &str,
     profile: Option<&str>,
     inner: Rect,
+    review: bool,
 ) -> Vec<Line<'a>> {
     let automatic_enabled = snapshot
         .compute_targets
@@ -1075,7 +1235,11 @@ fn dispatch_target_lines<'a>(
                 Style::new().fg(theme::text()).bold(),
             ),
             Span::styled(
-                "  Enter dispatch · Esc cancel",
+                if review {
+                    "  Enter review PR · Esc cancel"
+                } else {
+                    "  Enter dispatch · Esc cancel"
+                },
                 Style::new().fg(theme::muted()),
             ),
         ])];
@@ -1093,7 +1257,16 @@ fn dispatch_target_lines<'a>(
     );
     let mut lines = vec![
         Line::styled(
-            format!("Choose compute target · {}/{}", cursor + 1, count),
+            format!(
+                "{} · {}/{}",
+                if review {
+                    "Review PR: compute target"
+                } else {
+                    "Choose compute target"
+                },
+                cursor + 1,
+                count
+            ),
             Style::new().fg(theme::primary()).bold(),
         ),
         Line::styled(
@@ -1101,7 +1274,11 @@ fn dispatch_target_lines<'a>(
             Style::new().fg(theme::muted()),
         ),
         Line::styled(
-            "↑/↓ select · Enter dispatch · 1-9 · Esc cancel",
+            if review {
+                "↑/↓ select · Enter review PR · 1-9 · Esc cancel"
+            } else {
+                "↑/↓ select · Enter dispatch · 1-9 · Esc cancel"
+            },
             Style::new().fg(theme::muted()),
         ),
         Line::raw(""),
@@ -1491,6 +1668,7 @@ mod tests {
         WorktreeDeleteAction, WorktreeDeletePreview,
     };
     use chrono::{Duration, Utc};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use super::*;
@@ -1507,6 +1685,7 @@ mod tests {
             title: title.to_owned(),
             description: Some("Detailed acceptance criteria".to_owned()),
             state: "open".to_owned(),
+            pull_request: None,
             url: Some(format!("https://github.com/acme/launcher/issues/{id}")),
             author: Some("octocat".to_owned()),
             labels: vec!["runtime".to_owned()],
@@ -1520,6 +1699,7 @@ mod tests {
 
     fn normal_snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot {
+            initialized: true,
             repository: Some(Repository {
                 root: PathBuf::from("/repo"),
                 git_dir: PathBuf::from("/repo/.git"),
@@ -1592,6 +1772,564 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn pr_snapshot() -> RuntimeSnapshot {
+        let mut snapshot = normal_snapshot();
+        let mut pr = issue("42", "Improve review flow");
+        pr.pull_request = Some(agent_launcher_core::PullRequestMetadata {
+            number: 42,
+            additions: Some(128),
+            deletions: None,
+            base_ref: "main".into(),
+            head_ref: "review-ui".into(),
+            base_sha: "base-123".into(),
+            head_sha: "head-456".into(),
+            head_repository: Some("octocat/launcher".into()),
+        });
+        snapshot.issues.push(pr);
+        snapshot
+    }
+
+    fn mouse(
+        app: &mut AppState,
+        snapshot: &RuntimeSnapshot,
+        kind: MouseEventKind,
+        x: u16,
+        y: u16,
+    ) -> bool {
+        let size = (app.mouse.screen.width, app.mouse.screen.height);
+        crate::mouse::handle_mouse(
+            app,
+            MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+            snapshot,
+            size,
+        )
+    }
+
+    fn mouse_snapshot() -> RuntimeSnapshot {
+        let mut snapshot = pr_snapshot();
+        let pr = snapshot.issues[1].clone();
+        snapshot.issues = (1..=40)
+            .map(|id| issue(&id.to_string(), &format!("Issue {id}")))
+            .collect();
+        snapshot.issues.extend((41..=80).map(|id| Issue {
+            key: IssueKey {
+                native_id: id.to_string(),
+                ..pr.key.clone()
+            },
+            title: format!("Review {id}"),
+            ..pr.clone()
+        }));
+        snapshot
+    }
+
+    #[test]
+    fn mouse_tab_coordinates_preserve_independent_state() {
+        let snapshot = mouse_snapshot();
+        let mut app = AppState {
+            selected: 8,
+            scroll: 3,
+            search_query: "Issue".into(),
+            ..Default::default()
+        };
+        let buffer = render_buffer(80, 24, &snapshot, &mut app);
+        for x in 4..12 {
+            assert_eq!(buffer.cell((x, 4)).unwrap().bg, theme::primary());
+            assert_eq!(buffer.cell((x, 4)).unwrap().fg, theme::bg());
+        }
+        for x in 14..19 {
+            assert_eq!(buffer.cell((x, 4)).unwrap().bg, theme::element());
+        }
+        assert_eq!(app.mouse.tabs[0], (Rect::new(4, 4, 8, 1), InboxTab::Issues));
+        assert_eq!(
+            app.mouse.tabs[1],
+            (Rect::new(14, 4, 5, 1), InboxTab::PullRequests)
+        );
+        let click = MouseEventKind::Down(MouseButton::Left);
+        for (x, y) in [(3, 4), (12, 4), (13, 4), (19, 4), (14, 3), (14, 5)] {
+            assert!(!mouse(&mut app, &snapshot, click, x, y));
+        }
+        assert!(!mouse(&mut app, &snapshot, click, 4, 4));
+        assert!(mouse(&mut app, &snapshot, click, 16, 4));
+        assert_eq!(app.tab, InboxTab::PullRequests);
+        assert_eq!((app.selected, app.scroll), (0, 0));
+        assert!(app.search_query.is_empty());
+        app.search_query = "Review".into();
+        app.issue_sort = IssueSort::Oldest;
+        app.selected = 7;
+        app.scroll = 4;
+        let buffer = render_buffer(80, 24, &snapshot, &mut app);
+        assert_eq!(buffer.cell((4, 4)).unwrap().bg, theme::element());
+        for x in 14..19 {
+            assert_eq!(buffer.cell((x, 4)).unwrap().bg, theme::primary());
+        }
+        assert_eq!(app.mouse.tabs[1].0, Rect::new(14, 4, 5, 1));
+        assert!(mouse(&mut app, &snapshot, click, 9, 4));
+        assert_eq!((app.selected, app.scroll), (8, 3));
+        assert_eq!(app.search_query, "Issue");
+        assert_eq!(app.issue_sort, IssueSort::Newest);
+        render_buffer(80, 24, &snapshot, &mut app);
+        assert!(mouse(&mut app, &snapshot, click, 14, 4));
+        assert_eq!((app.selected, app.scroll), (7, 4));
+        assert_eq!(app.search_query, "Review");
+        assert_eq!(app.issue_sort, IssueSort::Oldest);
+    }
+
+    #[test]
+    fn mouse_hover_selects_without_opening_and_keeps_immediate_click_valid() {
+        let snapshot = mouse_snapshot();
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut app = AppState {
+                tab,
+                selected: 5,
+                scroll: 5,
+                ..Default::default()
+            };
+            render_buffer(80, 24, &snapshot, &mut app);
+            let (rect, index, key) = app.mouse.rows[1].clone();
+            let y = rect.bottom() - 1;
+            assert!(mouse(&mut app, &snapshot, MouseEventKind::Moved, rect.x, y));
+            assert_eq!(app.selected, index);
+            assert_eq!(app.route, Route::Inbox);
+            assert!(app.detail_issue_key.is_none());
+            assert!(!mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::Moved,
+                rect.x,
+                y
+            ));
+            let other_tab = app.mouse.tabs[usize::from(tab == InboxTab::Issues)].0;
+            assert!(!mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::Moved,
+                other_tab.x,
+                other_tab.y
+            ));
+            assert_eq!(app.tab, tab);
+            assert_eq!(app.selected, index);
+            assert!(mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::Down(MouseButton::Left),
+                rect.x,
+                y
+            ));
+            assert_eq!(app.detail_issue_key.as_ref(), Some(&key));
+        }
+    }
+
+    #[test]
+    fn mouse_rows_match_rendered_cells_and_scrolled_indices_at_responsive_sizes() {
+        let snapshot = mouse_snapshot();
+        for (width, height) in [(24, 9), (40, 14), (80, 24), (160, 60)] {
+            for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                for scroll in [0, 5] {
+                    let mut app = AppState {
+                        tab,
+                        scroll,
+                        selected: scroll,
+                        ..Default::default()
+                    };
+                    let buffer = render_buffer(width, height, &snapshot, &mut app);
+                    for (rect, tab) in &app.mouse.tabs {
+                        let text: String = (rect.x..rect.right())
+                            .map(|x| buffer[(x, rect.y)].symbol())
+                            .collect();
+                        assert!(text.contains(tab.label()));
+                    }
+                    let rows = app.mouse.rows.clone();
+                    let list = app.mouse.list;
+                    for (screen_row, (rect, index, key)) in rows.iter().enumerate() {
+                        assert_eq!(*index, scroll + screen_row);
+                        assert_eq!(
+                            rect.height,
+                            if tab == InboxTab::Issues {
+                                1
+                            } else {
+                                2
+                            }
+                        );
+                        assert_eq!(rect.y, list.y + screen_row as u16 * rect.height);
+                        let text: String = (rect.x..rect.right())
+                            .map(|x| buffer[(x, rect.y)].symbol())
+                            .collect();
+                        assert!(!text.trim().is_empty());
+                        if width >= 40 {
+                            assert!(text.contains(if tab == InboxTab::Issues {
+                                "Issue"
+                            } else {
+                                "#42"
+                            }));
+                        }
+                        for y in rect.y..rect.bottom() {
+                            render_buffer(width, height, &snapshot, &mut app);
+                            assert!(mouse(
+                                &mut app,
+                                &snapshot,
+                                MouseEventKind::Down(MouseButton::Left),
+                                rect.right() - 1,
+                                y
+                            ));
+                            assert_eq!(app.selected, *index);
+                            assert_eq!(app.detail_issue_key.as_ref(), Some(key));
+                            assert!(app.dispatch_overlay.is_none());
+                            app.reset_detail();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_both_lists_without_wrapping_or_opening() {
+        let snapshot = mouse_snapshot();
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut app = AppState {
+                tab,
+                ..Default::default()
+            };
+            for _ in 0..30 {
+                render_buffer(80, 24, &snapshot, &mut app);
+                let list = app.mouse.list;
+                let old = app.scroll;
+                let max = app.rows(&snapshot).len() - app.visible_rows;
+                assert!(mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::ScrollDown,
+                    list.x,
+                    list.y
+                ));
+                assert_eq!(app.scroll, (old + 3).min(max));
+                assert!((app.scroll..app.scroll + app.visible_rows).contains(&app.selected));
+                assert_eq!(app.route, Route::Inbox);
+            }
+            for _ in 0..30 {
+                render_buffer(80, 24, &snapshot, &mut app);
+                let list = app.mouse.list;
+                let old = app.scroll;
+                assert!(mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::ScrollUp,
+                    list.x,
+                    list.y
+                ));
+                assert_eq!(app.scroll, old.saturating_sub(3));
+            }
+            assert_eq!(app.scroll, 0);
+            app.search_query = "no matches".into();
+            render_buffer(80, 24, &snapshot, &mut app);
+            assert!(app.mouse.rows.is_empty());
+            let list = app.mouse.list;
+            assert!(!mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::Down(MouseButton::Left),
+                list.x,
+                list.y
+            ));
+            assert!(mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::ScrollDown,
+                list.x,
+                list.y
+            ));
+            assert_eq!((app.selected, app.scroll), (0, 0));
+        }
+    }
+
+    #[test]
+    fn mouse_excludes_headers_gutters_blank_rows_and_stale_geometry() {
+        let snapshot = normal_snapshot();
+        let mut app = AppState::default();
+        render_buffer(80, 24, &snapshot, &mut app);
+        let row = app.mouse.rows[0].0;
+        for (x, y) in [
+            (row.x, row.y - 1),
+            (row.x - 1, row.y),
+            (row.right(), row.y),
+            (row.x, row.bottom()),
+            (0, 23),
+        ] {
+            assert!(!mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y
+            ));
+        }
+        for (x, y) in [(row.x, row.y - 1), (row.x - 1, row.y), (0, 23)] {
+            assert!(!mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::ScrollDown,
+                x,
+                y
+            ));
+        }
+        assert!(!crate::mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.x,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &snapshot,
+            (81, 24)
+        ));
+        let mut changed = snapshot.clone();
+        changed.issues[0].key.native_id = "replacement".into();
+        assert!(!mouse(
+            &mut app,
+            &changed,
+            MouseEventKind::Down(MouseButton::Left),
+            row.x,
+            row.y
+        ));
+        render_buffer(10, 4, &snapshot, &mut app);
+        assert!(app.mouse.tabs.is_empty());
+        assert!(app.mouse.rows.is_empty());
+        assert_eq!(app.visible_rows, 0);
+        assert!(!mouse(
+            &mut app,
+            &snapshot,
+            MouseEventKind::Down(MouseButton::Left),
+            row.x,
+            row.y
+        ));
+    }
+
+    #[test]
+    fn mouse_detail_wheel_is_bounded_and_overlays_block_all_background_hits() {
+        let mut snapshot = mouse_snapshot();
+        for issue in &mut snapshot.issues {
+            issue.description = Some("long description\n".repeat(100));
+        }
+        let mut app = AppState::default();
+        for overlay in 0..5 {
+            render_buffer(80, 24, &snapshot, &mut app);
+            let row = app.mouse.rows[0].0;
+            let tab = app.mouse.tabs[1].0;
+            match overlay {
+                0 => app.command_overlay = true,
+                1 => app.sort_overlay = true,
+                2 => {
+                    app.dispatch_overlay = Some(crate::app::DispatchOverlay {
+                        issue_key: snapshot.issues[0].key.clone(),
+                        cursor: 0,
+                        stage: DispatchStage::Prompt,
+                    })
+                },
+                3 => {
+                    app.input_overlay = Some(crate::app::InputOverlay {
+                        run_id: "run".into(),
+                        prompt: "input".into(),
+                        text: String::new(),
+                    })
+                },
+                _ => {
+                    app.delete_overlay = Some(crate::app::DeleteOverlay {
+                        preview: WorktreeDeletePreview {
+                            run: RunSummary {
+                                id: "run".into(),
+                                issue_key: snapshot.issues[0].key.canonical(),
+                                workspace: None,
+                                agent: "opencode".into(),
+                                state: RunState::Running,
+                                message: None,
+                                session_id: None,
+                                started_at: Utc::now(),
+                                updated_at: Utc::now(),
+                            },
+                            action: WorktreeDeleteAction::Delete,
+                            has_uncommitted_changes: false,
+                            has_ignored_files: false,
+                            unpushed_commits: 0,
+                            inspection_warning: None,
+                            inspection_fingerprint: None,
+                        },
+                    })
+                },
+            }
+            for kind in [
+                MouseEventKind::Moved,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::ScrollDown,
+            ] {
+                for rect in [row, tab] {
+                    assert!(!mouse(&mut app, &snapshot, kind, rect.x, rect.y));
+                }
+            }
+            app = AppState::default();
+        }
+        assert!(app.open_detail(&snapshot));
+        for _ in 0..50 {
+            render_buffer(80, 24, &snapshot, &mut app);
+            let detail = app.mouse.detail;
+            let old = app.detail_scroll;
+            assert!(!mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::ScrollDown,
+                detail.x,
+                detail.y - 2
+            ));
+            assert!(mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::ScrollDown,
+                detail.x,
+                detail.y
+            ));
+            assert_eq!(app.detail_scroll, (old + 3).min(app.detail_scroll_max));
+        }
+        assert_eq!(app.detail_scroll, app.detail_scroll_max);
+        for _ in 0..50 {
+            render_buffer(80, 24, &snapshot, &mut app);
+            let detail = app.mouse.detail;
+            assert!(mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::ScrollUp,
+                detail.x,
+                detail.y
+            ));
+        }
+        assert_eq!(app.detail_scroll, 0);
+        render_buffer(10, 4, &snapshot, &mut app);
+        assert!(app.mouse.detail.is_empty());
+    }
+
+    #[test]
+    fn pr_rows_show_metadata_and_state_without_leaking_into_issues() {
+        let mut snapshot = pr_snapshot();
+        let issues = render(112, 28, &snapshot, &mut AppState::default());
+        assert!(issues.contains("Repair runtime dispatch"));
+        assert!(!issues.contains("Improve review flow"));
+        for state in ["open", "draft", "merged", "closed"] {
+            snapshot.issues[1].state = state.into();
+            for (width, height) in [(112, 48), (80, 24), (46, 16), (36, 12)] {
+                let mut app = AppState {
+                    tab: InboxTab::PullRequests,
+                    ..AppState::default()
+                };
+                let text = render(width, height, &snapshot, &mut app);
+                assert!(text.contains(" Issues    PRs "), "{text}");
+                assert!(text.contains("#42 Improve review flow"), "{text}");
+                assert!(text.contains("octocat"), "{text}");
+                assert!(text.contains("+128 -?"), "{text}");
+                assert!(text.contains(state), "{text}");
+                assert!(!text.contains("Repair runtime dispatch"));
+                if height == 48 {
+                    assert!(text.contains("agent activity"));
+                }
+            }
+        }
+        let pr = snapshot.issues[1].pull_request.as_mut().unwrap();
+        pr.additions = None;
+        pr.deletions = Some(0);
+        snapshot.issues[1].author = None;
+        let text = render(80, 24, &snapshot, &mut AppState {
+            tab: InboxTab::PullRequests,
+            ..AppState::default()
+        });
+        assert!(text.contains("+? -0"));
+        assert!(text.contains("unknown"));
+    }
+
+    #[test]
+    fn pr_detail_has_comparison_context_and_explicit_review_controls() {
+        let snapshot = pr_snapshot();
+        let mut app = AppState {
+            tab: InboxTab::PullRequests,
+            ..AppState::default()
+        };
+        assert!(app.open_detail(&snapshot));
+        let text = render(112, 48, &snapshot, &mut app);
+        for expected in [
+            "Pull Request",
+            "main (base-123)",
+            "review-ui (head-456)",
+            "octocat/launcher",
+            "+128 -?",
+            "d review PR",
+            "Opening details does not start a review",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("d dispatch"));
+        assert!(app.dispatch_overlay.is_none());
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn pr_command_and_target_overlays_label_review_not_issue_dispatch() {
+        let mut snapshot = pr_snapshot();
+        let mut app = AppState {
+            tab: InboxTab::PullRequests,
+            command_overlay: true,
+            ..AppState::default()
+        };
+        let text = render(90, 28, &snapshot, &mut app);
+        assert!(text.contains("review selected PR"));
+        assert!(text.contains("Tab / BackTab"));
+        assert!(!text.contains("dispatch selected issue"));
+        app.command_overlay = false;
+        snapshot.selected_backend = Some(BackendKind::Native);
+        snapshot.compute_targets = vec![compute_target(
+            "ready",
+            ComputeTargetAvailability::Online,
+            0,
+            Some(2),
+        )];
+        app.dispatch_overlay = Some(crate::app::DispatchOverlay {
+            issue_key: snapshot.issues[1].key.clone(),
+            cursor: 0,
+            stage: DispatchStage::Target { profile: None },
+        });
+        let text = render(90, 28, &snapshot, &mut app);
+        assert!(text.contains("Review PR: compute target"));
+        assert!(text.contains("Enter review PR"));
+        assert!(text.contains("Automatic"));
+        assert!(!text.contains("Enter dispatch"));
+        app.status_message = Some("Target ready is full".into());
+        assert!(render(90, 28, &snapshot, &mut app).contains("Target ready is full"));
+    }
+
+    #[test]
+    fn pr_empty_loading_error_and_filter_states_are_distinct() {
+        let mut snapshot = normal_snapshot();
+        let mut app = AppState {
+            tab: InboxTab::PullRequests,
+            ..AppState::default()
+        };
+        let text = render(90, 28, &snapshot, &mut app);
+        assert!(text.contains("No PRs."));
+        snapshot.initialized = false;
+        assert!(render(90, 28, &snapshot, &mut app).contains("Loading PRs..."));
+        snapshot.error = Some("GitHub unavailable".into());
+        let text = render(90, 28, &snapshot, &mut app);
+        assert!(text.contains("Could not load sources"));
+        assert!(text.contains("GitHub unavailable"));
+        snapshot = pr_snapshot();
+        app.search_query = "zzzzzzzz".into();
+        assert!(render(90, 28, &snapshot, &mut app).contains("No matching PRs"));
+        for (width, height) in [(0, 0), (1, 1), (18, 5), (24, 9), (36, 12)] {
+            render(width, height, &snapshot, &mut app);
+        }
     }
 
     #[test]
@@ -1676,8 +2414,8 @@ mod tests {
         assert!(text.contains(theme::LAUNCHER_LOGO[0]));
         assert!(!text.contains("agents · issues · workspaces"));
         assert!(!text.contains("Filter issues..."));
-        assert!(text.contains("Search issues… type to filter"));
-        assert!(text.contains("Inbox · 1 source · newest first"));
+        assert!(text.contains("Search issues…"));
+        assert!(text.contains(" Issues    PRs   1 source · newest first"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("age"));
@@ -1688,7 +2426,7 @@ mod tests {
         assert!(text.contains("Ctrl+G"));
         assert!(!text.contains("d dispatch"));
         assert!(!text.contains("Ctrl+P"));
-        assert!(!text.contains("Tab"));
+        assert!(!text.contains("Tab/BackTab"));
         assert!(text.contains("/repo  ·  github online  ·  superset  ·  opencode"));
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
         assert!(!text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
@@ -1743,14 +2481,35 @@ mod tests {
     }
 
     #[test]
-    fn empty_search_shows_placeholder_without_cursor() {
+    fn empty_search_shows_placeholder_with_block_cursor() {
         let text = render(112, 48, &normal_snapshot(), &mut AppState::default());
         let line = text
             .lines()
             .find(|line| line.contains("Search issues…"))
             .unwrap();
-        assert!(line.contains("type to filter"));
+        assert!(!line.contains("type to filter"));
         assert!(!line.contains('█'));
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            for overlay in [false, true] {
+                let app = AppState {
+                    tab,
+                    command_overlay: overlay,
+                    ..Default::default()
+                };
+                terminal
+                    .draw(|frame| draw_search(frame, frame.area(), &app))
+                    .unwrap();
+                let cell = terminal.backend().buffer().cell((0, 0)).unwrap();
+                assert_eq!(cell.symbol(), "S");
+                if overlay {
+                    assert_ne!(cell.bg, theme::text());
+                } else {
+                    assert_eq!(cell.bg, theme::text());
+                    assert_eq!(cell.fg, theme::panel());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1942,6 +2701,7 @@ mod tests {
     #[test]
     fn no_source_empty_state_is_actionable() {
         let snapshot = RuntimeSnapshot {
+            initialized: true,
             repository: Some(Repository {
                 root: PathBuf::from("/repo"),
                 git_dir: PathBuf::from("/repo/.git"),
@@ -1962,8 +2722,8 @@ mod tests {
         let text = render(36, 12, &normal_snapshot(), &mut AppState::default());
         assert!(text.contains("agent launcher"));
         assert!(!text.contains("Filter issues..."));
-        assert!(text.contains("Search issues… type to filter"));
-        assert!(text.contains("Inbox · 1 source · newest first"));
+        assert!(text.contains("Search issues…"));
+        assert!(text.contains(" Issues    PRs "));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("src"));

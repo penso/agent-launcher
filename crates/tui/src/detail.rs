@@ -92,6 +92,7 @@ pub(crate) fn draw_detail(
         frame,
         controls,
         snapshot.error.as_deref().or(app.status_message.as_deref()),
+        issue.pull_request.is_some(),
     );
     if app.input_overlay.is_some() {
         draw_input_overlay(frame, area, app);
@@ -127,7 +128,11 @@ fn draw_tiny_detail(
         ));
     }
     lines.push(Line::styled(
-        "Esc back · d dispatch · i input · x delete",
+        if issue.pull_request.is_some() {
+            "Esc back · d review PR · i input · x delete"
+        } else {
+            "Esc back · d dispatch · i input · x delete"
+        },
         Style::new().fg(theme::muted()),
     ));
     frame.render_widget(Paragraph::new(lines), area);
@@ -207,6 +212,7 @@ fn draw_detail_body(
         return;
     }
     let lines = detail_lines(snapshot, issue, latest_run);
+    app.mouse.detail = inner;
     let visible_height = inner.height;
     let inner_width = inner.width.max(1) as usize;
     app.detail_scroll_max = visual_line_count(&lines, inner_width)
@@ -228,7 +234,40 @@ fn detail_lines(
     issue: &Issue,
     latest_run: Option<&RunSummary>,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![section("Issue")];
+    let mut lines = vec![section(if issue.pull_request.is_some() {
+        "Pull Request"
+    } else {
+        "Issue"
+    })];
+    if let Some(pr) = &issue.pull_request {
+        lines.push(key_value("number", &format!("#{}", pr.number)));
+        lines.push(key_value(
+            "base",
+            &format!("{} ({})", pr.base_ref, pr.base_sha),
+        ));
+        lines.push(key_value(
+            "head",
+            &format!("{} ({})", pr.head_ref, pr.head_sha),
+        ));
+        lines.push(key_value(
+            "head repo",
+            pr.head_repository.as_deref().unwrap_or("unknown"),
+        ));
+        lines.push(key_value(
+            "changes",
+            &format!(
+                "+{} -{}",
+                pr.additions
+                    .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+                pr.deletions
+                    .map_or_else(|| "?".to_owned(), |n| n.to_string())
+            ),
+        ));
+        lines.push(Line::styled(
+            "Press d to review PR. Opening details does not start a review.",
+            Style::new().fg(theme::primary()),
+        ));
+    }
     lines.push(key_value("id", &issue.key.canonical()));
     lines.push(key_value("source", &issue.key.provider.to_string()));
     lines.push(key_value("repository", &issue.key.repository));
@@ -324,7 +363,11 @@ fn detail_lines(
         }
     } else {
         lines.push(Line::styled(
-            "Not dispatched. Press d to start an agent.",
+            if issue.pull_request.is_some() {
+                "Not reviewed. Press d to start a PR review."
+            } else {
+                "Not dispatched. Press d to start an agent."
+            },
             Style::new().fg(theme::muted()),
         ));
     }
@@ -479,13 +522,20 @@ fn key_value_styled(
     ])
 }
 
-fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
+fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review: bool) {
     if area.is_empty() {
         return;
     }
     let controls = if area.width >= 82 {
         vec![control_line(&[
-            ("d", " dispatch   "),
+            (
+                "d",
+                if review {
+                    " review PR  "
+                } else {
+                    " dispatch   "
+                },
+            ),
             ("o", " open   "),
             ("s", " stop   "),
             ("i", " send input   "),
@@ -496,7 +546,14 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>) {
     } else {
         vec![
             control_line(&[
-                ("d", " dispatch  "),
+                (
+                    "d",
+                    if review {
+                        " review PR "
+                    } else {
+                        " dispatch  "
+                    },
+                ),
                 ("o", " open  "),
                 ("s", " stop  "),
                 ("i", " input"),

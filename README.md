@@ -1,11 +1,11 @@
 # agent-launcher
 
-A repository-local issue inbox for dispatching coding agents into isolated local or remote
+A repository-local issue and PR inbox for dispatching coding agents into isolated local or remote
 workspaces.
 
 Run `agent-launcher` from inside a Git repository. It detects the current repository's GitHub or
-GitLab remote from Git configuration and also enables Beads when `.beads` exists. Pull requests
-and merge requests are intentionally excluded.
+GitLab remote from Git configuration and also enables Beads when `.beads` exists. GitHub pull
+requests appear in a separate PRs tab; GitLab merge requests are not yet supported.
 
 Override the detected remote to fetch issues for a specific GitHub or GitLab repository:
 
@@ -69,7 +69,25 @@ Available variables are `issue_text`, `issue_title`, `issue_link`, `issue_identi
 `issue_repository`, and `issue_provider`. MiniJinja filters and control flow are also available.
 Undefined variables are rejected before an agent is started.
 
-- GitHub: `GH_TOKEN`, then `GITHUB_TOKEN`
+### PR Reviews
+
+The PRs tab shows GitHub PR numbers, titles, authors, additions/deletions, and lifecycle status.
+Unknown diff counts display `?`. Each tab retains its own filter and selection. Full refreshes
+retrieve open and draft PRs separately from issues; incremental updates also show closed/merged
+transitions until the next full reconciliation. Failed list requests preserve the cached inbox.
+If optional PR detail fetching hits GitHub's rate limit, the fetched list remains available with
+unknown diff counts. Use `gh auth login --hostname github.com` to authenticate if needed, then
+restart the launcher so it picks up the credentials.
+
+Use **Review PR** on the selected PR to launch the configured agent and, for native workspaces,
+choose a compute target. Reviews bypass issue prompt profiles and use a dedicated prompt with
+repository identity, base/head refs and SHAs, and explicit GitHub CLI/Git diff instructions.
+The agent must verify the PR revision rather than review the workspace's default branch. It is
+instructed to report findings only, without implementing changes, posting comments/reviews,
+approving, merging, committing, or pushing. These are prompt constraints, not a read-only sandbox.
+The agent environment needs authenticated GitHub CLI or Git access to the PR and base objects.
+
+- GitHub: `GH_TOKEN`, then `GITHUB_TOKEN`, then stored `gh auth` credentials for the remote host
 - GitLab: `PRIVATE_TOKEN`, then `GITLAB_TOKEN`
 - Conductor: `CONDUCTOR_API_TOKEN`, then `CONDUCTOR_API_KEY`
 - Superset, Herdr, OpenCode, SSH, Daytona, Coder, and Azure use their installed CLI authentication
@@ -80,17 +98,22 @@ Undefined variables are rejected before an agent is started.
 | --- | --- | --- |
 | `↑` / `↓` | Navigate | Scroll |
 | Type / Backspace | Filter | |
-| `Enter` | Open issue | |
-| `Ctrl+G`, then `d` | Dispatch | |
+| `Tab` / `Shift+Tab` | Switch Issues / PRs | |
+| `Enter` | Open issue or PR | |
+| `Ctrl+G`, then `d` | Dispatch issue / review PR | |
 | `Ctrl+G`, then `r` | Refresh | |
 | `Ctrl+G`, then `s` | Choose sorting | |
-| `d` | | Dispatch |
+| `d` | | Dispatch issue / review PR |
 | `r` | | Refresh |
 | `i` | | Send input |
 | `o` | | Open workspace/session |
 | `s` | | Stop run |
 | `Esc` | Quit | Return to inbox |
 | `Ctrl-C` | Quit | Quit |
+
+Click a tab to switch between Issues and PRs. Hover a row to select it, then click to open its details. Mouse-wheel
+scrolling over the list moves three items at a time; over details it moves three lines. Overlays
+block background mouse actions. Opening a PR does not launch a review.
 
 ## Development
 

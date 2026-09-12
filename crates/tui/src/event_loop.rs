@@ -22,7 +22,7 @@ use crate::{
     app::{AppState, DeleteOverlay, DispatchOverlay, DispatchStage, InputOverlay, Route},
     metrics::HostMetricsSampler,
     render::draw,
-    rows::{IssueSort, display_rows_matching},
+    rows::IssueSort,
 };
 
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
@@ -45,8 +45,8 @@ type UiActionSender = tokio::sync::mpsc::UnboundedSender<UiActionResult>;
 
 /// Runs the interactive terminal UI against a live runtime handle.
 pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
-    enable_raw_mode()?;
     let _cleanup = TerminalCleanup;
+    enable_raw_mode()?;
 
     let mut output = io::stdout();
     execute!(output, EnterAlternateScreen, EnableMouseCapture)?;
@@ -101,7 +101,22 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
                         }
                         needs_draw = true;
                     },
-                    Some(Ok(Event::Resize(_, _))) => needs_draw = true,
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        // Query the live size too: a mouse event can precede a queued resize.
+                        match crossterm::terminal::size() {
+                            Ok(size) if size == (app.mouse.screen.width, app.mouse.screen.height) => {
+                                needs_draw = crate::mouse::handle_mouse(&mut app, mouse, &snapshot, size);
+                            },
+                            _ => {
+                                app.mouse = Default::default();
+                                needs_draw = true;
+                            },
+                        }
+                    },
+                    Some(Ok(Event::Resize(_, _))) => {
+                        app.mouse = Default::default();
+                        needs_draw = true;
+                    },
                     Some(Ok(_)) => {},
                     Some(Err(error)) => return Err(error.into()),
                     None => break,
@@ -111,12 +126,12 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
                 if changed.is_err() {
                     break;
                 }
-                let selected_key = app.selected_issue(&snapshot).map(|issue| issue.key.clone());
-                snapshot = snapshots.borrow().clone();
+                let next = snapshots.borrow().clone();
+                app.reconcile_lists(&snapshot, &next);
+                snapshot = next;
                 if snapshot.initialized && !app.agent_activity.is_initialized() {
                     app.agent_activity.initialize(&snapshot);
                 }
-                app.reconcile_selection(&snapshot, selected_key.as_ref());
                 app.reconcile_detail(&snapshot);
                 app.reconcile_dispatch(&snapshot);
                 needs_draw = true;
@@ -203,13 +218,11 @@ fn handle_key(
         return handle_inbox_command_key(app, key, snapshot, runtime, actions);
     }
 
-    let rows = display_rows_matching(snapshot, &app.search_query, app.issue_sort);
+    if app.route == Route::Inbox {
+        return handle_list_key(app, key, snapshot);
+    }
     match (app.route, key.code) {
-        (Route::Inbox, KeyCode::Esc) => return true,
         (Route::Detail, KeyCode::Esc) => app.reset_detail(),
-        (Route::Inbox, KeyCode::Enter) if !rows.is_empty() => {
-            app.open_detail(snapshot);
-        },
         (Route::Detail, KeyCode::Char('r')) => {
             app.status_message = Some("refreshing issue sources...".to_owned());
             let runtime = runtime.clone();
@@ -226,19 +239,6 @@ fn handle_key(
         (Route::Detail, KeyCode::Char('x')) => {
             open_delete(app, snapshot, runtime, actions);
         },
-        (Route::Inbox, KeyCode::Up) => select_previous(app, rows.len()),
-        (Route::Inbox, KeyCode::Down) => select_next(app, rows.len()),
-        (Route::Inbox, KeyCode::PageUp) => {
-            app.selected = app.selected.saturating_sub(app.visible_rows.max(1));
-        },
-        (Route::Inbox, KeyCode::PageDown) => {
-            app.selected = app
-                .selected
-                .saturating_add(app.visible_rows.max(1))
-                .min(rows.len().saturating_sub(1));
-        },
-        (Route::Inbox, KeyCode::Home) => app.selected = 0,
-        (Route::Inbox, KeyCode::End) => app.selected = rows.len().saturating_sub(1),
         (Route::Detail, KeyCode::Up) => {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
         },
@@ -259,12 +259,39 @@ fn handle_key(
         },
         (Route::Detail, KeyCode::Home) => app.detail_scroll = 0,
         (Route::Detail, KeyCode::End) => app.detail_scroll = app.detail_scroll_max,
-        (Route::Inbox, KeyCode::Backspace) => {
+        _ => {},
+    }
+    false
+}
+
+fn handle_list_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot) -> bool {
+    let count = app.rows(snapshot).len();
+    match key.code {
+        KeyCode::Esc => return true,
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.switch_tab();
+            app.status_message = None;
+        },
+        KeyCode::Enter => {
+            app.open_detail(snapshot);
+        },
+        KeyCode::Up => select_previous(app, count),
+        KeyCode::Down => select_next(app, count),
+        KeyCode::PageUp => app.selected = app.selected.saturating_sub(app.visible_rows.max(1)),
+        KeyCode::PageDown => {
+            app.selected = app
+                .selected
+                .saturating_add(app.visible_rows.max(1))
+                .min(count.saturating_sub(1))
+        },
+        KeyCode::Home => app.selected = 0,
+        KeyCode::End => app.selected = count.saturating_sub(1),
+        KeyCode::Backspace => {
             app.search_query.pop();
             app.selected = 0;
             app.scroll = 0;
         },
-        (Route::Inbox, KeyCode::Char(character)) if printable(character, key.modifiers) => {
+        KeyCode::Char(character) if printable(character, key.modifiers) => {
             app.search_query.push(character);
             app.selected = 0;
             app.scroll = 0;
@@ -434,9 +461,13 @@ fn dispatch_selected(
     runtime: &RuntimeHandle,
     actions: &UiActionSender,
 ) {
-    let Some(issue_key) = dispatch_target(app, snapshot) else {
-        return;
-    };
+    if let Some(action) = prepare_dispatch(app, snapshot) {
+        start_launch(app, runtime, actions, action);
+    }
+}
+
+fn prepare_dispatch(app: &mut AppState, snapshot: &RuntimeSnapshot) -> Option<LaunchAction> {
+    let issue_key = dispatch_target(app, snapshot)?;
     if let Some(run) = snapshot.runs.iter().find(|run| {
         run.issue_key == issue_key.canonical()
             && (run.state.is_active()
@@ -451,26 +482,38 @@ fn dispatch_selected(
         } else {
             "existing native run must be resumed or deleted before dispatching again".to_owned()
         });
-        return;
+        return None;
     }
     if let Some(overlay) = staged_dispatch_overlay(issue_key.clone(), snapshot) {
         app.status_message = None;
         app.dispatch_overlay = Some(overlay);
-        return;
+        return None;
     }
     let profile = snapshot.prompt_profiles.first().cloned();
-    start_dispatch(app, runtime, actions, issue_key, profile);
+    Some(launch_action(snapshot, issue_key, profile, None))
+}
+
+fn is_pull_request(snapshot: &RuntimeSnapshot, key: &agent_launcher_core::IssueKey) -> bool {
+    snapshot
+        .issues
+        .iter()
+        .any(|issue| issue.key == *key && issue.pull_request.is_some())
 }
 
 fn staged_dispatch_overlay(
     issue_key: agent_launcher_core::IssueKey,
     snapshot: &RuntimeSnapshot,
 ) -> Option<DispatchOverlay> {
-    let stage = if snapshot.prompt_profiles.len() > 1 {
+    let review = is_pull_request(snapshot, &issue_key);
+    let stage = if !review && snapshot.prompt_profiles.len() > 1 {
         DispatchStage::Prompt
     } else if has_target_stage(snapshot) {
         DispatchStage::Target {
-            profile: snapshot.prompt_profiles.first().cloned(),
+            profile: if review {
+                None
+            } else {
+                snapshot.prompt_profiles.first().cloned()
+            },
         }
     } else {
         return None;
@@ -522,23 +565,24 @@ fn dispatch_from_overlay(
     actions: &UiActionSender,
     index: usize,
 ) {
-    let Some(stage) = app
-        .dispatch_overlay
-        .as_ref()
-        .map(|overlay| overlay.stage.clone())
-    else {
-        return;
-    };
+    if let Some(action) = select_dispatch(app, snapshot, index) {
+        start_launch(app, runtime, actions, action);
+    }
+}
+
+fn select_dispatch(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    index: usize,
+) -> Option<LaunchAction> {
+    let stage = app.dispatch_overlay.as_ref()?.stage.clone();
     match stage {
         DispatchStage::Prompt => {
-            if let Some((issue_key, profile)) = select_prompt(app, snapshot, index) {
-                start_dispatch(app, runtime, actions, issue_key, Some(profile));
-            }
+            let (issue_key, profile) = select_prompt(app, snapshot, index)?;
+            Some(launch_action(snapshot, issue_key, Some(profile), None))
         },
         DispatchStage::Target { profile } => {
-            let Ok(target) = select_target(app, snapshot, index) else {
-                return;
-            };
+            let target = select_target(app, snapshot, index).ok()?;
             let issue_key = app
                 .dispatch_overlay
                 .as_ref()
@@ -546,7 +590,7 @@ fn dispatch_from_overlay(
                 .issue_key
                 .clone();
             app.dispatch_overlay = None;
-            start_dispatch_on_target(app, runtime, actions, issue_key, profile, target);
+            Some(launch_action(snapshot, issue_key, profile, target))
         },
     }
 }
@@ -665,32 +709,57 @@ fn target_unavailable_message(target: &agent_launcher_core::ComputeTargetStatus)
     format!("{} is {status}", target.name)
 }
 
-fn start_dispatch(
-    app: &mut AppState,
-    runtime: &RuntimeHandle,
-    actions: &UiActionSender,
-    issue_key: agent_launcher_core::IssueKey,
-    profile: Option<String>,
-) {
-    let status = profile.as_deref().map_or_else(
-        || "dispatching agent...".to_owned(),
-        |profile| format!("dispatching {profile}..."),
-    );
-    app.status_message = Some(status);
-    let runtime = runtime.clone();
-    spawn_runtime_action(actions, "agent dispatched", None, async move {
-        runtime.dispatch(issue_key, profile).await
-    });
+#[derive(Debug, Eq, PartialEq)]
+enum LaunchAction {
+    Review {
+        issue: agent_launcher_core::IssueKey,
+        target: Option<String>,
+    },
+    Dispatch {
+        issue: agent_launcher_core::IssueKey,
+        profile: Option<String>,
+        target: Option<String>,
+    },
 }
 
-fn start_dispatch_on_target(
+fn launch_action(
+    snapshot: &RuntimeSnapshot,
+    issue: agent_launcher_core::IssueKey,
+    profile: Option<String>,
+    target: Option<String>,
+) -> LaunchAction {
+    if is_pull_request(snapshot, &issue) {
+        LaunchAction::Review { issue, target }
+    } else {
+        LaunchAction::Dispatch {
+            issue,
+            profile,
+            target,
+        }
+    }
+}
+
+fn start_launch(
     app: &mut AppState,
     runtime: &RuntimeHandle,
     actions: &UiActionSender,
-    issue_key: agent_launcher_core::IssueKey,
-    profile: Option<String>,
-    target: Option<String>,
+    action: LaunchAction,
 ) {
+    let (issue, profile, target) = match action {
+        LaunchAction::Review { issue, target } => {
+            app.status_message = Some("starting PR review...".to_owned());
+            let runtime = runtime.clone();
+            spawn_runtime_action(actions, "PR review started", None, async move {
+                runtime.review(issue, target).await
+            });
+            return;
+        },
+        LaunchAction::Dispatch {
+            issue,
+            profile,
+            target,
+        } => (issue, profile, target),
+    };
     let status = match (profile.as_deref(), target.as_deref()) {
         (Some(profile), Some(target)) => format!("dispatching {profile} on {target}..."),
         (None, Some(target)) => format!("dispatching agent on {target}..."),
@@ -700,7 +769,11 @@ fn start_dispatch_on_target(
     app.status_message = Some(status);
     let runtime = runtime.clone();
     spawn_runtime_action(actions, "agent dispatched", None, async move {
-        runtime.dispatch_on_target(issue_key, profile, target).await
+        if target.is_some() {
+            runtime.dispatch_on_target(issue, profile, target).await
+        } else {
+            runtime.dispatch(issue, profile).await
+        }
     });
 }
 
@@ -817,7 +890,11 @@ fn selected_action_issue<'a>(
         Route::Detail => app.detail_issue(snapshot),
     };
     if issue.is_none() {
-        app.status_message = Some("no issue selected".to_owned());
+        app.status_message = Some(if app.tab == crate::app::InboxTab::PullRequests {
+            "no PR selected".to_owned()
+        } else {
+            "no issue selected".to_owned()
+        });
     }
     issue
 }
@@ -944,12 +1021,11 @@ struct TerminalCleanup;
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
+        // Attempt each restoration even if an earlier terminal write fails.
+        let mut output = io::stdout();
+        let _ = execute!(output, DisableMouseCapture);
+        let _ = execute!(output, LeaveAlternateScreen);
+        let _ = execute!(output, Show);
     }
 }
 
@@ -976,6 +1052,7 @@ mod tests {
             title: format!("Issue {id}"),
             description: None,
             state: "open".to_owned(),
+            pull_request: None,
             url: None,
             author: None,
             labels: Vec::new(),
@@ -1005,6 +1082,199 @@ mod tests {
             sampled_at: Utc::now(),
             message: None,
         }
+    }
+
+    fn pull_request(id: &str) -> Issue {
+        Issue {
+            title: format!("Review {id}"),
+            pull_request: Some(agent_launcher_core::PullRequestMetadata {
+                number: id.parse().unwrap(),
+                additions: Some(12),
+                deletions: None,
+                base_ref: "main".into(),
+                head_ref: "feature".into(),
+                base_sha: "base-sha".into(),
+                head_sha: "head-sha".into(),
+                head_repository: Some("fork/launcher".into()),
+            }),
+            ..issue(id, Duration::zero())
+        }
+    }
+
+    #[test]
+    fn tabs_keep_independent_navigation_and_reconcile_the_hidden_selection() {
+        let mut snapshot = RuntimeSnapshot {
+            issues: (1..=10)
+                .map(|id| issue(&id.to_string(), Duration::days(id)))
+                .collect(),
+            ..RuntimeSnapshot::default()
+        };
+        snapshot
+            .issues
+            .extend((11..=20).map(|id| pull_request(&id.to_string())));
+        let mut app = AppState {
+            search_query: "Issue".into(),
+            selected: 5,
+            scroll: 3,
+            ..AppState::default()
+        };
+        let issue_key = app.selected_issue(&snapshot).unwrap().key.clone();
+        handle_list_key(&mut app, KeyCode::Tab.into(), &snapshot);
+        assert_eq!(app.tab, crate::app::InboxTab::PullRequests);
+        assert_eq!((app.selected, app.scroll), (0, 0));
+        assert!(app.search_query.is_empty());
+        app.search_query = "Review".into();
+        app.issue_sort = IssueSort::Oldest;
+        app.selected = 4;
+        app.scroll = 2;
+        let pr_key = app.selected_issue(&snapshot).unwrap().key.clone();
+        handle_list_key(&mut app, KeyCode::BackTab.into(), &snapshot);
+        assert_eq!(app.search_query, "Issue");
+        assert_eq!((app.selected, app.scroll), (5, 3));
+        assert_eq!(app.issue_sort, IssueSort::Newest);
+
+        let mut refreshed = snapshot.clone();
+        refreshed.issues.reverse();
+        refreshed.issues.push(issue("21", Duration::zero()));
+        let mut new_pr = pull_request("22");
+        new_pr.created_at = Some(Utc::now() - Duration::days(100));
+        refreshed.issues.push(new_pr);
+        app.reconcile_lists(&snapshot, &refreshed);
+        assert_eq!(app.selected_issue(&refreshed).unwrap().key, issue_key);
+        assert_eq!(app.scroll, 3);
+        handle_list_key(&mut app, KeyCode::Tab.into(), &refreshed);
+        assert_eq!(app.selected_issue(&refreshed).unwrap().key, pr_key);
+        assert_eq!(app.scroll, 2);
+        assert_eq!(app.search_query, "Review");
+        assert_eq!(app.issue_sort, IssueSort::Oldest);
+
+        refreshed.issues.retain(|issue| issue.key != pr_key);
+        app.reconcile_lists(&snapshot, &refreshed);
+        assert!(app.selected < app.rows(&refreshed).len());
+    }
+
+    #[test]
+    fn printable_command_characters_remain_filter_text_on_both_tabs() {
+        let snapshot = RuntimeSnapshot::default();
+        let mut app = AppState::default();
+        for tab in [KeyCode::Tab, KeyCode::BackTab] {
+            for character in "drs?".chars() {
+                assert!(!handle_list_key(
+                    &mut app,
+                    KeyCode::Char(character).into(),
+                    &snapshot
+                ));
+            }
+            assert_eq!(app.search_query, "drs?");
+            assert!(app.dispatch_overlay.is_none());
+            handle_list_key(&mut app, tab.into(), &snapshot);
+        }
+        assert_eq!(app.search_query, "drs?");
+    }
+
+    #[test]
+    fn explicit_review_bypasses_profiles_and_opening_details_does_not_launch() {
+        let pr = pull_request("42");
+        let snapshot = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::zero()), pr.clone()],
+            prompt_profiles: vec!["implementer".into(), "designer".into()],
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState::default();
+        handle_list_key(&mut app, KeyCode::Tab.into(), &snapshot);
+        handle_list_key(&mut app, KeyCode::Enter.into(), &snapshot);
+        assert_eq!(app.detail_issue_key, Some(pr.key.clone()));
+        assert!(app.dispatch_overlay.is_none());
+        assert!(app.status_message.is_none());
+        assert_eq!(
+            prepare_dispatch(&mut app, &snapshot),
+            Some(LaunchAction::Review {
+                issue: pr.key,
+                target: None,
+            })
+        );
+        assert!(app.dispatch_overlay.is_none());
+    }
+
+    #[test]
+    fn review_target_flow_keeps_the_pr_key_and_never_an_issue_profile() {
+        let pr = pull_request("42");
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![pr.clone()],
+            prompt_profiles: vec!["implementer".into(), "designer".into()],
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![
+                compute_target("offline", ComputeTargetAvailability::Offline, 0, Some(2)),
+                compute_target("ready", ComputeTargetAvailability::Online, 0, Some(2)),
+            ],
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState {
+            tab: crate::app::InboxTab::PullRequests,
+            ..AppState::default()
+        };
+        assert_eq!(prepare_dispatch(&mut app, &snapshot), None);
+        assert_eq!(
+            app.dispatch_overlay.as_ref().unwrap().stage,
+            DispatchStage::Target { profile: None }
+        );
+        assert_eq!(select_dispatch(&mut app, &snapshot, 1), None);
+        assert!(app.status_message.as_deref().unwrap().contains("offline"));
+        snapshot.issues.insert(0, pull_request("43"));
+        snapshot.prompt_profiles.clear();
+        assert!(!app.reconcile_dispatch(&snapshot));
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 2),
+            Some(LaunchAction::Review {
+                issue: pr.key.clone(),
+                target: Some("ready".into()),
+            })
+        );
+        assert!(app.dispatch_overlay.is_none());
+        app.dispatch_overlay = staged_dispatch_overlay(pr.key.clone(), &snapshot);
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 0),
+            Some(LaunchAction::Review {
+                issue: pr.key.clone(),
+                target: None,
+            })
+        );
+        app.dispatch_overlay = staged_dispatch_overlay(pr.key.clone(), &snapshot);
+        snapshot.issues.retain(|issue| issue.key != pr.key);
+        assert!(app.reconcile_dispatch(&snapshot));
+        assert!(app.dispatch_overlay.is_none());
+    }
+
+    #[test]
+    fn issue_launch_still_uses_the_selected_prompt_and_target() {
+        let selected = issue("1", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            prompt_profiles: vec!["implementer".into(), "designer".into()],
+            selected_backend: Some(BackendKind::Native),
+            compute_targets: vec![compute_target(
+                "ready",
+                ComputeTargetAvailability::Online,
+                0,
+                Some(2),
+            )],
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState::default();
+        assert_eq!(prepare_dispatch(&mut app, &snapshot), None);
+        assert_eq!(
+            app.dispatch_overlay.as_ref().unwrap().stage,
+            DispatchStage::Prompt
+        );
+        assert_eq!(select_dispatch(&mut app, &snapshot, 1), None);
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 1),
+            Some(LaunchAction::Dispatch {
+                issue: selected.key,
+                profile: Some("designer".into()),
+                target: Some("ready".into()),
+            })
+        );
     }
 
     #[test]

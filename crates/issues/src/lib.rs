@@ -74,20 +74,9 @@ pub fn build_sources(repository: &Repository) -> Result<Vec<Box<dyn IssueSource>
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use agent_launcher_core::IssueProvider;
 
-    use agent_launcher_core::{IssueProvider, Repository};
-
-    use super::{build_sources, command_line_remote};
-
-    fn repository_with_remote(remote_url: &str) -> Repository {
-        Repository {
-            root: PathBuf::from("/repo"),
-            git_dir: PathBuf::from("/repo/.git"),
-            remote: Some(command_line_remote(remote_url).unwrap()),
-            has_beads: false,
-        }
-    }
+    use super::{GitHubSource, GitLabSource, IssueSource, command_line_remote};
 
     #[test]
     fn builds_sources_for_command_line_remote_formats() {
@@ -105,10 +94,19 @@ mod tests {
         ];
 
         for (url, provider, name) in cases {
-            let sources = build_sources(&repository_with_remote(url)).unwrap();
-            assert_eq!(sources.len(), 1);
-            assert_eq!(sources[0].source_key().provider, provider);
-            assert_eq!(sources[0].source_key().repository, name);
+            let remote = command_line_remote(url).unwrap();
+            // Explicit auth keeps this parsing/construction test off the local credential store.
+            let source: Box<dyn IssueSource> = match remote.provider {
+                IssueProvider::Github => {
+                    Box::new(GitHubSource::new(remote.host, remote.repository, None).unwrap())
+                },
+                IssueProvider::Gitlab => {
+                    Box::new(GitLabSource::new(remote.host, remote.repository, None).unwrap())
+                },
+                IssueProvider::Beads => unreachable!(),
+            };
+            assert_eq!(source.source_key().provider, provider);
+            assert_eq!(source.source_key().repository, name);
         }
     }
 }

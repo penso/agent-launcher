@@ -222,6 +222,7 @@ impl BeadsIssue {
         blocked_by.dedup();
 
         Issue {
+            pull_request: None,
             key: IssueKey {
                 provider: source.provider,
                 host: source.host.clone(),

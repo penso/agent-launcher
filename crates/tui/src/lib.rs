@@ -5,6 +5,7 @@ mod error;
 mod event_loop;
 mod format;
 mod metrics;
+mod mouse;
 mod render;
 mod rows;
 mod status;
