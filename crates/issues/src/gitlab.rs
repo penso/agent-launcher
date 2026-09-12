@@ -132,6 +132,7 @@ impl IssueSource for GitLabSource {
                 } else {
                     checkpoint.and_then(|value| value.last_full_at)
                 },
+                ..SyncCheckpoint::default()
             },
             mode: if full {
                 SyncMode::Full

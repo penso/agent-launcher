@@ -17,6 +17,24 @@ agent-launcher --remote git@gitlab.com:group/repository.git
 HTTPS, `git://`, `ssh://`, and SCP-style Git URLs are supported. The override is also used as the
 repository identity when selecting or creating a workspace backend.
 
+### Terminal Title
+
+The interactive TUI sets its own terminal title to `launcher` using Crossterm's OSC title
+command. It saves and restores the previous title with xterm title-stack sequences on exit
+(including errors and handled termination signals), where the terminal supports them.
+Forced termination or terminals without title-stack support cannot guarantee restoration.
+Herdr 0.9.0 captures OSC titles as terminal metadata, separately from its tab labels.
+When `HERDR_ENV=1` and `HERDR_TAB_ID` is nonempty, startup also invokes
+`herdr tab rename -- <HERDR_TAB_ID> launcher` with a one-second timeout and suppressed output.
+This targets only the inherited tab ID, never UI focus or a list of other terminals.
+Failure is nonfatal. The custom tab label persists after exit: Herdr has no reset-to-auto API.
+Its OSC tracker does not track title-stack restoration either; a later shell OSC title update
+replaces that metadata. If a pane is moved between tabs, restart from a fresh shell context
+before launching: an inherited tab ID may refer to its original tab. Do not forward Herdr
+context variables to unrelated terminals.
+See Herdr's [title synchronization](https://github.com/herdrdev/herdr/blob/v0.9.0/src/app/terminal_titles.rs)
+and [tab rename implementation](https://github.com/herdrdev/herdr/blob/v0.9.0/src/app/api/tabs.rs).
+
 ## Dispatch
 
 The default backend is `auto`: use Superset when the current repository is registered there, then
@@ -71,13 +89,30 @@ Undefined variables are rejected before an agent is started.
 
 ### PR Reviews
 
-The PRs tab shows GitHub PR numbers, titles, authors, additions/deletions, and lifecycle status.
-Unknown diff counts display `?`. Each tab retains its own filter and selection. Full refreshes
+The PRs tab shows GitHub PR numbers, titles, authors, a four-square diff indicator, and lifecycle
+status on one line. One to four filled squares mean 1-10, 11-100, 101-1000, or over 1000 changed
+lines; unused squares are dim outlines. Green/red squares approximate the addition/deletion ratio,
+with both colors shown for mixed changes when at least two squares are filled. A single square
+uses the dominant color (green on ties). Zero changes show four outlines; either count unknown
+shows `?` followed by three outlines. PR details retain exact `+/-` counts.
+Each tab retains its own filter and selection. Full refreshes
 retrieve open and draft PRs separately from issues; incremental updates also show closed/merged
 transitions until the next full reconciliation. Failed list requests preserve the cached inbox.
-If optional PR detail fetching hits GitHub's rate limit, the fetched list remains available with
-unknown diff counts. Use `gh auth login --hostname github.com` to authenticate if needed, then
-restart the launcher so it picks up the credentials.
+Issues and PRs share the persistent SQLite cache. Every GitHub sync paginates the complete open
+PR list; issue deltas overlap by five minutes, with full reconciliation every six hours. PR
+details are reused across refreshes and restarts while the update timestamp, head/base revisions,
+and state match. Missing or changed details are fetched in rotating batches of at most ten per
+sync, so later PRs are not starved. Optional failures retain known metadata and counts (which may
+be stale until enrichment succeeds); never-fetched counts remain unknown.
+
+GitHub throttling pauses all requests for that source, including manual refreshes, while keeping
+cached lists visible. Source status reports the retry deadline rather than going offline. The
+launcher honors `Retry-After` (seconds or HTTP date) and `X-RateLimit-Reset`, using the later valid
+deadline; without one, retries back off from 60 seconds exponentially to a one-hour maximum.
+Backoff resets after a successful sync and lasts for the source's runtime lifetime, not across
+restarts. No command-dispatch thread sleeps; the next refresh after expiry resumes syncing.
+Use `gh auth login --hostname github.com` to authenticate if needed, then restart the launcher
+so it picks up the credentials.
 
 Use **Review PR** on the selected PR to launch the configured agent and, for native workspaces,
 choose a compute target. Reviews bypass issue prompt profiles and use a dedicated prompt with

@@ -188,6 +188,19 @@ impl Store {
         rows.iter().map(issue_from_row).collect()
     }
 
+    /// Loads only records belonging to this source's persistent cache.
+    pub async fn load_source_issues(&self, source: &str) -> Result<Vec<Issue>> {
+        let rows = sqlx::query(
+            "SELECT provider, host, repository, native_id, identifier, title, description, \
+             state, url, author, labels_json, parent_id, blocked_by_json, priority, \
+             created_at, updated_at, pull_request_json FROM issues WHERE source = ? ORDER BY canonical_key ASC",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(issue_from_row).collect()
+    }
+
     /// Alias for [`Store::load_issues`].
     pub async fn load_current_issues(&self) -> Result<Vec<Issue>> {
         self.load_issues().await

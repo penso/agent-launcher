@@ -468,12 +468,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
     }
     let rows = app.rows(snapshot);
     app.selected = app.selected.min(rows.len().saturating_sub(1));
-    let row_height = if app.tab == InboxTab::PullRequests {
-        2
-    } else {
-        1
-    };
-    let visible_rows = area.height.saturating_sub(1) as usize / row_height;
+    let visible_rows = area.height.saturating_sub(1) as usize;
     app.visible_rows = visible_rows;
     let max_scroll = rows.len().saturating_sub(visible_rows);
     app.scroll = app.scroll.min(max_scroll);
@@ -488,19 +483,35 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
 
     let scrollbar_width = u16::from(rows.len() > visible_rows) * 2;
     let table_width = area.width.saturating_sub(scrollbar_width);
-    app.mouse.list = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        (visible_rows * row_height) as u16,
-    );
+    app.mouse.list = Rect::new(area.x, area.y + 1, area.width, visible_rows as u16);
     let columns = Columns::for_width(table_width);
+    let number_width = rows
+        .iter()
+        .filter_map(|row| {
+            snapshot.issues[row.issue_idx]
+                .pull_request
+                .as_ref()
+                .map(|pr| pr.number.to_string().len() as u16 + 1)
+        })
+        .max()
+        .unwrap_or(2);
+    let pr_columns = pr_columns(Rect::new(area.x, area.y, table_width, 1), number_width);
     if app.tab == InboxTab::PullRequests {
-        frame.render_widget(
-            Paragraph::new("  PR / title · author · +/- · status")
-                .style(Style::new().fg(theme::muted())),
-            Rect::new(area.x, area.y, table_width, 1),
-        );
+        for (column, label) in pr_columns
+            .into_iter()
+            .zip(["PR", "title", "author", "diff", "status"])
+        {
+            frame.render_widget(
+                Paragraph::new(label)
+                    .style(Style::new().fg(theme::muted()))
+                    .alignment(if label == "status" {
+                        Alignment::Right
+                    } else {
+                        Alignment::Left
+                    }),
+                column,
+            );
+        }
     } else {
         draw_table_header(frame, Rect::new(area.x, area.y, table_width, 1), columns);
     }
@@ -531,15 +542,10 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         let Some(issue) = snapshot.issues.get(row.issue_idx) else {
             continue;
         };
-        let row_area = Rect::new(
-            area.x,
-            area.y + 1 + (screen_row * row_height) as u16,
-            table_width,
-            row_height as u16,
-        );
+        let row_area = Rect::new(area.x, area.y + 1 + screen_row as u16, table_width, 1);
         app.mouse.rows.push((row_area, index, issue.key.clone()));
         if issue.pull_request.is_some() {
-            draw_pr_row(frame, row_area, issue, index == app.selected);
+            draw_pr_row(frame, row_area, issue, index == app.selected, pr_columns);
             continue;
         }
         draw_table_row(
@@ -618,20 +624,22 @@ fn draw_table_header(frame: &mut Frame<'_>, area: Rect, columns: Columns) {
             format!("{:<title_width$}", "title"),
             Style::new().fg(theme::muted()),
         ),
-        Span::styled(
-            format!(
-                "{:>width$}",
-                if columns.state <= 2 {
-                    "st"
-                } else {
-                    "state"
-                },
-                width = columns.state
-            ),
-            Style::new().fg(theme::muted()),
-        ),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let state_width = (columns.state as u16).min(area.width);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(area.x, area.y, area.width - state_width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(if columns.state <= 2 {
+            "st"
+        } else {
+            "state"
+        })
+        .style(Style::new().fg(theme::muted()))
+        .alignment(Alignment::Right),
+        Rect::new(area.right() - state_width, area.y, state_width, 1),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -730,22 +738,84 @@ fn draw_table_row(
                 .bg(bg),
         ),
         Span::styled(
-            format!("{:<title_width$}", truncate(&title, title_width)),
+            truncate(&title, title_width),
             Style::new().fg(text_color).bg(bg),
         ),
-        Span::styled(
-            format!(
-                "{:>width$}",
-                truncate(state, columns.state),
-                width = columns.state
-            ),
-            Style::new().fg(state_color).bg(bg),
-        ),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    // Keep state independent of the terminal-cell width of the title.
+    let state_width = (columns.state as u16).min(area.width);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(area.x, area.y, area.width - state_width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(truncate(state, state_width as usize))
+            .style(Style::new().fg(state_color).bg(bg))
+            .alignment(Alignment::Right),
+        Rect::new(area.right() - state_width, area.y, state_width, 1),
+    );
 }
 
-fn draw_pr_row(frame: &mut Frame<'_>, area: Rect, issue: &Issue, selected: bool) {
+fn pr_columns(area: Rect, number_width: u16) -> [Rect; 5] {
+    // Reserve identity, diff, and lifecycle before sharing the rest with title/author.
+    let available = area.width.saturating_sub(6);
+    let number = number_width.min(available);
+    let status = 6.min(available.saturating_sub(number));
+    let diff = 4.min(available.saturating_sub(number + status));
+    let remaining = available.saturating_sub(number + status + diff);
+    let author = (remaining / 3).min(12);
+    let widths = [number, remaining - author, author, diff, status];
+    let mut x = area.x.saturating_add(2).min(area.right());
+    widths.map(|width| {
+        let rect = Rect::new(x, area.y, width.min(area.right() - x), 1);
+        x = rect.right().saturating_add(1).min(area.right());
+        rect
+    })
+}
+
+fn pr_change_indicator(additions: Option<u64>, deletions: Option<u64>) -> Line<'static> {
+    let (Some(additions), Some(deletions)) = (additions, deletions) else {
+        return Line::styled("?□□□", Style::new().fg(theme::muted()));
+    };
+    let total = u128::from(additions) + u128::from(deletions);
+    let filled = match total {
+        0 => 0,
+        1..=10 => 1,
+        11..=100 => 2,
+        101..=1000 => 3,
+        _ => 4,
+    };
+    let mut green = if total == 0 {
+        0
+    } else {
+        (u128::from(additions) * filled + total / 2) / total
+    };
+    if additions > 0 && deletions > 0 && filled >= 2 {
+        green = green.clamp(1, filled - 1);
+    }
+    Line::from(
+        (0..4)
+            .map(|cell| {
+                let (glyph, color) = if cell >= filled {
+                    ("□", theme::muted())
+                } else if cell < green {
+                    ("■", theme::done())
+                } else {
+                    ("■", theme::error())
+                };
+                Span::styled(glyph, Style::new().fg(color))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn draw_pr_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    issue: &Issue,
+    selected: bool,
+    columns: [Rect; 5],
+) {
     let pr = issue.pull_request.as_ref().expect("PR row");
     let bg = if selected {
         theme::element()
@@ -757,36 +827,35 @@ fn draw_pr_row(frame: &mut Frame<'_>, area: Rect, issue: &Issue, selected: bool)
     } else {
         " "
     };
-    let title = format!("{marker} #{} {}", pr.number, issue.title);
-    let additions = pr
-        .additions
-        .map_or_else(|| "?".to_owned(), |n| n.to_string());
-    let deletions = pr
-        .deletions
-        .map_or_else(|| "?".to_owned(), |n| n.to_string());
-    let changes = format!("+{additions} -{deletions}");
-    let state = truncate(&issue.state, 7);
-    let author_width = (area.width as usize).saturating_sub(changes.len() + state.len() + 4);
-    let author = truncate(issue.author.as_deref().unwrap_or("unknown"), author_width);
+    frame.render_widget(Block::new().style(Style::new().bg(bg)), area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                truncate(&title, area.width as usize),
-                Style::new().fg(theme::text()).bold(),
-            ),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {author:<author_width$} "),
-                    Style::new().fg(theme::muted()),
-                ),
-                Span::styled(format!("+{additions}"), Style::new().fg(theme::done())),
-                Span::styled(format!(" -{deletions} "), Style::new().fg(theme::error())),
-                Span::styled(state, Style::new().fg(issue_color(&issue.state))),
-            ]),
-        ])
-        .style(Style::new().bg(bg)),
-        area,
+        Paragraph::new(marker).style(Style::new().fg(theme::primary())),
+        Rect::new(area.x, area.y, area.width.min(2), 1),
     );
+    let lines = [
+        Line::styled(format!("#{}", pr.number), Style::new().fg(theme::primary())),
+        Line::styled(
+            truncate(&issue.title, columns[1].width as usize),
+            Style::new().fg(theme::text()),
+        ),
+        Line::styled(
+            truncate(
+                issue.author.as_deref().unwrap_or("unknown"),
+                columns[2].width as usize,
+            ),
+            Style::new().fg(theme::muted()),
+        ),
+        pr_change_indicator(pr.additions, pr.deletions),
+        Line::styled(
+            issue.state.as_str(),
+            Style::new().fg(issue_color(&issue.state)),
+        )
+        .alignment(Alignment::Right),
+    ];
+    for (mut column, line) in columns.into_iter().zip(lines) {
+        column.y = area.y;
+        frame.render_widget(Paragraph::new(line).style(Style::new().bg(bg)), column);
+    }
 }
 
 fn draw_empty_state(
@@ -1647,8 +1716,10 @@ fn render_scrollbar(
         .track_style(Style::new().bg(theme::element()))
         .thumb_symbol(" ")
         .thumb_style(Style::new().bg(theme::border()));
-    let mut state = ScrollbarState::new(total)
-        .position(scroll)
+    // Ratatui expects the number of scroll positions, not the number of rows.
+    let max_scroll = total.saturating_sub(visible);
+    let mut state = ScrollbarState::new(max_scroll + 1)
+        .position(scroll.min(max_scroll))
         .viewport_content_length(visible);
     frame.render_stateful_widget(
         scrollbar,
@@ -1947,16 +2018,11 @@ mod tests {
                     }
                     let rows = app.mouse.rows.clone();
                     let list = app.mouse.list;
+                    assert_eq!(app.visible_rows, list.height as usize);
+                    assert_eq!(rows.len(), app.visible_rows.min(40 - app.scroll));
                     for (screen_row, (rect, index, key)) in rows.iter().enumerate() {
-                        assert_eq!(*index, scroll + screen_row);
-                        assert_eq!(
-                            rect.height,
-                            if tab == InboxTab::Issues {
-                                1
-                            } else {
-                                2
-                            }
-                        );
+                        assert_eq!(*index, app.scroll + screen_row);
+                        assert_eq!(rect.height, 1);
                         assert_eq!(rect.y, list.y + screen_row as u16 * rect.height);
                         let text: String = (rect.x..rect.right())
                             .map(|x| buffer[(x, rect.y)].symbol())
@@ -2228,10 +2294,15 @@ mod tests {
                 };
                 let text = render(width, height, &snapshot, &mut app);
                 assert!(text.contains(" Issues    PRs "), "{text}");
-                assert!(text.contains("#42 Improve review flow"), "{text}");
-                assert!(text.contains("octocat"), "{text}");
-                assert!(text.contains("+128 -?"), "{text}");
-                assert!(text.contains(state), "{text}");
+                assert!(text.contains("#42"), "{text}");
+                if width >= 80 {
+                    assert!(text.contains("Improve review flow"), "{text}");
+                    assert!(text.contains("octocat"), "{text}");
+                }
+                let row = text.lines().find(|line| line.contains("#42")).unwrap();
+                assert!(row.contains("?□□□"), "{text}");
+                assert!(row.contains(state), "{text}");
+                assert!(!text.contains("+128 -?"), "{text}");
                 assert!(!text.contains("Repair runtime dispatch"));
                 if height == 48 {
                     assert!(text.contains("agent activity"));
@@ -2246,8 +2317,222 @@ mod tests {
             tab: InboxTab::PullRequests,
             ..AppState::default()
         });
-        assert!(text.contains("+? -0"));
+        assert!(text.contains("?□□□"));
         assert!(text.contains("unknown"));
+    }
+
+    #[test]
+    fn pr_indicator_thresholds_ratios_and_extreme_counts() {
+        for (additions, deletions, colors) in [
+            (0, 0, "...."),
+            (1, 0, "g..."),
+            (0, 1, "r..."),
+            (10, 0, "g..."),
+            (11, 0, "gg.."),
+            (100, 0, "gg.."),
+            (101, 0, "ggg."),
+            (1000, 0, "ggg."),
+            (1001, 0, "gggg"),
+            (0, 1001, "rrrr"),
+            (5, 5, "g..."),
+            (1, 9, "r..."),
+            (1, 10, "gr.."),
+            (99, 1, "gr.."),
+            (50, 51, "grr."),
+            (51, 50, "ggr."),
+            (750, 251, "gggr"),
+            (251, 750, "grrr"),
+            (u64::MAX, 0, "gggg"),
+            (0, u64::MAX, "rrrr"),
+            (u64::MAX, 1, "gggr"),
+            (1, u64::MAX, "grrr"),
+            (u64::MAX, u64::MAX, "ggrr"),
+        ] {
+            let line = pr_change_indicator(Some(additions), Some(deletions));
+            assert_eq!(line.width(), 4);
+            for (span, color) in line.spans.iter().zip(colors.chars()) {
+                assert_eq!(
+                    span.content,
+                    if color == '.' {
+                        "□"
+                    } else {
+                        "■"
+                    }
+                );
+                assert_eq!(
+                    span.style.fg,
+                    Some(match color {
+                        'g' => theme::done(),
+                        'r' => theme::error(),
+                        _ => theme::muted(),
+                    }),
+                    "+{additions} -{deletions}: {colors}"
+                );
+            }
+        }
+        for counts in [
+            (None, None),
+            (Some(0), None),
+            (None, Some(0)),
+            (Some(u64::MAX), None),
+        ] {
+            let line = pr_change_indicator(counts.0, counts.1);
+            assert_eq!(line.to_string(), "?□□□");
+            assert_eq!(line.width(), 4);
+            assert_eq!(line.style.fg, Some(theme::muted()));
+        }
+    }
+
+    #[test]
+    fn pr_columns_align_headers_and_preserve_context_at_narrow_widths() {
+        let mut snapshot = pr_snapshot();
+        snapshot.issues[1].title = "界 long title ".repeat(20);
+        snapshot.issues[1].author = Some("界very-long-author-name".repeat(10));
+        let pr = snapshot.issues[1].pull_request.as_mut().unwrap();
+        pr.additions = Some(100);
+        pr.deletions = Some(1);
+        for width in [36, 46, 80, 112] {
+            let mut app = AppState {
+                tab: InboxTab::PullRequests,
+                ..Default::default()
+            };
+            let buffer = render_buffer(width, 24, &snapshot, &mut app);
+            let row = app.mouse.rows[0].0;
+            let columns = pr_columns(row, 3);
+            for (column, label) in columns.iter().zip(["P", "t", "a", "d"]) {
+                assert_eq!(buffer[(column.x, row.y - 1)].symbol(), label);
+            }
+            assert_eq!(buffer[(row.right() - 1, row.y - 1)].symbol(), "s");
+            assert_eq!(columns[3].width, 4);
+            assert_eq!(columns[4].width, 6);
+            assert!(columns[2].width <= 12);
+            assert_eq!(buffer[(columns[0].x, row.y)].symbol(), "#");
+            assert_eq!(buffer[(columns[3].x, row.y)].fg, theme::done());
+            assert_eq!(buffer[(columns[3].x + 2, row.y)].fg, theme::error());
+            assert_eq!(buffer[(columns[3].x + 3, row.y)].symbol(), "□");
+            assert_eq!(buffer[(columns[4].right() - 4, row.y)].symbol(), "o");
+            assert_eq!(buffer[(row.right() - 1, row.y)].symbol(), "n");
+            for x in row.x..row.right() {
+                // Ratatui resets the continuation cell of a wide glyph.
+                if x > row.x && Line::raw(buffer[(x - 1, row.y)].symbol()).width() > 1 {
+                    continue;
+                }
+                assert_eq!(
+                    buffer[(x, row.y)].bg,
+                    theme::element(),
+                    "width {width}, x {x}"
+                );
+            }
+        }
+        for width in 0..36 {
+            let area = Rect::new(3, 2, width, 1);
+            for column in pr_columns(area, 21) {
+                assert!(column.right() <= area.right());
+            }
+        }
+    }
+
+    #[test]
+    fn inbox_states_stay_right_aligned_with_unicode_titles_and_run_states() {
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut snapshot = pr_snapshot();
+            let template = snapshot.issues[usize::from(tab == InboxTab::PullRequests)].clone();
+            snapshot.issues = [
+                "Short",
+                "Ellipsis… and café",
+                "Mixed 界 title 界",
+                "Combining e\u{301} title",
+                "界…e\u{301} long title ",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, title)| Issue {
+                key: IssueKey {
+                    native_id: index.to_string(),
+                    ..template.key.clone()
+                },
+                title: if index == 4 {
+                    title.repeat(30)
+                } else {
+                    title.into()
+                },
+                author: Some(title.repeat(index + 1)),
+                ..template.clone()
+            })
+            .collect();
+            for run_state in [
+                None,
+                Some(RunState::Running),
+                Some(RunState::NeedsInput),
+                Some(RunState::Disconnected),
+            ] {
+                snapshot.runs = run_state.map_or_else(Vec::new, |state| {
+                    snapshot
+                        .issues
+                        .iter()
+                        .map(|issue| RunSummary {
+                            id: issue.key.native_id.clone(),
+                            issue_key: issue.key.canonical(),
+                            workspace: None,
+                            agent: "opencode".into(),
+                            state,
+                            message: None,
+                            session_id: None,
+                            started_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        })
+                        .collect()
+                });
+                for width in [36, 46, 54, 72, 80, 112] {
+                    let mut app = AppState {
+                        tab,
+                        ..Default::default()
+                    };
+                    let buffer = render_buffer(width, 24, &snapshot, &mut app);
+                    assert_eq!(app.mouse.rows.len(), snapshot.issues.len());
+                    let right = app.mouse.rows[0].0.right();
+                    for (row, ..) in &app.mouse.rows {
+                        assert_eq!(row.right(), right);
+                        let columns = Columns::for_width(row.width);
+                        let expected = if tab == InboxTab::PullRequests {
+                            "open".to_owned()
+                        } else if columns.state <= 2 {
+                            run_state
+                                .map_or_else(
+                                    || issue_icon("open"),
+                                    |state| {
+                                        if state.needs_attention() {
+                                            "!"
+                                        } else {
+                                            "●"
+                                        }
+                                    },
+                                )
+                                .to_owned()
+                        } else {
+                            truncate(run_state.map_or("open", run_label), columns.state)
+                        };
+                        let start = right - Line::raw(expected.as_str()).width() as u16;
+                        let actual: String = (start..right)
+                            .map(|x| buffer[(x, row.y)].symbol())
+                            .collect();
+                        assert_eq!(actual, expected, "{tab:?}, width {width}, {run_state:?}");
+                    }
+                    let header_y = app.mouse.rows[0].0.y - 1;
+                    let label = if tab == InboxTab::PullRequests {
+                        "status"
+                    } else if Columns::for_width(app.mouse.rows[0].0.width).state <= 2 {
+                        "st"
+                    } else {
+                        "state"
+                    };
+                    let actual: String = (right - label.len() as u16..right)
+                        .map(|x| buffer[(x, header_y)].symbol())
+                        .collect();
+                    assert_eq!(actual, label);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2375,6 +2660,49 @@ mod tests {
         );
         assert!(text.contains("● ready"));
         assert!(!text.contains("1 working"));
+    }
+
+    #[test]
+    fn scrollbar_thumb_reaches_both_ends_of_the_list() {
+        let mut terminal = Terminal::new(TestBackend::new(8, 12)).unwrap();
+        for scroll in [0, 6, 13] {
+            terminal
+                .draw(|frame| render_scrollbar(frame, frame.area(), 24, 11, scroll))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let thumb: Vec<_> = (1..12)
+                .filter(|&y| buffer[(7, y)].bg == theme::border())
+                .collect();
+            assert!(!thumb.is_empty());
+            match scroll {
+                0 => assert_eq!(thumb.first(), Some(&1)),
+                13 => assert_eq!(thumb.last(), Some(&11)),
+                _ => {
+                    assert!(thumb[0] > 1);
+                    assert!(*thumb.last().unwrap() < 11);
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn both_inbox_tabs_scroll_the_thumb_to_the_last_visible_row() {
+        let snapshot = mouse_snapshot();
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut app = AppState {
+                tab,
+                selected: 39,
+                ..Default::default()
+            };
+            let buffer = render_buffer(80, 24, &snapshot, &mut app);
+            let list = app.mouse.list;
+            assert_eq!(app.scroll + app.visible_rows, app.rows(&snapshot).len());
+            assert_eq!(
+                buffer[(list.right() - 1, list.bottom() - 1)].bg,
+                theme::border()
+            );
+            assert_eq!(buffer[(list.right() - 1, list.y)].bg, theme::element());
+        }
     }
 
     #[test]

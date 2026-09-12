@@ -12,7 +12,10 @@ use crossterm::{
         KeyEventKind, KeyModifiers,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    style::Print,
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -28,6 +31,10 @@ use crate::{
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 const METRICS_INTERVAL: Duration = Duration::from_secs(5);
 const AGENT_ACTIVITY_INTERVAL: Duration = Duration::from_secs(1);
+// Xterm title-stack operations; ignored by terminals without title-stack support.
+const PUSH_TITLE: Print<&str> = Print("\x1b[22;0t");
+const POP_TITLE: Print<&str> = Print("\x1b[23;0t");
+const LAUNCHER_TITLE: SetTitle<&str> = SetTitle("launcher");
 
 enum UiActionResult {
     Runtime {
@@ -45,14 +52,24 @@ type UiActionSender = tokio::sync::mpsc::UnboundedSender<UiActionResult>;
 
 /// Runs the interactive terminal UI against a live runtime handle.
 pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
-    let _cleanup = TerminalCleanup;
+    let mut cleanup = TerminalCleanup { title_saved: false };
     enable_raw_mode()?;
 
     let mut output = io::stdout();
     execute!(output, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(output, PUSH_TITLE)?;
+    cleanup.title_saved = true;
+    execute!(output, LAUNCHER_TITLE)?;
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
+    if let Some(mut command) = herdr_tab_title_command(
+        std::env::var("HERDR_ENV").ok().as_deref(),
+        std::env::var("HERDR_TAB_ID").ok().as_deref(),
+    ) {
+        // Cosmetic only: an unavailable host must not prevent the launcher from starting.
+        let _ = tokio::time::timeout(Duration::from_secs(1), command.status()).await;
+    }
 
     let mut events = EventStream::new();
     let mut snapshots = runtime.subscribe();
@@ -167,6 +184,25 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
 
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn herdr_tab_title_command(
+    env: Option<&str>,
+    tab_id: Option<&str>,
+) -> Option<tokio::process::Command> {
+    let tab_id = tab_id.filter(|id| !id.trim().is_empty())?;
+    if env != Some("1") {
+        return None;
+    }
+    // Never use UI focus or enumerate sibling tabs. Herdr injects this caller-scoped ID.
+    let mut command = tokio::process::Command::new("herdr");
+    command
+        .args(["tab", "rename", "--", tab_id, "launcher"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    Some(command)
 }
 
 fn animation_active(snapshot: &RuntimeSnapshot, app: &AppState) -> bool {
@@ -1016,7 +1052,9 @@ async fn termination_signal() -> io::Result<()> {
     std::future::pending().await
 }
 
-struct TerminalCleanup;
+struct TerminalCleanup {
+    title_saved: bool,
+}
 
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
@@ -1026,6 +1064,9 @@ impl Drop for TerminalCleanup {
         let _ = execute!(output, DisableMouseCapture);
         let _ = execute!(output, LeaveAlternateScreen);
         let _ = execute!(output, Show);
+        if self.title_saved {
+            let _ = execute!(output, POP_TITLE);
+        }
     }
 }
 
@@ -1039,6 +1080,30 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
+
+    #[test]
+    fn terminal_title_commands_save_set_and_restore_only_the_local_title() {
+        let mut output = Vec::new();
+        execute!(output, PUSH_TITLE, LAUNCHER_TITLE, POP_TITLE).unwrap();
+        assert_eq!(output, b"\x1b[22;0t\x1b]0;launcher\x07\x1b[23;0t");
+    }
+
+    #[test]
+    fn herdr_title_command_requires_explicit_caller_context() {
+        for (env, id) in [
+            (None, Some("w1:t2")),
+            (Some("0"), Some("w1:t2")),
+            (Some("1"), None),
+            (Some("1"), Some(" ")),
+        ] {
+            assert!(herdr_tab_title_command(env, id).is_none());
+        }
+        let command = herdr_tab_title_command(Some("1"), Some("w7:t9")).unwrap();
+        assert_eq!(command.as_std().get_program(), "herdr");
+        assert_eq!(command.as_std().get_args().collect::<Vec<_>>(), [
+            "tab", "rename", "--", "w7:t9", "launcher"
+        ]);
+    }
 
     fn issue(id: &str, age: Duration) -> Issue {
         Issue {

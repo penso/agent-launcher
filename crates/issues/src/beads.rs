@@ -81,6 +81,7 @@ impl IssueSource for BeadsSource {
                 updated_at,
                 etag: None,
                 last_full_at: Some(Utc::now()),
+                ..SyncCheckpoint::default()
             },
             mode: SyncMode::Full,
         })

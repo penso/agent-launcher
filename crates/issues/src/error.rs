@@ -5,6 +5,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("GitHub throttled; retry after {retry_at}")]
+    Throttled {
+        retry_at: chrono::DateTime<chrono::Utc>,
+    },
     #[error("failed to run {program}: {source}")]
     CommandIo {
         program: &'static str,

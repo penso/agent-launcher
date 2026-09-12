@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env,
     process::{Command, Output, Stdio},
+    sync::Mutex,
 };
 
 use agent_launcher_core::{Issue, IssueKey, IssueProvider, PullRequestMetadata, RepositoryRemote};
@@ -27,9 +28,44 @@ pub struct GitHubSource {
     key: SourceKey,
     client: Client,
     endpoint: Url,
+    backoff: Mutex<Backoff>,
+}
+
+#[derive(Default)]
+struct Backoff {
+    retry_at: Option<DateTime<Utc>>,
+    failures: u32,
+}
+
+impl Backoff {
+    fn throttle(&mut self, deadline: Option<DateTime<Utc>>, now: DateTime<Utc>) {
+        let seconds = 60 * 2_i64.pow(self.failures.min(6));
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(
+            deadline
+                .filter(|at| *at > now)
+                .unwrap_or(now + Duration::seconds(seconds.min(3600))),
+        );
+    }
 }
 
 impl GitHubSource {
+    async fn get(&self, url: Url) -> Result<reqwest::Response, Error> {
+        if let Some(retry_at) = self.retry_at() {
+            return Err(Error::Throttled { retry_at });
+        }
+        let response = self.client.get(url).send().await?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let deadline = retry_deadline(response.headers(), Utc::now());
+        let error = http_status_error(response).await;
+        if matches!(error, Error::GitHubRateLimit { .. }) {
+            self.backoff.lock().unwrap().throttle(deadline, Utc::now());
+        }
+        Err(error)
+    }
+
     fn pulls_endpoint(&self) -> Url {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
@@ -45,10 +81,7 @@ impl GitHubSource {
         url.path_segments_mut()
             .expect("GitHub API base URL")
             .push(&number.to_string());
-        let response = self.client.get(url).send().await?;
-        if !response.status().is_success() {
-            return Err(http_status_error(response).await);
-        }
+        let response = self.get(url).await?;
         let record: GitHubPullRequest =
             serde_json::from_slice(&response.bytes().await?).map_err(|error| Error::Json {
                 source: "GitHub",
@@ -92,6 +125,7 @@ impl GitHubSource {
             },
             client,
             endpoint,
+            backoff: Mutex::new(Backoff::default()),
         })
     }
 }
@@ -103,6 +137,25 @@ impl IssueSource for GitHubSource {
     }
 
     async fn sync(&self, checkpoint: Option<&SyncCheckpoint>) -> Result<SyncResult, Error> {
+        self.sync_with_cache(checkpoint, &[]).await
+    }
+
+    fn retry_at(&self) -> Option<DateTime<Utc>> {
+        self.backoff
+            .lock()
+            .unwrap()
+            .retry_at
+            .filter(|at| *at > Utc::now())
+    }
+
+    async fn sync_with_cache(
+        &self,
+        checkpoint: Option<&SyncCheckpoint>,
+        cached: &[Issue],
+    ) -> Result<SyncResult, Error> {
+        if let Some(retry_at) = self.retry_at() {
+            return Err(Error::Throttled { retry_at });
+        }
         let now = Utc::now();
         let full = checkpoint.and_then(|value| value.updated_at).is_none()
             || checkpoint
@@ -133,10 +186,7 @@ impl IssueSource for GitHubSource {
                 }
             }
 
-            let response = self.client.get(url.clone()).send().await?;
-            if !response.status().is_success() {
-                return Err(http_status_error(response).await);
-            }
+            let response = self.get(url).await?;
 
             let has_next = github_has_next(response.headers());
             let body = response.bytes().await?;
@@ -172,10 +222,7 @@ impl IssueSource for GitHubSource {
                     .append_pair("state", "open")
                     .append_pair("per_page", "100")
                     .append_pair("page", &page.to_string());
-                let response = self.client.get(url).send().await?;
-                if !response.status().is_success() {
-                    return Err(http_status_error(response).await);
-                }
+                let response = self.get(url).await?;
                 let has_next = github_has_next(response.headers());
                 let records: Vec<GitHubPullRequest> =
                     serde_json::from_slice(&response.bytes().await?).map_err(|error| {
@@ -201,20 +248,85 @@ impl IssueSource for GitHubSource {
             }
         }
 
-        // Finish mandatory pagination first and bound optional quota use even
-        // when GitHub has not yet returned a rate-limit error.
-        for issue in issues
-            .iter_mut()
-            .filter(|issue| issue.pull_request.is_some())
-            .take(MAX_PR_DETAILS_PER_SYNC)
-        {
-            if let Some(metadata) = &issue.pull_request {
-                match self.pull_request(metadata.number).await {
-                    Ok(detail) => *issue = detail,
-                    Err(Error::GitHubRateLimit { .. }) => break,
-                    Err(error) => return Err(error),
+        // Closed transitions can leave the delta window before their detail turn.
+        // Keep them eligible until the next open-only full reconciliation.
+        if !full {
+            for issue in cached {
+                if let Some(metadata) = &issue.pull_request
+                    && issue.key.provider == self.key.provider
+                    && issue.key.host == self.key.host
+                    && issue.key.repository == self.key.repository
+                    && matches!(issue.state.as_str(), "closed" | "merged")
+                    && !pr_indices.contains_key(&metadata.number)
+                {
+                    pr_indices.insert(metadata.number, issues.len());
+                    issues.push(issue.clone());
                 }
             }
+        }
+        let cached: HashMap<_, _> = cached.iter().map(|issue| (&issue.key, issue)).collect();
+        let mut details = checkpoint.map(|c| c.pr_details.clone()).unwrap_or_default();
+        let mut cursor = checkpoint.and_then(|c| c.pr_cursor);
+        let mut pending = Vec::new();
+        for (index, issue) in issues.iter_mut().enumerate() {
+            let Some(metadata) = issue.pull_request.as_mut() else {
+                continue;
+            };
+            let previous = cached
+                .get(&issue.key)
+                .and_then(|old| old.pull_request.as_ref());
+            if let Some(old) = previous {
+                metadata.additions = metadata.additions.or(old.additions);
+                metadata.deletions = metadata.deletions.or(old.deletions);
+                if metadata.head_sha.is_empty() {
+                    metadata.head_sha.clone_from(&old.head_sha);
+                    metadata.base_sha.clone_from(&old.base_sha);
+                    metadata.head_ref.clone_from(&old.head_ref);
+                    metadata.base_ref.clone_from(&old.base_ref);
+                    metadata.head_repository.clone_from(&old.head_repository);
+                }
+            }
+            let number = metadata.number;
+            if previous.is_none_or(|old| old.additions.is_none() || old.deletions.is_none())
+                || details.get(&issue.key.native_id) != Some(&pr_revision(issue))
+            {
+                pending.push((index, number));
+            }
+        }
+        // Rotate attempts, including failures, so a permanently failing PR cannot
+        // starve later entries. Only validity markers, not records, live here.
+        if let Some(cursor) = cursor {
+            pending.sort_by_key(|(_, number)| (*number <= cursor, *number));
+        }
+        let mut successful = true;
+        for (index, number) in pending.into_iter().take(MAX_PR_DETAILS_PER_SYNC) {
+            cursor = Some(number);
+            match self.pull_request(number).await {
+                Ok(mut detail) => {
+                    let revision = pr_revision(&detail);
+                    let metadata = detail.pull_request.as_mut().expect("PR detail metadata");
+                    if metadata.additions.is_some() && metadata.deletions.is_some() {
+                        details.insert(issues[index].key.native_id.clone(), revision);
+                    } else {
+                        details.remove(&issues[index].key.native_id);
+                        let old = issues[index].pull_request.as_ref().unwrap();
+                        metadata.additions = metadata.additions.or(old.additions);
+                        metadata.deletions = metadata.deletions.or(old.deletions);
+                    }
+                    issues[index] = detail;
+                },
+                Err(Error::GitHubRateLimit { .. } | Error::Throttled { .. }) => {
+                    successful = false;
+                    break;
+                },
+                Err(_) => successful = false,
+            }
+        }
+        if full {
+            details.retain(|key, _| issues.iter().any(|issue| &issue.key.native_id == key));
+        }
+        if successful {
+            *self.backoff.lock().unwrap() = Backoff::default();
         }
 
         Ok(SyncResult {
@@ -222,6 +334,8 @@ impl IssueSource for GitHubSource {
             checkpoint: SyncCheckpoint {
                 updated_at,
                 etag: None,
+                pr_details: details,
+                pr_cursor: cursor,
                 last_full_at: if full {
                     Some(now)
                 } else {
@@ -235,6 +349,14 @@ impl IssueSource for GitHubSource {
             },
         })
     }
+}
+
+fn pr_revision(issue: &Issue) -> String {
+    let metadata = issue.pull_request.as_ref().expect("PR revision metadata");
+    format!(
+        "{:?}:{}:{}:{}",
+        issue.updated_at, metadata.head_sha, metadata.base_sha, issue.state
+    )
 }
 
 fn is_public_github_host(host: &str) -> bool {
@@ -320,6 +442,29 @@ fn github_has_next(headers: &HeaderMap) -> bool {
                 .split(',')
                 .any(|link| link.split(';').any(|part| part.trim() == "rel=\"next\""))
         })
+}
+
+fn retry_deadline(headers: &HeaderMap, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let retry = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.parse::<i64>()
+                .ok()
+                .filter(|seconds| *seconds >= 0)
+                .and_then(|seconds| now.checked_add_signed(Duration::try_seconds(seconds)?))
+                .or_else(|| {
+                    DateTime::parse_from_rfc2822(v)
+                        .ok()
+                        .map(|at| at.with_timezone(&Utc))
+                })
+        });
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+    retry.into_iter().chain(reset).filter(|at| *at > now).max()
 }
 
 async fn http_status_error(response: reqwest::Response) -> Error {
@@ -518,8 +663,325 @@ mod tests {
         })
     }
 
+    fn pr_list(number: u64) -> Value {
+        let mut value = pr_payload(number);
+        value.as_object_mut().unwrap().remove("additions");
+        value.as_object_mut().unwrap().remove("deletions");
+        value
+    }
+
+    #[tokio::test]
+    async fn progressively_enriches_all_prs_and_reuses_persisted_cache_after_restart() {
+        let mut cached = Vec::new();
+        let mut checkpoint = SyncCheckpoint::default();
+        for (round, numbers) in [(0, 1..11), (1, 11..21), (2, 21..26), (3, 0..0)] {
+            let mut responses = vec![
+                ("/repos/acme/app/issues?", 200, false, json!([])),
+                (
+                    "/repos/acme/app/pulls?",
+                    200,
+                    false,
+                    json!((1..=25).map(pr_list).collect::<Vec<_>>()),
+                ),
+            ];
+            for number in numbers {
+                responses.push(("/repos/acme/app/pulls/", 200, false, pr_payload(number)));
+            }
+            // New source on each pass: no in-memory record cache may be required.
+            let (source, server) = mock_source(responses).await;
+            let result = source
+                .sync_with_cache(Some(&checkpoint), &cached)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(result.issues.len(), 25);
+            assert_eq!(
+                result
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.pull_request.as_ref().unwrap().additions.is_some())
+                    .count(),
+                ((round + 1) * 10).min(25)
+            );
+            checkpoint =
+                serde_json::from_value(serde_json::to_value(result.checkpoint).unwrap()).unwrap();
+            cached = serde_json::from_value(serde_json::to_value(result.issues).unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidates_changed_metadata_and_preserves_counts_on_optional_failure() {
+        let mut cached = Vec::new();
+        let mut checkpoint = SyncCheckpoint::default();
+        for round in 0..5 {
+            let mut list = pr_list(7);
+            let mut detail = pr_payload(7);
+            if round >= 1 {
+                list["head"]["sha"] = json!("new-head");
+                detail["head"]["sha"] = json!("new-head");
+            }
+            if round >= 3 {
+                list["updated_at"] = json!("2026-01-04T00:00:00Z");
+                detail["updated_at"] = list["updated_at"].clone();
+            }
+            let status = if round == 3 {
+                429
+            } else if round == 1 {
+                500
+            } else {
+                200
+            };
+            let (source, server) = mock_source(vec![
+                ("/repos/acme/app/issues?", 200, false, json!([])),
+                ("/repos/acme/app/pulls?", 200, false, json!([list])),
+                ("/repos/acme/app/pulls/7 ", status, false, detail),
+            ])
+            .await;
+            let result = source
+                .sync_with_cache(Some(&checkpoint), &cached)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            let pr = result.issues[0].pull_request.as_ref().unwrap();
+            assert_eq!(pr.additions, Some(12));
+            assert_eq!(pr.deletions, Some(0));
+            if round >= 1 {
+                assert_eq!(pr.head_sha, "new-head");
+            }
+            cached = result.issues;
+            checkpoint = result.checkpoint;
+        }
+    }
+
+    #[test]
+    fn honors_retry_headers_and_bounds_exponential_fallback() {
+        use chrono::{Duration, Utc};
+        use reqwest::header::HeaderMap;
+        let now = Utc::now();
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "120".parse().unwrap());
+        assert_eq!(
+            super::retry_deadline(&headers, now),
+            Some(now + Duration::seconds(120))
+        );
+        let reset = now + Duration::seconds(300);
+        headers.insert(
+            "x-ratelimit-reset",
+            reset.timestamp().to_string().parse().unwrap(),
+        );
+        assert_eq!(
+            super::retry_deadline(&headers, now).unwrap().timestamp(),
+            reset.timestamp()
+        );
+        headers.remove("x-ratelimit-reset");
+        headers.insert("retry-after", reset.to_rfc2822().parse().unwrap());
+        assert_eq!(
+            super::retry_deadline(&headers, now).unwrap().timestamp(),
+            reset.timestamp()
+        );
+        headers.insert("retry-after", "invalid".parse().unwrap());
+        assert_eq!(super::retry_deadline(&headers, now), None);
+        let mut backoff = super::Backoff::default();
+        for expected in [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600] {
+            backoff.throttle(None, now);
+            assert_eq!(backoff.retry_at, Some(now + Duration::seconds(expected)));
+        }
+        backoff.throttle(Some(reset), now);
+        assert_eq!(backoff.retry_at, Some(reset));
+    }
+
+    #[tokio::test]
+    async fn closed_prs_finish_enrichment_outside_delta_window_until_full_reconciliation() {
+        let mut checkpoint = SyncCheckpoint {
+            updated_at: Some(chrono::Utc::now()),
+            last_full_at: Some(chrono::Utc::now()),
+            ..SyncCheckpoint::default()
+        };
+        let mut cached = Vec::new();
+        for (round, numbers) in [(0, 1..11), (1, 11..13), (2, 0..0), (3, 0..0)] {
+            let stubs = if round == 0 {
+                (1..=12)
+                    .map(|number| {
+                        let mut stub = pr_list(number);
+                        stub["state"] = json!("closed");
+                        stub["pull_request"] = json!({});
+                        stub
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if round == 3 {
+                checkpoint.last_full_at = None;
+            }
+            let mut responses = vec![
+                ("/repos/acme/app/issues?", 200, false, json!(stubs)),
+                ("/repos/acme/app/pulls?", 200, false, json!([])),
+            ];
+            for number in numbers {
+                let mut detail = pr_payload(number);
+                detail["state"] = json!("closed");
+                responses.push(("/repos/acme/app/pulls/", 200, false, detail));
+            }
+            let (source, server) = mock_source(responses).await;
+            let result = source
+                .sync_with_cache(Some(&checkpoint), &cached)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(
+                result.issues.len(),
+                if round == 3 {
+                    0
+                } else {
+                    12
+                }
+            );
+            assert_eq!(
+                result.checkpoint.pr_details.len(),
+                if round == 3 {
+                    0
+                } else {
+                    ((round + 1) * 10).min(12)
+                }
+            );
+            checkpoint = result.checkpoint;
+            cached = result.issues;
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_early_details_do_not_starve_later_prs() {
+        let mut cached = Vec::new();
+        let mut checkpoint = SyncCheckpoint::default();
+        for numbers in [(1..=10).collect::<Vec<_>>(), vec![
+            11, 12, 1, 2, 3, 4, 5, 6, 7, 8,
+        ]] {
+            let mut responses = vec![
+                ("/repos/acme/app/issues?", 200, false, json!([])),
+                (
+                    "/repos/acme/app/pulls?",
+                    200,
+                    false,
+                    json!((1..=12).map(pr_list).collect::<Vec<_>>()),
+                ),
+            ];
+            for number in numbers {
+                responses.push((
+                    "/repos/acme/app/pulls/",
+                    if number <= 10 {
+                        500
+                    } else {
+                        200
+                    },
+                    false,
+                    pr_payload(number),
+                ));
+            }
+            let (source, server) = mock_source(responses).await;
+            let result = source
+                .sync_with_cache(Some(&checkpoint), &cached)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            cached = result.issues;
+            checkpoint = result.checkpoint;
+        }
+        assert_eq!(
+            cached
+                .iter()
+                .filter(|issue| issue.pull_request.as_ref().unwrap().additions.is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn response_headers_set_the_source_deadline() {
+        let deadline = chrono::Utc::now() + chrono::Duration::minutes(10);
+        for headers in [
+            "Retry-After: 600\r\n".to_owned(),
+            format!("Retry-After: {}\r\n", deadline.to_rfc2822()),
+            format!(
+                "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {}\r\n",
+                deadline.timestamp()
+            ),
+        ] {
+            let (source, server) = mock_source_with_headers(
+                vec![("/repos/acme/app/issues?", 403, false, json!({}))],
+                headers,
+            )
+            .await;
+            assert!(matches!(
+                source.sync(None).await,
+                Err(crate::Error::GitHubRateLimit { .. })
+            ));
+            server.await.unwrap();
+            assert!((source.retry_at().unwrap().timestamp() - deadline.timestamp()).abs() <= 1);
+            assert!(matches!(
+                source.sync(None).await,
+                Err(crate::Error::Throttled { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn throttling_suppresses_every_request_until_expiry_and_resets_after_success() {
+        for optional in [false, true] {
+            let mut responses = Vec::new();
+            if optional {
+                responses.extend([
+                    ("/repos/acme/app/issues?", 200, false, json!([])),
+                    ("/repos/acme/app/pulls?", 200, false, json!([pr_list(7)])),
+                ]);
+            }
+            responses.push((
+                if optional {
+                    "/repos/acme/app/pulls/7 "
+                } else {
+                    "/repos/acme/app/issues?"
+                },
+                429,
+                false,
+                json!({}),
+            ));
+            let throttled = responses.clone();
+            responses.extend(throttled.clone());
+            responses.extend(throttled);
+            responses.extend([
+                ("/repos/acme/app/issues?", 200, false, json!([])),
+                ("/repos/acme/app/pulls?", 200, false, json!([])),
+            ]);
+            let (source, server) = mock_source(responses).await;
+            for seconds in [60, 120, 240] {
+                assert_eq!(source.sync(None).await.is_ok(), optional);
+                let remaining = (source.retry_at().unwrap() - chrono::Utc::now()).num_seconds();
+                assert!((seconds - 1..=seconds).contains(&remaining));
+                for _ in 0..5 {
+                    assert!(matches!(
+                        source.sync(None).await,
+                        Err(crate::Error::Throttled { .. })
+                    ));
+                }
+                source.backoff.lock().unwrap().retry_at =
+                    Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+            }
+            source.sync(None).await.unwrap();
+            server.await.unwrap();
+            assert_eq!(source.retry_at(), None);
+            assert_eq!(source.backoff.lock().unwrap().failures, 0);
+        }
+    }
+
     async fn mock_source(
         responses: Vec<(&'static str, u16, bool, Value)>,
+    ) -> (GitHubSource, tokio::task::JoinHandle<()>) {
+        mock_source_with_headers(responses, String::new()).await
+    }
+
+    async fn mock_source_with_headers(
+        responses: Vec<(&'static str, u16, bool, Value)>,
+        headers: String,
     ) -> (GitHubSource, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -538,6 +1000,12 @@ mod tests {
                 }
                 let request = String::from_utf8(request).unwrap();
                 assert!(request.starts_with(&format!("GET {path}")), "{request}");
+                if path == "/repos/acme/app/pulls/" {
+                    assert!(
+                        request.starts_with(&format!("GET {path}{} ", body["number"])),
+                        "{request}"
+                    );
+                }
                 assert!(
                     request
                         .to_ascii_lowercase()
@@ -551,7 +1019,7 @@ mod tests {
                     ""
                 };
                 socket.write_all(format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{link}Connection: close\r\n\r\n{body}", body.len()
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{link}{headers}Connection: close\r\n\r\n{body}", body.len()
                 ).as_bytes()).await.unwrap();
             }
         });
@@ -690,6 +1158,7 @@ mod tests {
                 updated_at: Some(chrono::Utc::now()),
                 last_full_at: Some(chrono::Utc::now()),
                 etag: None,
+                ..SyncCheckpoint::default()
             }))
             .await
             .unwrap();
@@ -706,6 +1175,7 @@ mod tests {
                 updated_at: Some(chrono::Utc::now()),
                 last_full_at: Some(chrono::Utc::now()),
                 etag: None,
+                ..SyncCheckpoint::default()
             };
             let mut stub = pr_payload(1);
             stub["pull_request"] = json!({});
@@ -767,7 +1237,8 @@ mod tests {
             let result = source.sync(Some(&checkpoint)).await.unwrap();
             server.await.unwrap();
             assert_eq!(result.mode, SyncMode::Delta);
-            assert_eq!(result.checkpoint, checkpoint);
+            assert_eq!(result.checkpoint.updated_at, checkpoint.updated_at);
+            assert_eq!(result.checkpoint.last_full_at, checkpoint.last_full_at);
             assert_eq!(result.issues.len(), 207);
             let keys = result
                 .issues
@@ -821,6 +1292,7 @@ mod tests {
                         },
                 ),
                 etag: None,
+                ..SyncCheckpoint::default()
             };
             let (source, server) = mock_source(vec![
                 (
@@ -873,6 +1345,7 @@ mod tests {
                     updated_at: Some(chrono::Utc::now()),
                     last_full_at: Some(chrono::Utc::now()),
                     etag: None,
+                    ..SyncCheckpoint::default()
                 }))
                 .await
                 .is_err()
@@ -896,7 +1369,7 @@ mod tests {
                 responses.push(("/repos/acme/app/pulls?", status, false, json!({})));
             }
             let (source, server) = mock_source(responses).await;
-            assert!(source.sync(None).await.is_err());
+            assert_eq!(source.sync(None).await.is_err(), !detail_failure);
             server.await.unwrap();
         }
     }
@@ -1132,6 +1605,7 @@ mod tests {
                 updated_at: Some(chrono::Utc::now()),
                 last_full_at: Some(chrono::Utc::now()),
                 etag: None,
+                ..SyncCheckpoint::default()
             }))
             .await
             .unwrap();

@@ -32,6 +32,12 @@ pub struct SyncCheckpoint {
     pub updated_at: Option<DateTime<Utc>>,
     pub etag: Option<String>,
     pub last_full_at: Option<DateTime<Utc>>,
+    /// GitHub detail revision markers; records themselves remain in the issue cache.
+    #[serde(default)]
+    pub pr_details: std::collections::HashMap<String, String>,
+    /// Last attempted PR number, including failed optional requests.
+    #[serde(default)]
+    pub pr_cursor: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -54,6 +60,20 @@ pub trait IssueSource: Send + Sync {
     fn source_key(&self) -> &SourceKey;
 
     async fn sync(&self, checkpoint: Option<&SyncCheckpoint>) -> Result<SyncResult, Error>;
+
+    /// The runtime supplies this source's persisted records, including closed items.
+    async fn sync_with_cache(
+        &self,
+        checkpoint: Option<&SyncCheckpoint>,
+        _cached: &[Issue],
+    ) -> Result<SyncResult, Error> {
+        self.sync(checkpoint).await
+    }
+
+    /// An active source-wide deadline. Manual refreshes must not bypass it.
+    fn retry_at(&self) -> Option<DateTime<Utc>> {
+        None
+    }
 }
 
 #[cfg(test)]

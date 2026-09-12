@@ -708,6 +708,9 @@ impl RuntimeService {
         let mut launched = false;
         for source in &self.sources {
             let source_name = source.source_key().canonical();
+            if source.retry_at().is_some() {
+                continue;
+            }
             if !self.source_in_flight.insert(source_name.clone()) {
                 continue;
             }
@@ -793,6 +796,11 @@ impl RuntimeService {
                 result,
             } => {
                 self.source_in_flight.remove(&source_name);
+                let retry_at = self
+                    .sources
+                    .iter()
+                    .find(|source| source.source_key().canonical() == source_name)
+                    .and_then(|source| source.retry_at());
                 match result {
                     Ok(()) => {
                         self.set_source_status(&source_name, true, None);
@@ -812,6 +820,11 @@ impl RuntimeService {
                         self.set_source_status(&source_name, false, Some(message.clone()));
                         self.set_error_without_publish(format!("source:{source_name}"), message);
                     },
+                }
+                if let Some(retry_at) = retry_at {
+                    let message = format!("GitHub throttled; retry after {retry_at}");
+                    self.set_source_status(&source_name, true, Some(message.clone()));
+                    self.set_error_without_publish(format!("source:{source_name}"), message);
                 }
                 self.update_refreshing();
                 if self.source_in_flight.is_empty() {
@@ -1346,8 +1359,9 @@ async fn sync_source(
             })
         })
         .transpose()?;
+    let cached = store.load_source_issues(&source_name).await?;
     let result = source
-        .sync(checkpoint.as_ref())
+        .sync_with_cache(checkpoint.as_ref(), &cached)
         .await
         .map_err(|source| Error::IssueSource {
             source_name: source_name.clone(),
@@ -1571,6 +1585,8 @@ mod tests {
     struct MockSourceState {
         results: Mutex<VecDeque<std::result::Result<SyncResult, agent_launcher_issues::Error>>>,
         checkpoints: Mutex<Vec<Option<SyncCheckpoint>>>,
+        caches: Mutex<Vec<Vec<Issue>>>,
+        retry_at: Mutex<Option<chrono::DateTime<Utc>>>,
         calls: AtomicUsize,
     }
 
@@ -1595,6 +1611,8 @@ mod tests {
             let state = Arc::new(MockSourceState {
                 results: Mutex::new(results.into()),
                 checkpoints: Mutex::new(Vec::new()),
+                caches: Mutex::new(Vec::new()),
+                retry_at: Mutex::new(None),
                 calls: AtomicUsize::new(0),
             });
             (
@@ -1613,6 +1631,23 @@ mod tests {
             &self.key
         }
 
+        fn retry_at(&self) -> Option<chrono::DateTime<Utc>> {
+            self.state
+                .retry_at
+                .lock()
+                .unwrap()
+                .filter(|at| *at > Utc::now())
+        }
+
+        async fn sync_with_cache(
+            &self,
+            checkpoint: Option<&SyncCheckpoint>,
+            cached: &[Issue],
+        ) -> std::result::Result<SyncResult, agent_launcher_issues::Error> {
+            self.state.caches.lock().unwrap().push(cached.to_vec());
+            self.sync(checkpoint).await
+        }
+
         async fn sync(
             &self,
             checkpoint: Option<&SyncCheckpoint>,
@@ -1623,7 +1658,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(checkpoint.cloned());
-            self.state
+            let result = self
+                .state
                 .results
                 .lock()
                 .unwrap()
@@ -1634,7 +1670,11 @@ mod tests {
                         checkpoint: checkpoint.cloned().unwrap_or_default(),
                         mode: SyncMode::NotModified,
                     })
-                })
+                });
+            if let Err(agent_launcher_issues::Error::Throttled { retry_at }) = &result {
+                *self.state.retry_at.lock().unwrap() = Some(*retry_at);
+            }
+            result
         }
     }
 
@@ -2372,6 +2412,9 @@ mod tests {
         })
         .await;
         assert_eq!(first.selected_backend, Some(BackendKind::Native));
+        assert_eq!(source_state.caches.lock().unwrap()[0], vec![issue(
+            "cached", "Cached", "open"
+        )]);
         assert_eq!(
             first
                 .issues
@@ -2425,6 +2468,66 @@ mod tests {
                 .contains("temporary failure")
         );
         assert_eq!(store.load_issues().await.unwrap().len(), 4);
+        assert!(
+            source_state
+                .caches
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .all(|issue| issue.key.provider == IssueProvider::Github)
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn throttled_source_stays_connected_and_skips_manual_and_automatic_refreshes() {
+        let store = Store::in_memory().await.unwrap();
+        let cached = issue("7", "Cached", "open");
+        store
+            .replace_issues(
+                "github:example.com:acme/widgets",
+                std::slice::from_ref(&cached),
+            )
+            .await
+            .unwrap();
+        let (source, state) = MockSource::new(vec![Err(agent_launcher_issues::Error::Throttled {
+            retry_at: Utc::now() + chrono::Duration::hours(1),
+        })]);
+        let mut config = config();
+        config.poll_interval_seconds = 1;
+        let handle = RuntimeService::start_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store,
+            runner(&[MockBackend::new(BackendKind::Native, true)]),
+            config,
+            Arc::new(NoopNotifier),
+        );
+        let mut snapshots = handle.subscribe();
+        let snapshot = wait_for(&mut snapshots, |snapshot| {
+            !snapshot.refreshing
+                && snapshot.selected_backend.is_some()
+                && snapshot
+                    .error
+                    .as_deref()
+                    .is_some_and(|text| text.contains("throttled"))
+        })
+        .await;
+        assert!(snapshot.sources[0].connected);
+        assert_eq!(snapshot.issues, vec![cached.clone()]);
+        tokio::time::timeout(Duration::from_secs(1), handle.dispatch(cached.key, None))
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            let _ = handle.refresh().await;
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        *state.retry_at.lock().unwrap() = None;
+        handle.refresh().await.unwrap();
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
         handle.shutdown().await.unwrap();
     }
 
