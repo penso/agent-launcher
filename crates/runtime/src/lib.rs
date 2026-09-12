@@ -1,5 +1,6 @@
 //! Single-owner runtime state and command loop.
 
+mod activity;
 mod diagnostics;
 mod error;
 mod notification;

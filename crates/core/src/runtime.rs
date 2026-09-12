@@ -10,6 +10,8 @@ use crate::{
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RuntimeSnapshot {
     #[serde(default)]
+    pub herdr_activity: crate::HerdrActivitySnapshot,
+    #[serde(default)]
     pub initialized: bool,
     pub repository: Option<Repository>,
     pub issues: Vec<Issue>,

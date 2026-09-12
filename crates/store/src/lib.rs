@@ -3,8 +3,10 @@
 use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
 use agent_launcher_core::{
-    EventEnvelope, Issue, IssueKey, IssueProvider, RunEvent, RunSummary, WorkspaceRef,
+    ActivitySample, EventEnvelope, Issue, IssueKey, IssueProvider, RunEvent, RunSummary,
+    WorkspaceRef,
 };
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
@@ -64,7 +66,22 @@ CREATE TABLE IF NOT EXISTS events (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (run_id, sequence)
 );
+
+CREATE TABLE IF NOT EXISTS herdr_activity_samples (
+    sampled_at_unix_ms INTEGER PRIMARY KEY NOT NULL,
+    counts_json TEXT,
+    expected_endpoints INTEGER NOT NULL CHECK (expected_endpoints >= 0),
+    fresh_endpoints INTEGER NOT NULL CHECK (fresh_endpoints >= 0),
+    stale_endpoints INTEGER NOT NULL CHECK (stale_endpoints >= 0),
+    never_observed_endpoints INTEGER NOT NULL CHECK (never_observed_endpoints >= 0),
+    failed_endpoints INTEGER NOT NULL CHECK (failed_endpoints >= 0),
+    excluded_endpoints INTEGER NOT NULL CHECK (excluded_endpoints >= 0),
+    inventory_complete INTEGER NOT NULL,
+    completeness_json TEXT NOT NULL
+);
 "#;
+
+const MAX_ACTIVITY_SAMPLE_BATCH: usize = 10_000;
 
 /// Errors returned by [`Store`].
 #[derive(Debug, Error)]
@@ -83,6 +100,10 @@ pub enum StoreError {
     EventLimitOutOfRange(usize),
     #[error("run `{0}` was not found")]
     RunNotFound(String),
+    #[error("activity endpoint count cannot be represented by SQLite or this platform")]
+    ActivityCountOutOfRange,
+    #[error("invalid activity sample timestamp {0} in the database")]
+    InvalidActivityTimestamp(i64),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -281,6 +302,100 @@ impl Store {
         }
 
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Persists aggregate counts and coverage only, independently of launcher runs.
+    ///
+    /// Timestamps are truncated to Unix milliseconds. The last successful write
+    /// replaces every field of an existing millisecond bucket, including null counts.
+    pub async fn upsert_activity_sample(&self, sample: &ActivitySample) -> Result<()> {
+        let mut query = sqlx::query(
+            "INSERT INTO herdr_activity_samples (sampled_at_unix_ms, counts_json, \
+             expected_endpoints, fresh_endpoints, stale_endpoints, never_observed_endpoints, \
+             failed_endpoints, excluded_endpoints, inventory_complete, completeness_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(sampled_at_unix_ms) DO UPDATE SET counts_json = excluded.counts_json, \
+             expected_endpoints = excluded.expected_endpoints, fresh_endpoints = excluded.fresh_endpoints, \
+             stale_endpoints = excluded.stale_endpoints, never_observed_endpoints = excluded.never_observed_endpoints, \
+             failed_endpoints = excluded.failed_endpoints, excluded_endpoints = excluded.excluded_endpoints, \
+             inventory_complete = excluded.inventory_complete, completeness_json = excluded.completeness_json",
+        )
+        .bind(sample.sampled_at.timestamp_millis())
+        .bind(serialize_optional(sample.counts.as_ref())?);
+        for count in [
+            sample.expected_endpoints,
+            sample.fresh_endpoints,
+            sample.stale_endpoints,
+            sample.never_observed_endpoints,
+            sample.failed_endpoints,
+            sample.excluded_endpoints,
+        ] {
+            query =
+                query.bind(i64::try_from(count).map_err(|_| StoreError::ActivityCountOutOfRange)?);
+        }
+        query
+            .bind(sample.inventory_complete)
+            .bind(serde_json::to_string(&sample.completeness)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Loads the newest samples in the inclusive UTC window, ordered oldest first.
+    ///
+    /// Future rows (relative to both `until` and the current clock) are excluded.
+    /// At most `min(limit, 10_000)` rows are returned; no gaps are filled.
+    pub async fn load_activity_samples(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ActivitySample>> {
+        // Round the lower bound up so sub-millisecond windows stay inclusive
+        // without admitting a persisted timestamp earlier than `since`.
+        let since_ms = since.timestamp_millis()
+            + i64::from(!since.timestamp_subsec_nanos().is_multiple_of(1_000_000));
+        let rows = sqlx::query(
+            "SELECT * FROM (SELECT * FROM herdr_activity_samples \
+             WHERE sampled_at_unix_ms >= ? AND sampled_at_unix_ms <= ? \
+             ORDER BY sampled_at_unix_ms DESC LIMIT ?) ORDER BY sampled_at_unix_ms ASC",
+        )
+        .bind(since_ms)
+        .bind(until.min(Utc::now()).timestamp_millis())
+        .bind(limit.min(MAX_ACTIVITY_SAMPLE_BATCH) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(activity_sample_from_row).collect()
+    }
+
+    /// Deletes at most `min(limit, 10_000)` samples strictly before `before`,
+    /// oldest first. Launcher runs and events are never touched.
+    pub async fn prune_activity_samples(&self, before: DateTime<Utc>, limit: usize) -> Result<()> {
+        let before_ms = before.timestamp_millis()
+            + i64::from(!before.timestamp_subsec_nanos().is_multiple_of(1_000_000));
+        sqlx::query(
+            "DELETE FROM herdr_activity_samples WHERE sampled_at_unix_ms IN (\
+             SELECT sampled_at_unix_ms FROM herdr_activity_samples \
+             WHERE sampled_at_unix_ms < ? ORDER BY sampled_at_unix_ms ASC LIMIT ?)",
+        )
+        .bind(before_ms)
+        .bind(limit.min(MAX_ACTIVITY_SAMPLE_BATCH) as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically deletes all samples at or after `cutoff`, without touching runs
+    /// or events. Use after startup or clock rollback to permanently invalidate
+    /// future history rather than merely hiding it until the clock catches up.
+    pub async fn clear_activity_samples_from(&self, cutoff: DateTime<Utc>) -> Result<()> {
+        let cutoff_ms = cutoff.timestamp_millis()
+            + i64::from(!cutoff.timestamp_subsec_nanos().is_multiple_of(1_000_000));
+        sqlx::query("DELETE FROM herdr_activity_samples WHERE sampled_at_unix_ms >= ?")
+            .bind(cutoff_ms)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -512,6 +627,30 @@ async fn upsert_issue(
     Ok(())
 }
 
+fn activity_sample_from_row(row: &SqliteRow) -> Result<ActivitySample> {
+    let sampled_at_ms = row.try_get("sampled_at_unix_ms")?;
+    let count = |column| -> Result<usize> {
+        usize::try_from(row.try_get::<i64, _>(column)?)
+            .map_err(|_| StoreError::ActivityCountOutOfRange)
+    };
+    Ok(ActivitySample {
+        sampled_at: DateTime::from_timestamp_millis(sampled_at_ms)
+            .ok_or(StoreError::InvalidActivityTimestamp(sampled_at_ms))?,
+        counts: row
+            .try_get::<Option<String>, _>("counts_json")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        expected_endpoints: count("expected_endpoints")?,
+        fresh_endpoints: count("fresh_endpoints")?,
+        stale_endpoints: count("stale_endpoints")?,
+        never_observed_endpoints: count("never_observed_endpoints")?,
+        failed_endpoints: count("failed_endpoints")?,
+        excluded_endpoints: count("excluded_endpoints")?,
+        inventory_complete: row.try_get("inventory_complete")?,
+        completeness: deserialize_json(row, "completeness_json")?,
+    })
+}
+
 fn issue_from_row(row: &SqliteRow) -> Result<Issue> {
     let provider: String = row.try_get("provider")?;
     let provider = IssueProvider::from_str(&provider)
@@ -624,7 +763,9 @@ fn deserialize_json<T: serde::de::DeserializeOwned>(row: &SqliteRow, column: &st
 mod tests {
     use std::path::PathBuf;
 
-    use agent_launcher_core::{BackendKind, OutputStream, RunState};
+    use agent_launcher_core::{
+        ActivityCompleteness, ActivityCounts, BackendKind, OutputStream, RunState,
+    };
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use serde_json::json;
 
@@ -632,6 +773,396 @@ mod tests {
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).single().unwrap()
+    }
+
+    fn activity_sample(seconds: i64) -> ActivitySample {
+        ActivitySample {
+            sampled_at: timestamp(seconds),
+            counts: Some(ActivityCounts {
+                working: 1,
+                blocked: 2,
+                idle: 3,
+                unseen_done: 4,
+                unknown: u64::MAX,
+            }),
+            expected_endpoints: 10,
+            fresh_endpoints: 2,
+            stale_endpoints: 3,
+            never_observed_endpoints: 5,
+            failed_endpoints: 7,
+            excluded_endpoints: 11,
+            inventory_complete: false,
+            completeness: ActivityCompleteness::Partial,
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_samples_round_trip_missing_zero_and_all_coverage() {
+        let store = Store::in_memory().await.unwrap();
+        let partial = activity_sample(100);
+        let mut missing = activity_sample(101);
+        missing.counts = None;
+        missing.completeness = ActivityCompleteness::Missing;
+        let mut zero = activity_sample(102);
+        zero.counts = Some(ActivityCounts::default());
+        zero.inventory_complete = true;
+        zero.completeness = ActivityCompleteness::Complete;
+        let expected = vec![partial, missing, zero];
+        for sample in &expected {
+            store.upsert_activity_sample(sample).await.unwrap();
+        }
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(100), timestamp(102), 10)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_samples_duplicate_millisecond_overwrites_every_field() {
+        let store = Store::in_memory().await.unwrap();
+        let original = activity_sample(100);
+        store.upsert_activity_sample(&original).await.unwrap();
+        let mut replacement = ActivitySample {
+            sampled_at: original.sampled_at + Duration::nanoseconds(999_999),
+            counts: None,
+            expected_endpoints: 20,
+            fresh_endpoints: 0,
+            stale_endpoints: 12,
+            never_observed_endpoints: 8,
+            failed_endpoints: 6,
+            excluded_endpoints: 9,
+            inventory_complete: true,
+            completeness: ActivityCompleteness::Missing,
+        };
+        store.upsert_activity_sample(&replacement).await.unwrap();
+        replacement.sampled_at = original.sampled_at;
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap(),
+            vec![replacement]
+        );
+        store.upsert_activity_sample(&original).await.unwrap();
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap(),
+            vec![original]
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_samples_load_bounded_newest_window_without_future_rows() {
+        let store = Store::in_memory().await.unwrap();
+        for seconds in [105, 99, 103, 100, 102, 101, 104] {
+            store
+                .upsert_activity_sample(&activity_sample(seconds))
+                .await
+                .unwrap();
+        }
+        let future = Utc::now() + Duration::days(1);
+        let mut sample = activity_sample(0);
+        sample.sampled_at = future;
+        store.upsert_activity_sample(&sample).await.unwrap();
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(100), timestamp(104), 3)
+                .await
+                .unwrap(),
+            vec![
+                activity_sample(102),
+                activity_sample(103),
+                activity_sample(104)
+            ]
+        );
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(100), future, usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            6
+        );
+        for (since, until, limit) in [
+            (timestamp(100), timestamp(104), 0),
+            (timestamp(104), timestamp(100), 10),
+            (
+                timestamp(100) + Duration::nanoseconds(1),
+                timestamp(100),
+                10,
+            ),
+            (future, future, 10),
+        ] {
+            assert!(
+                store
+                    .load_activity_samples(since, until, limit)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_samples_prune_is_bounded_and_isolated_from_runs() {
+        let store = Store::in_memory().await.unwrap();
+        let run = run("unrelated", timestamp(100));
+        let event = EventEnvelope {
+            run_id: run.id.clone(),
+            sequence: 0,
+            timestamp: run.updated_at,
+            payload: RunEvent::Completed {
+                success: true,
+                message: None,
+            },
+        };
+        store.insert_run(&run).await.unwrap();
+        store.append_event(&event).await.unwrap();
+        for seconds in [103, 100, 102, 101] {
+            store
+                .upsert_activity_sample(&activity_sample(seconds))
+                .await
+                .unwrap();
+        }
+        store
+            .prune_activity_samples(timestamp(103), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        store
+            .prune_activity_samples(timestamp(103), 2)
+            .await
+            .unwrap();
+        let remaining = vec![activity_sample(102), activity_sample(103)];
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap(),
+            remaining
+        );
+        assert_eq!(store.load_run(&run.id).await.unwrap(), Some(run.clone()));
+        assert_eq!(store.load_events(&run.id).await.unwrap(), vec![event]);
+        store.delete_run(&run.id).await.unwrap();
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap(),
+            remaining
+        );
+        store
+            .prune_activity_samples(timestamp(103), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap(),
+            vec![activity_sample(103)]
+        );
+        store
+            .prune_activity_samples(timestamp(103) + Duration::nanoseconds(1), 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_samples_enforce_hard_load_and_prune_bounds() {
+        let store = Store::in_memory().await.unwrap();
+        store
+            .upsert_activity_sample(&activity_sample(0))
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE buckets(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM buckets WHERE n < ?) \
+             INSERT INTO herdr_activity_samples SELECT n, counts_json, expected_endpoints, \
+             fresh_endpoints, stale_endpoints, never_observed_endpoints, failed_endpoints, \
+             excluded_endpoints, inventory_complete, completeness_json \
+             FROM buckets CROSS JOIN herdr_activity_samples WHERE sampled_at_unix_ms = 0",
+        )
+        .bind(MAX_ACTIVITY_SAMPLE_BATCH as i64 + 1)
+        .execute(&store.pool).await.unwrap();
+        let loaded = store
+            .load_activity_samples(timestamp(0), timestamp(100), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), MAX_ACTIVITY_SAMPLE_BATCH);
+        assert_eq!(loaded[0].sampled_at.timestamp_millis(), 2);
+        assert_eq!(
+            loaded.last().unwrap().sampled_at.timestamp_millis(),
+            MAX_ACTIVITY_SAMPLE_BATCH as i64 + 1
+        );
+        store
+            .prune_activity_samples(timestamp(100), usize::MAX)
+            .await
+            .unwrap();
+        let loaded = store
+            .load_activity_samples(timestamp(0), timestamp(100), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(
+            loaded[0].sampled_at.timestamp_millis(),
+            MAX_ACTIVITY_SAMPLE_BATCH as i64
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_samples_migrate_old_schema_and_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-activity-migration-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        let old_schema = SCHEMA
+            .split("CREATE TABLE IF NOT EXISTS herdr_activity_samples")
+            .next()
+            .unwrap();
+        sqlx::raw_sql(old_schema).execute(&pool).await.unwrap();
+        let original = run("legacy-run", timestamp(100));
+        write_run(&pool, &original, false).await.unwrap();
+        pool.close().await;
+        for reopen in 0..2 {
+            let store = Store::open(&path).await.unwrap();
+            assert_eq!(
+                store.load_run(&original.id).await.unwrap(),
+                Some(original.clone())
+            );
+            let loaded = store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                loaded,
+                if reopen == 0 {
+                    vec![]
+                } else {
+                    vec![activity_sample(100)]
+                }
+            );
+            store
+                .upsert_activity_sample(&activity_sample(100))
+                .await
+                .unwrap();
+            store.pool.close().await;
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_samples_future_invalidation_survives_reopen_and_preserves_history() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-activity-invalidation-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&path).await.unwrap();
+        let original = run("retained-run", timestamp(100));
+        let event = EventEnvelope {
+            run_id: original.id.clone(),
+            sequence: 0,
+            timestamp: original.updated_at,
+            payload: RunEvent::Completed {
+                success: true,
+                message: None,
+            },
+        };
+        store.insert_run(&original).await.unwrap();
+        store.append_event(&event).await.unwrap();
+        for seconds in [99, 100, 101] {
+            store
+                .upsert_activity_sample(&activity_sample(seconds))
+                .await
+                .unwrap();
+        }
+        let mut future = activity_sample(0);
+        future.sampled_at = Utc::now() + Duration::days(1);
+        store.upsert_activity_sample(&future).await.unwrap();
+
+        // A fractional cutoff must retain the millisecond immediately before it.
+        store
+            .clear_activity_samples_from(timestamp(100) + Duration::nanoseconds(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), timestamp(200), 10)
+                .await
+                .unwrap(),
+            vec![activity_sample(99), activity_sample(100)]
+        );
+        store
+            .clear_activity_samples_from(timestamp(100))
+            .await
+            .unwrap();
+        store.pool.close().await;
+
+        let store = Store::open(&path).await.unwrap();
+        // Loading beyond the invalidated window simulates catchup. Inspecting all
+        // stored keys also proves real future rows were deleted, not just hidden.
+        assert_eq!(
+            store
+                .load_activity_samples(timestamp(0), future.sampled_at, 10)
+                .await
+                .unwrap(),
+            vec![activity_sample(99)]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT sampled_at_unix_ms FROM herdr_activity_samples ORDER BY sampled_at_unix_ms"
+            )
+            .fetch_all(&store.pool)
+            .await
+            .unwrap(),
+            vec![99_000]
+        );
+        assert_eq!(
+            store.load_run(&original.id).await.unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(store.load_events(&original.id).await.unwrap(), vec![event]);
+        store
+            .clear_activity_samples_from(timestamp(100))
+            .await
+            .unwrap();
+        store.pool.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     fn issue(provider: IssueProvider, native_id: &str, title: &str) -> Issue {

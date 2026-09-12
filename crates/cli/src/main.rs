@@ -255,6 +255,7 @@ async fn run(
 
 #[cfg(feature = "tui")]
 fn validate_config(config: &AppConfig) -> Result<(), Error> {
+    config.herdr_activity.validate().map_err(Error::Usage)?;
     if config.poll_interval_seconds == 0 {
         return Err(Error::Usage(
             "poll_interval_seconds must be greater than zero".to_owned(),
@@ -656,6 +657,9 @@ mod tests {
     fn validates_required_configuration_values() {
         let mut config = AppConfig::default();
         config.agent.name.clear();
+        assert!(validate_config(&config).is_err());
+        let mut config = AppConfig::default();
+        config.herdr_activity.xdg_config_home = Some("relative/path".into());
         assert!(validate_config(&config).is_err());
     }
 

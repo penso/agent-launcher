@@ -15,6 +15,43 @@ name = "opencode"
 [notifications]
 desktop = true
 
+# Read-only Herdr counts, independent of backend. Never starts or upgrades servers.
+# Polls every 2s; observations expire after 10s. Four requests maximum, 10s deadline.
+# History is sampled (brief transitions can be missed), retained locally for 30min.
+[herdr_activity]
+enabled = true
+discover_local_sessions = true
+discover_saved_profiles = true
+# Consent to enumerate OTHER running sessions on enabled configured SSH hosts.
+# false means configured-session coverage, not all sessions on those hosts.
+discover_remote_sessions = false
+# executable = "herdr"
+# ssh_executable = "ssh"
+# Inherited HERDR_* routing and XDG overrides are cleared. Defaults use HOME.
+# Deliberate local namespaces (absolute paths, no shell/tilde expansion):
+# xdg_config_home = "/home/me/.config"
+# xdg_state_home = "/home/me/.local/state"
+# Remote executable is always `herdr` on the remote PATH; SSH auth env is preserved.
+# Explicit endpoints use the same fields as exclusions. Missing target means local.
+# [[herdr_activity.endpoints]]
+# target = "ssh://developer@builder:2222"
+# IPv6 uses ssh://user@[::1]:2222. Bare IPv6/host:port are rejected.
+# Explicit URI ports override SSH config; omitted ports honor SSH config.
+# session = "default"
+# enabled = true
+# xdg_config_home = "/home/developer/.config"
+# [[herdr_activity.exclusions]]
+# target = "builder"
+# session = "private"
+# Exclusions and disabled profiles win over all discovery, including alias matches.
+# [[herdr_activity.alias_groups]]
+# canonical = "workstation"
+# targets = ["local", "developer@localhost"]
+# Aliases assert the same account/host; session and config namespace remain distinct.
+# No automatic physical-host deduplication is claimed.
+# At most 1024 canonical endpoints; oversized inventories fail atomically.
+# Arbitrary custom socket paths are not discovered; configure an XDG namespace.
+
 # Uncomment to run the native backend on a pool of SSH compute targets. Automatic placement
 # prefers fewer active launcher runs, then lower CPU/memory load. Use "random" for random
 # placement. A detached OpenCode server and remote Git worktree are created per issue.

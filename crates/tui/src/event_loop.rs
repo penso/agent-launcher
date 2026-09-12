@@ -30,7 +30,6 @@ use crate::{
 
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 const METRICS_INTERVAL: Duration = Duration::from_secs(5);
-const AGENT_ACTIVITY_INTERVAL: Duration = Duration::from_secs(1);
 // Xterm title-stack operations; ignored by terminals without title-stack support.
 const PUSH_TITLE: Print<&str> = Print("\x1b[22;0t");
 const POP_TITLE: Print<&str> = Print("\x1b[23;0t");
@@ -76,9 +75,6 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
         ..Default::default()
     };
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
-    if snapshot.initialized {
-        app.agent_activity.initialize(&snapshot);
-    }
     let mut metrics_sampler = HostMetricsSampler::new();
     metrics_sampler.sample(&mut app.host_metrics);
     let mut ticker = tokio::time::interval(ANIMATION_INTERVAL);
@@ -88,11 +84,6 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
         METRICS_INTERVAL,
     );
     metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut agent_activity_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + AGENT_ACTIVITY_INTERVAL,
-        AGENT_ACTIVITY_INTERVAL,
-    );
-    agent_activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let termination = termination_signal();
     tokio::pin!(termination);
     let mut needs_draw = true;
@@ -146,9 +137,6 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                 let next = snapshots.borrow().clone();
                 app.reconcile_lists(&snapshot, &next);
                 snapshot = next;
-                if snapshot.initialized && !app.agent_activity.is_initialized() {
-                    app.agent_activity.initialize(&snapshot);
-                }
                 app.reconcile_detail(&snapshot);
                 app.reconcile_dispatch(&snapshot);
                 needs_draw = true;
@@ -162,14 +150,6 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
             _ = metrics_tick.tick() => {
                 metrics_sampler.sample(&mut app.host_metrics);
                 needs_draw = true;
-            }
-            _ = agent_activity_tick.tick() => {
-                if snapshot.initialized {
-                    app.agent_activity.record(&snapshot);
-                }
-                if app.route == Route::Inbox {
-                    needs_draw = true;
-                }
             }
             Some(result) = action_rx.recv() => {
                 apply_ui_action_result(&mut app, result);

@@ -1,281 +1,213 @@
-use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    time::{Duration, Instant},
-};
+use agent_launcher_core::{ActivityCompleteness, ActivitySample, HerdrActivitySnapshot};
+use chrono::{DateTime, Utc};
 
-use agent_launcher_core::{RunState, RuntimeSnapshot};
+const HISTORY_MS: i64 = 15 * 60 * 1000;
+// The runtime's fixed sampling cadence. Empty slots remain gaps when downsampling.
+const SAMPLE_MS: i64 = 2000;
 
-const HISTORY_DURATION: Duration = Duration::from_secs(15 * 60);
-
-#[derive(Debug, Default)]
-pub(crate) struct AgentActivity {
-    pub score: u64,
-    pub working: usize,
-    pub attention: usize,
-    pub idle: usize,
-    history: VecDeque<(Instant, u64)>,
-    last_event_sequences: HashMap<String, u64>,
-    last_states: HashMap<String, RunState>,
-    initialized: bool,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ActivityBucket {
+    pub working: Option<u64>,
+    pub partial: bool,
 }
 
-impl AgentActivity {
-    pub fn initialize(&mut self, snapshot: &RuntimeSnapshot) {
-        self.history.clear();
-        self.last_event_sequences.clear();
-        self.last_states.clear();
-        let now = Instant::now();
-        let wall_clock = chrono::Utc::now();
-        let mut historical = BTreeMap::<u64, (u64, u64)>::new();
-        for events in snapshot.run_events.values() {
-            for event in events {
-                let Ok(age) = (wall_clock - event.timestamp).to_std() else {
-                    continue;
-                };
-                if age <= HISTORY_DURATION {
-                    historical.entry(age.as_secs()).or_default().0 += 1;
-                }
-            }
-        }
-        for run in &snapshot.runs {
-            if matches!(run.state, RunState::Completed | RunState::Failed) {
-                let Ok(age) = (wall_clock - run.updated_at).to_std() else {
-                    continue;
-                };
-                if age <= HISTORY_DURATION {
-                    historical.entry(age.as_secs()).or_default().1 += 1;
-                }
-            }
-        }
-        for (age, (events, completions)) in historical.into_iter().rev() {
-            let score = (events.min(4) * 10 + completions.min(2) * 20).min(100);
-            if let Some(sampled_at) = now.checked_sub(Duration::from_secs(age)) {
-                self.history.push_back((sampled_at, score));
-            }
-        }
-        for run in &snapshot.runs {
-            let next_sequence = snapshot
-                .run_events
-                .get(&run.id)
-                .and_then(|events| events.last())
-                .map_or(0, |event| event.sequence.saturating_add(1));
-            self.last_event_sequences
-                .insert(run.id.clone(), next_sequence);
-            self.last_states.insert(run.id.clone(), run.state);
-        }
-        self.record_at(snapshot, now);
-        self.initialized = true;
+/// Project persisted UTC observations, never launcher events or current-state backfill.
+pub(crate) fn buckets(
+    snapshot: &HerdrActivitySnapshot,
+    width: usize,
+    now: DateTime<Utc>,
+) -> Vec<ActivityBucket> {
+    if width == 0 {
+        return Vec::new();
     }
-
-    pub const fn is_initialized(&self) -> bool {
-        self.initialized
-    }
-
-    pub fn record(&mut self, snapshot: &RuntimeSnapshot) {
-        self.record_at(snapshot, Instant::now());
-    }
-
-    fn record_at(&mut self, snapshot: &RuntimeSnapshot, now: Instant) {
-        self.working = snapshot
-            .runs
-            .iter()
-            .filter(|run| {
-                matches!(
-                    run.state,
-                    RunState::Provisioning | RunState::Starting | RunState::Running
-                )
-            })
-            .count();
-        self.attention = snapshot
-            .runs
-            .iter()
-            .filter(|run| run.state.needs_attention())
-            .count();
-        self.idle = snapshot
-            .runs
-            .iter()
-            .filter(|run| run.state == RunState::Idle)
-            .count();
-
-        let mut new_events = 0_u64;
-        let mut completed = 0_u64;
-        for run in &snapshot.runs {
-            let next_sequence = snapshot
-                .run_events
-                .get(&run.id)
-                .and_then(|events| events.last())
-                .map_or(0, |event| event.sequence.saturating_add(1));
-            if let Some(previous) = self
-                .last_event_sequences
-                .insert(run.id.clone(), next_sequence)
-            {
-                new_events = new_events.saturating_add(next_sequence.saturating_sub(previous));
-            }
-            if self
-                .last_states
-                .insert(run.id.clone(), run.state)
-                .is_some_and(|previous| {
-                    previous.is_active()
-                        && matches!(run.state, RunState::Completed | RunState::Failed)
-                })
-            {
-                completed = completed.saturating_add(1);
-            }
+    let mut slots = vec![ActivityBucket::default(); (HISTORY_MS / SAMPLE_MS) as usize];
+    for sample in &snapshot.samples {
+        let age = now
+            .signed_duration_since(sample.sampled_at)
+            .num_milliseconds();
+        if !(0..HISTORY_MS).contains(&age) {
+            continue;
         }
-        self.last_event_sequences
-            .retain(|run_id, _| snapshot.runs.iter().any(|run| run.id == *run_id));
-        self.last_states
-            .retain(|run_id, _| snapshot.runs.iter().any(|run| run.id == *run_id));
-
-        let needs_input = snapshot
-            .runs
-            .iter()
-            .filter(|run| run.state == RunState::NeedsInput)
-            .count() as u64;
-        self.score = ((self.working as u64 * 45)
-            + (self.attention as u64 * 12)
-            + (needs_input * 8)
-            + (self.idle as u64 * 4)
-            + (new_events.min(4) * 10)
-            + (completed.min(2) * 20))
-            .min(100);
-        self.history.push_back((now, self.score));
-        while self
-            .history
-            .front()
-            .is_some_and(|(sampled_at, _)| now.duration_since(*sampled_at) > HISTORY_DURATION)
+        let slot = &mut slots[((HISTORY_MS - 1 - age) / SAMPLE_MS) as usize];
+        if sample.completeness != ActivityCompleteness::Missing
+            && let Some(counts) = &sample.counts
         {
-            self.history.pop_front();
+            slot.working = Some(slot.working.unwrap_or(0).max(counts.working));
         }
+        slot.partial |= sample.completeness != ActivityCompleteness::Complete
+            || !sample.inventory_complete
+            || sample.counts.is_none();
     }
-
-    pub fn sparkline(&self, width: usize) -> Vec<u64> {
-        self.sparkline_at(width, Instant::now())
+    let mut result = vec![ActivityBucket::default(); width];
+    for (index, slot) in slots.iter().enumerate() {
+        let bucket = &mut result[index * width / slots.len()];
+        if let Some(count) = slot.working {
+            bucket.working = Some(bucket.working.unwrap_or(0).max(count));
+        }
+        bucket.partial |= slot.partial || slot.working.is_none();
     }
+    result
+}
 
-    fn sparkline_at(&self, width: usize, now: Instant) -> Vec<u64> {
-        if width == 0 {
-            return Vec::new();
-        }
-        let mut values = vec![0; width];
-        for (sampled_at, value) in &self.history {
-            let age = now.checked_duration_since(*sampled_at).unwrap_or_default();
-            if age > HISTORY_DURATION {
-                continue;
-            }
-            let elapsed = HISTORY_DURATION.saturating_sub(age);
-            let column = ((elapsed.as_secs_f64() / HISTORY_DURATION.as_secs_f64()) * width as f64)
-                .floor() as usize;
-            let column = column.min(width - 1);
-            values[column] = values[column].max(*value);
-        }
-        values
+pub(crate) fn current_sample(
+    snapshot: &HerdrActivitySnapshot,
+    now: DateTime<Utc>,
+) -> Option<&ActivitySample> {
+    snapshot
+        .samples
+        .iter()
+        .filter(|sample| {
+            let age = now.signed_duration_since(sample.sampled_at);
+            age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(10)
+        })
+        .max_by_key(|sample| sample.sampled_at)
+}
+
+#[cfg(test)]
+pub(crate) fn sample(
+    at: DateTime<Utc>,
+    working: u64,
+    completeness: ActivityCompleteness,
+) -> ActivitySample {
+    ActivitySample {
+        sampled_at: at,
+        counts: (completeness != ActivityCompleteness::Missing).then_some(
+            agent_launcher_core::ActivityCounts {
+                working,
+                ..Default::default()
+            },
+        ),
+        expected_endpoints: 1,
+        fresh_endpoints: usize::from(completeness == ActivityCompleteness::Complete),
+        stale_endpoints: 0,
+        never_observed_endpoints: 0,
+        failed_endpoints: 0,
+        excluded_endpoints: 0,
+        inventory_complete: completeness == ActivityCompleteness::Complete,
+        completeness,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use agent_launcher_core::{EventEnvelope, OutputStream, RunEvent, RunSummary, RuntimeSnapshot};
-    use chrono::Utc;
+    use ActivityCompleteness::{Complete, Missing, Partial};
 
     use super::*;
 
-    fn run(id: &str, state: RunState) -> RunSummary {
-        let now = Utc::now();
-        RunSummary {
-            id: id.to_owned(),
-            issue_key: format!("issue-{id}"),
-            workspace: None,
-            agent: "opencode".to_owned(),
-            state,
-            message: None,
-            session_id: None,
-            started_at: now,
-            updated_at: now,
+    #[test]
+    fn counts_are_not_scores_or_capped() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for count in [0, 1, 3, 1000, u64::MAX] {
+            let snapshot = HerdrActivitySnapshot {
+                samples: vec![sample(now, count, Complete)],
+                ..Default::default()
+            };
+            let values = buckets(&snapshot, 450, now);
+            assert_eq!(values[449], ActivityBucket {
+                working: Some(count),
+                partial: false
+            });
+            assert_eq!(values.iter().filter(|v| v.working.is_some()).count(), 1);
         }
     }
 
     #[test]
-    fn scores_agent_state_new_feedback_and_completion() {
-        let start = Instant::now();
-        let mut activity = AgentActivity::default();
-        let mut snapshot = RuntimeSnapshot {
-            runs: vec![run("one", RunState::Running)],
-            ..RuntimeSnapshot::default()
+    fn persisted_times_leave_downtime_gaps_and_ignore_future_and_expired_rows() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let snapshot = HerdrActivitySnapshot {
+            samples: vec![
+                sample(now - chrono::Duration::seconds(600), 3, Complete),
+                sample(now, 0, Complete),
+                sample(now + chrono::Duration::seconds(2), 99, Complete),
+                sample(now - chrono::Duration::minutes(16), 99, Complete),
+            ],
+            ..Default::default()
         };
-        activity.record_at(&snapshot, start);
-        assert_eq!(activity.score, 45);
-        assert_eq!(activity.working, 1);
-
-        snapshot.run_events = HashMap::from([("one".to_owned(), vec![EventEnvelope {
-            run_id: "one".to_owned(),
-            sequence: 0,
-            timestamp: Utc::now(),
-            payload: RunEvent::Output {
-                stream: OutputStream::Pty,
-                text: "working".to_owned(),
-            },
-        }])]);
-        activity.record_at(&snapshot, start + Duration::from_secs(1));
-        assert_eq!(activity.score, 55);
-
-        snapshot.runs[0].state = RunState::Completed;
-        activity.record_at(&snapshot, start + Duration::from_secs(2));
-        assert_eq!(activity.score, 20);
-        assert_eq!(activity.working, 0);
+        let values = buckets(&snapshot, 450, now);
+        assert_eq!(values[149].working, Some(3));
+        assert_eq!(values[449].working, Some(0));
+        assert!(values[150..449].iter().all(|v| v.working.is_none()));
+        assert_eq!(current_sample(&snapshot, now).unwrap().sampled_at, now);
+        assert!(current_sample(&snapshot, now + chrono::Duration::seconds(20)).is_none());
     }
 
     #[test]
-    fn retains_fifteen_minutes_and_downsamples_peaks() {
-        let start = Instant::now();
-        let mut activity = AgentActivity::default();
-        let mut snapshot = RuntimeSnapshot::default();
-        activity.record_at(&snapshot, start);
-        snapshot.runs.push(run("one", RunState::Running));
-        activity.record_at(&snapshot, start + Duration::from_secs(5));
-        snapshot.runs.push(run("two", RunState::Running));
-        activity.record_at(&snapshot, start + Duration::from_secs(10));
-        snapshot.runs.clear();
-        activity.record_at(&snapshot, start + Duration::from_secs(15));
-        assert_eq!(activity.sparkline_at(2, start + Duration::from_secs(15)), [
-            0, 90
-        ]);
-
-        activity.record_at(
-            &snapshot,
-            start + HISTORY_DURATION + Duration::from_secs(11),
-        );
-        assert_eq!(
-            activity.sparkline_at(2, start + HISTORY_DURATION + Duration::from_secs(11)),
-            [0, 0]
-        );
+    fn complete_empty_history_is_zero_and_downsampling_preserves_peaks() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut snapshot = HerdrActivitySnapshot {
+            samples: (0..450)
+                .map(|index| sample(now - chrono::Duration::seconds(index * 2), 0, Complete))
+                .collect(),
+            ..Default::default()
+        };
+        for width in [1, 24, 44, 108] {
+            assert!(buckets(&snapshot, width, now).iter().all(|bucket| *bucket
+                == ActivityBucket {
+                    working: Some(0),
+                    partial: false
+                }));
+        }
+        snapshot.samples[0].counts.as_mut().unwrap().working = 3;
+        snapshot.samples[1].counts.as_mut().unwrap().working = 1000;
+        assert_eq!(buckets(&snapshot, 1, now), [ActivityBucket {
+            working: Some(1000),
+            partial: false
+        }]);
     }
 
     #[test]
-    fn initializes_history_from_persisted_events_and_completions() {
-        let now = Utc::now();
-        let mut completed = run("done", RunState::Completed);
-        completed.updated_at = now - chrono::Duration::seconds(30);
-        let snapshot = RuntimeSnapshot {
-            runs: vec![completed],
-            run_events: HashMap::from([("done".to_owned(), vec![EventEnvelope {
-                run_id: "done".to_owned(),
-                sequence: 4,
-                timestamp: now - chrono::Duration::minutes(1),
-                payload: RunEvent::Output {
-                    stream: OutputStream::Pty,
-                    text: "finished".to_owned(),
-                },
-            }])]),
-            ..RuntimeSnapshot::default()
+    fn missing_partial_zero_and_downsampled_gaps_remain_distinct() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let snapshot = HerdrActivitySnapshot {
+            samples: vec![
+                sample(now, 0, Complete),
+                sample(now - chrono::Duration::seconds(2), 0, Partial),
+                sample(now - chrono::Duration::seconds(4), 0, Missing),
+            ],
+            ..Default::default()
         };
-        let mut activity = AgentActivity::default();
+        let values = buckets(&snapshot, 450, now);
+        assert_eq!(values[449], ActivityBucket {
+            working: Some(0),
+            partial: false
+        });
+        assert_eq!(values[448], ActivityBucket {
+            working: Some(0),
+            partial: true
+        });
+        assert_eq!(values[447].working, None);
+        assert_eq!(buckets(&snapshot, 1, now), [ActivityBucket {
+            working: Some(0),
+            partial: true
+        }]);
+        assert!(buckets(&snapshot, 0, now).is_empty());
+    }
 
-        activity.initialize(&snapshot);
-
-        assert_eq!(activity.sparkline(3), [0, 0, 20]);
-        assert_eq!(activity.last_event_sequences.get("done"), Some(&5));
+    #[test]
+    fn braille_bucket_widths_preserve_hidden_gaps_and_partial_peaks() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut snapshot = HerdrActivitySnapshot {
+            samples: (0..450)
+                .map(|index| sample(now - chrono::Duration::seconds(index * 2), 0, Complete))
+                .collect(),
+            ..Default::default()
+        };
+        snapshot.samples[1] = sample(now - chrono::Duration::seconds(2), u64::MAX, Partial);
+        snapshot.samples[2] = sample(now - chrono::Duration::seconds(4), 0, Missing);
+        for columns in [1, 2, 24, 44, 108, 225, 450] {
+            let values = buckets(&snapshot, columns * 2, now);
+            assert_eq!(values.len(), columns * 2);
+            let peak = values.iter().find(|b| b.working == Some(u64::MAX)).unwrap();
+            assert!(peak.partial);
+            let missing_slot_bucket = 447 * columns * 2 / 450;
+            assert!(values[missing_slot_bucket].partial);
+            if columns >= 225 {
+                assert!(values[missing_slot_bucket].working.is_none());
+            }
+            if columns > 225 {
+                // Upsampling must not invent observations between the fixed two-second slots.
+                assert!(values[1].working.is_none());
+            }
+        }
     }
 }

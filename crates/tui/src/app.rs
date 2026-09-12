@@ -3,7 +3,6 @@ use agent_launcher_core::{
 };
 
 use crate::{
-    activity::AgentActivity,
     metrics::HostMetrics,
     rows::{IssueSort, display_rows_matching},
 };
@@ -94,7 +93,6 @@ pub(crate) struct AppState {
     pub issue_sort: IssueSort,
     pub status_message: Option<String>,
     pub host_metrics: HostMetrics,
-    pub agent_activity: AgentActivity,
     pub tick: u32,
 }
 

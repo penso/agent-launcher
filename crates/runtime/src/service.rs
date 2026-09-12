@@ -224,6 +224,7 @@ pub struct RuntimeService {
     next_sequences: HashMap<String, u64>,
     last_outputs: HashMap<String, String>,
     notified: HashSet<(String, &'static str)>,
+    activity_refresh: watch::Sender<u64>,
 }
 
 impl RuntimeService {
@@ -312,6 +313,7 @@ impl RuntimeService {
                 next_sequences: HashMap::new(),
                 last_outputs: HashMap::new(),
                 notified: HashSet::new(),
+                activity_refresh: watch::channel(0).0,
             },
             handle,
         )
@@ -346,7 +348,25 @@ impl RuntimeService {
     }
 
     /// Runs the service until a shutdown command or all handles are dropped.
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
+        self.run_with_demo_activity(std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY").is_some())
+            .await
+    }
+
+    async fn run_with_demo_activity(mut self, demo_activity: bool) -> Result<()> {
+        let mut activity_config = self.config.herdr_activity.clone();
+        // Demo is an explicit presentation mode and must never collect or persist samples.
+        activity_config.enabled &= !demo_activity;
+        let activity_expected = activity_config.enabled && activity_config.validate().is_ok();
+        let (activity_tx, mut activity_rx) = watch::channel(Default::default());
+        let mut activity_tasks = JoinSet::new();
+        activity_tasks.spawn(crate::activity::run(
+            activity_config,
+            self.store.clone(),
+            activity_tx,
+            self.activity_refresh.subscribe(),
+        ));
+        let mut activity_open = true;
         self.initialize().await;
         self.launch_source_refreshes();
         self.launch_run_refreshes();
@@ -363,6 +383,32 @@ impl RuntimeService {
 
         loop {
             tokio::select! {
+                changed = activity_rx.changed(), if activity_open => {
+                    activity_open = changed.is_ok();
+                    self.snapshot.herdr_activity = activity_rx.borrow_and_update().clone();
+                    if !activity_open && activity_expected {
+                        let activity = &mut self.snapshot.herdr_activity;
+                        activity.discovering = false;
+                        activity.discovery_error = Some("collector-unavailable".into());
+                        for endpoint in &mut activity.endpoints {
+                            if endpoint.transport != agent_launcher_core::ActivityTransportState::Disabled {
+                                endpoint.transport = agent_launcher_core::ActivityTransportState::Failed;
+                                endpoint.freshness = if endpoint.last_success_at.is_some() {
+                                    agent_launcher_core::ActivityFreshness::Stale
+                                } else {
+                                    agent_launcher_core::ActivityFreshness::NeverObserved
+                                };
+                                endpoint.error_kind = Some("collector-unavailable".into());
+                            }
+                        }
+                    }
+                    self.publish();
+                }
+                Some(result) = activity_tasks.join_next(), if !activity_tasks.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "activity collector task failed");
+                    }
+                }
                 command = self.commands.recv() => {
                     let Some(request) = command else { break };
                     if self.handle_command(request).await {
@@ -392,10 +438,19 @@ impl RuntimeService {
             }
         }
 
+        drop(activity_rx);
         self.work.abort_all();
         while self.work.join_next().await.is_some() {}
         self.notifications.abort_all();
         while self.notifications.join_next().await.is_some() {}
+        if tokio::time::timeout(Duration::from_secs(2), async {
+            while activity_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            activity_tasks.shutdown().await;
+        }
         Ok(())
     }
 
@@ -495,6 +550,8 @@ impl RuntimeService {
         self.diagnostics
             .record(operation, backend, identity.as_deref(), "started");
         if matches!(&command, RuntimeCommand::Refresh) {
+            self.activity_refresh
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
             self.refresh_waiters.push(acknowledge);
             self.launch_detection();
             self.launch_source_refreshes();
@@ -2108,6 +2165,10 @@ mod tests {
             compute: None,
             ssh: None,
             notifications: NotificationConfig { desktop: true },
+            herdr_activity: agent_launcher_core::HerdrActivityConfig {
+                enabled: false,
+                ..Default::default()
+            },
             prompt_profiles: Vec::new(),
         }
     }
@@ -2157,6 +2218,208 @@ mod tests {
             select_backend(&BackendConfig::Auto, &detections),
             Some(BackendKind::Herdr)
         );
+    }
+
+    #[tokio::test]
+    async fn activity_restores_bounded_history_and_failures_do_not_block_refresh() {
+        use agent_launcher_core::{
+            ActivityCompleteness, ActivityCounts, ActivitySample, ActivityTransportState,
+            HerdrActivityEndpointConfig,
+        };
+
+        let store = Store::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        for seconds in 1..=500 {
+            store
+                .upsert_activity_sample(&ActivitySample {
+                    sampled_at: now - chrono::Duration::seconds(seconds),
+                    counts: Some(ActivityCounts {
+                        working: 7,
+                        ..Default::default()
+                    }),
+                    expected_endpoints: 1,
+                    fresh_endpoints: 1,
+                    stale_endpoints: 0,
+                    never_observed_endpoints: 0,
+                    failed_endpoints: 0,
+                    excluded_endpoints: 0,
+                    inventory_complete: true,
+                    completeness: ActivityCompleteness::Complete,
+                })
+                .await
+                .unwrap();
+        }
+        let mut config = config();
+        config.herdr_activity.enabled = true;
+        config.herdr_activity.executable = "/nonexistent/activity-test/herdr".into();
+        config.herdr_activity.ssh_executable = "/nonexistent/activity-test/ssh".into();
+        config.herdr_activity.discover_local_sessions = false;
+        config.herdr_activity.discover_saved_profiles = false;
+        config.herdr_activity.endpoints = vec![HerdrActivityEndpointConfig::default()];
+        let backend = MockBackend::new(BackendKind::Native, true);
+        let (service, handle) = RuntimeService::new(
+            repository(),
+            vec![],
+            store.clone(),
+            runner(&[backend]),
+            config,
+        );
+        handle.attach(tokio::spawn(service.run_with_demo_activity(false)));
+        let snapshot = wait_for(&mut handle.subscribe(), |snapshot| {
+            snapshot.initialized
+                && snapshot.herdr_activity.samples.len() == 451
+                && snapshot
+                    .herdr_activity
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.transport == ActivityTransportState::Failed)
+        })
+        .await;
+        assert!(snapshot.runs.is_empty());
+        assert!(snapshot.run_events.is_empty());
+        assert!(snapshot.herdr_activity.samples.iter().any(|sample| {
+            sample
+                .counts
+                .as_ref()
+                .is_some_and(|counts| counts.working == 7)
+        }));
+        assert_eq!(
+            snapshot.herdr_activity.endpoints[0].error_kind.as_deref(),
+            Some("missing-executable")
+        );
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(1), handle.refresh())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(handle.task.lock().unwrap().is_none());
+        assert!(store.load_runs().await.unwrap().is_empty());
+        assert!(handle.subscribe().has_changed().is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_and_demo_activity_do_not_collect_or_persist() {
+        for (enabled, demo) in [(false, false), (true, true)] {
+            let store = Store::open_in_memory().await.unwrap();
+            let mut config = config();
+            config.herdr_activity.enabled = enabled;
+            config.herdr_activity.executable = "/nonexistent/activity-test/herdr".into();
+            config.herdr_activity.ssh_executable = "/nonexistent/activity-test/ssh".into();
+            let (service, handle) = RuntimeService::new(
+                repository(),
+                vec![],
+                store.clone(),
+                runner(&[MockBackend::new(BackendKind::Native, true)]),
+                config,
+            );
+            handle.attach(tokio::spawn(service.run_with_demo_activity(demo)));
+            wait_for(&mut handle.subscribe(), |snapshot| snapshot.initialized).await;
+            handle.refresh().await.unwrap();
+            handle.shutdown().await.unwrap();
+            let activity = handle.snapshot().herdr_activity;
+            assert!(!activity.enabled);
+            assert!(activity.samples.is_empty());
+            assert!(activity.endpoints.is_empty());
+            assert!(activity.discovery_error.is_none());
+            assert!(
+                store
+                    .load_activity_samples(
+                        Utc::now() - chrono::Duration::hours(1),
+                        Utc::now(),
+                        1000,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn activity_shutdown_cancels_in_flight_process_without_connection_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "activity-shutdown-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap(),
+        ));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let executable = directory.join("fake-herdr");
+        tokio::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf '%s' $$ > \"$XDG_STATE_HOME/started\"\nexec sleep 30\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let store = Store::open_in_memory().await.unwrap();
+        let mut config = config();
+        config.herdr_activity.enabled = true;
+        config.herdr_activity.executable = executable.to_string_lossy().into_owned();
+        config.herdr_activity.ssh_executable = "/nonexistent/activity-test/ssh".into();
+        config.herdr_activity.xdg_state_home = Some(directory.to_string_lossy().into_owned());
+        config.herdr_activity.discover_saved_profiles = false;
+        let (service, handle) = RuntimeService::new(
+            repository(),
+            vec![],
+            store.clone(),
+            runner(&[MockBackend::new(BackendKind::Native, true)]),
+            config,
+        );
+        handle.attach(tokio::spawn(service.run_with_demo_activity(false)));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !tokio::fs::try_exists(directory.join("started"))
+                .await
+                .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid = tokio::fs::read_to_string(directory.join("started"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle.refresh())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap()
+                .success()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake collector child must be killed and reaped");
+        assert!(
+            !store
+                .load_activity_samples(Utc::now() - chrono::Duration::minutes(1), Utc::now(), 100,)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[tokio::test]

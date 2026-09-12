@@ -1,5 +1,28 @@
 # Herdr Activity Graph: Research and Implementation Handoff
 
+## Implementation Status (2026-09-12)
+
+The user subsequently authorized implementation. The polling rollout is implemented:
+separate core telemetry/configuration types, runtime-owned read-only local/SSH
+discovery and bounded polling, aggregate SQLite history, and a freshness-aware
+working-count graph. Launcher run controls and explicit demo behavior remain separate.
+See README's Herdr Activity section and `config.example.toml` for shipped coverage.
+
+Verification: all 274 workspace tests, `just format-check`, `just lockfile-check`,
+`just lint`, and `git diff --check` passed. Tests use sanitized fixtures/fake
+executables for discovery, SSH safety, scheduling, failure recovery, persistence,
+clock rollback, shutdown, and rendering. A read-only local smoke check confirmed
+the discovery and agent-list schemas (one running session, three recognized agents).
+No live remote SSH or interactive GUI verification was performed.
+
+Remote host-wide discovery remains opt-in. Explicit XDG namespaces are supported;
+arbitrary custom socket paths are not. There is no always-on collector, streaming,
+lossless transition history, or automatic physical-host alias detection. Clock
+rollback invalidation becomes durable when its database reset commits; a crash
+before that point cannot retroactively establish the correct clock history.
+
+The original research and authorization record follows below.
+
 ## Scope and Authorization
 
 This document records read-only research and a proposed implementation plan. The

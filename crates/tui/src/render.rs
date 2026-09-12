@@ -6,11 +6,13 @@ use agent_launcher_core::{
 use ratatui::{
     Frame,
     layout::{Alignment, Margin, Rect},
-    style::Style,
+    style::{Modifier, Style},
+    symbols::Marker,
     text::{Line, Span},
     widgets::{
         Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
         Sparkline,
+        canvas::{Canvas, Line as CanvasLine, Points},
     },
 };
 
@@ -123,7 +125,7 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             panel.width,
             chart_height,
         );
-        draw_agent_activity(frame, chart, app);
+        draw_agent_activity(frame, chart, app, snapshot);
     }
 
     let logo = Rect::new(panel.x, panel.y, panel.width, logo_height);
@@ -209,7 +211,16 @@ fn draw_logo(frame: &mut Frame<'_>, area: Rect, full: bool) {
     }
 }
 
-fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn draw_agent_activity(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    snapshot: &RuntimeSnapshot,
+) {
+    if std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY").is_none() {
+        draw_live_activity(frame, area, &snapshot.herdr_activity, chrono::Utc::now());
+        return;
+    }
     if area.width < 8 || area.height < 4 {
         return;
     }
@@ -221,7 +232,6 @@ fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if inner.height < 2 {
         return;
     }
-    let demo = std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY").is_some();
     let show_timeline = inner.height >= 3 && inner.width >= 32;
     let graph = Rect::new(
         inner.x,
@@ -229,32 +239,17 @@ fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         inner.width,
         inner.height - 1 - u16::from(show_timeline),
     );
-    let data = if demo {
-        demo_activity(graph.width, app.tick)
-    } else {
-        app.agent_activity.sparkline(graph.width as usize)
-    };
-    let color = if demo {
-        theme::primary()
-    } else {
-        activity_color(app)
-    };
+    let data = demo_activity(graph.width, app.tick);
+    let color = theme::primary();
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("agent activity", Style::new().fg(color).bold()),
-            Span::styled(
-                if demo {
-                    "  ·  demo"
-                } else {
-                    "  ·  live"
-                },
-                Style::new().fg(theme::muted()),
-            ),
+            Span::styled("  ·  demo", Style::new().fg(theme::muted())),
         ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let status = if demo {
+    let status = {
         let working = data.last().copied().unwrap_or(0).div_ceil(25);
         if working == 0 {
             "quiet · 15m".to_owned()
@@ -263,26 +258,6 @@ fn draw_agent_activity(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         } else {
             format!("{working} working · 15m")
         }
-    } else if inner.width < 64 && app.agent_activity.attention > 0 {
-        format!(
-            "{}w · {}! · 15m",
-            app.agent_activity.working, app.agent_activity.attention
-        )
-    } else if inner.width < 64 && app.agent_activity.working > 0 {
-        format!("{}w · 15m", app.agent_activity.working)
-    } else if inner.width < 64 && app.agent_activity.idle > 0 {
-        format!("{} idle · 15m", app.agent_activity.idle)
-    } else if app.agent_activity.attention > 0 {
-        format!(
-            "{} working · {} attention · 15m",
-            app.agent_activity.working, app.agent_activity.attention
-        )
-    } else if app.agent_activity.working > 0 {
-        format!("{} working · 15m", app.agent_activity.working)
-    } else if app.agent_activity.idle > 0 {
-        format!("{} idle · 15m", app.agent_activity.idle)
-    } else {
-        "quiet · 15m".to_owned()
     };
     frame.render_widget(
         Paragraph::new(status)
@@ -340,13 +315,208 @@ fn demo_activity(width: u16, tick: u32) -> Vec<u64> {
         .collect()
 }
 
-fn activity_color(app: &AppState) -> ratatui::style::Color {
-    if app.agent_activity.attention > 0 {
-        theme::error()
-    } else if app.agent_activity.working > 0 {
-        theme::primary()
+fn draw_live_activity(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &agent_launcher_core::HerdrActivitySnapshot,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use agent_launcher_core::ActivityCompleteness;
+
+    if area.width < 8 || area.height < 4 {
+        return;
+    }
+    let panel = Block::new()
+        .style(Style::new().bg(theme::panel()))
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
+    let current = snapshot
+        .enabled
+        .then(|| crate::activity::current_sample(snapshot, now))
+        .flatten();
+    let freshness = if !snapshot.enabled {
+        "disabled".to_owned()
+    } else if let Some(sample) = current {
+        format!(
+            "{}/{} fresh",
+            sample.fresh_endpoints, sample.expected_endpoints
+        )
     } else {
-        theme::secondary()
+        "unobserved".to_owned()
+    };
+    let incomplete = snapshot.discovery_error.is_some()
+        || current.is_some_and(|s| !s.inventory_complete)
+        || (snapshot.discover_remote_sessions && (snapshot.discovering || current.is_none()));
+    let scope = if incomplete {
+        "discovery incomplete"
+    } else if snapshot.discover_remote_sessions {
+        "discovered-session coverage"
+    } else {
+        "configured-session coverage"
+    };
+    let mut coverage = if !snapshot.enabled {
+        if inner.width >= 64 {
+            "Herdr agent activity | disabled"
+        } else {
+            "Herdr disabled"
+        }
+        .to_owned()
+    } else if inner.width >= 64 {
+        format!("Herdr agent activity | {scope} | {freshness}")
+    } else if inner.width >= 40 {
+        let scope = if incomplete {
+            scope
+        } else if snapshot.discover_remote_sessions {
+            "discovered sessions"
+        } else {
+            "configured sessions"
+        };
+        format!("Herdr {freshness} | {scope}")
+    } else {
+        let scope = if incomplete {
+            "incomplete"
+        } else if snapshot.discover_remote_sessions {
+            "disc"
+        } else {
+            "cfg"
+        };
+        format!("{freshness} {scope}")
+    };
+    if snapshot.persistence_error.is_some() {
+        coverage.push_str(" | persistence error");
+    }
+    if snapshot.enabled && snapshot.discovering {
+        coverage.push_str(" | discovering");
+    }
+    if let Some(s) = current {
+        coverage.push_str(&format!(
+            " | {} stale | {} failed | {} never observed | {} excluded",
+            s.stale_endpoints, s.failed_endpoints, s.never_observed_endpoints, s.excluded_endpoints
+        ));
+    }
+    let data = crate::activity::buckets(snapshot, usize::from(inner.width) * 2, now);
+    let max = data
+        .iter()
+        .filter_map(|bucket| bucket.working)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let counters = current
+        .filter(|s| s.completeness != ActivityCompleteness::Missing)
+        .and_then(|s| s.counts.as_ref().map(|c| (s, c)))
+        .map_or_else(
+            || "counts unavailable".to_owned(),
+            |(s, c)| {
+                format!(
+                    "{}{} working | {} blocked | {} unseen done | {} idle | {} unknown",
+                    if s.completeness == ActivityCompleteness::Partial || !s.inventory_complete {
+                        ">="
+                    } else {
+                        ""
+                    },
+                    c.working,
+                    c.blocked,
+                    c.unseen_done,
+                    c.idle,
+                    c.unknown
+                )
+            },
+        );
+    // Compact panels reserve their first row for coverage, not optional counters.
+    let show_counters = inner.height >= 4;
+    let show_labels = inner.height >= 3;
+    let graph = Rect::new(
+        inner.x,
+        inner.y + 1 + u16::from(show_counters),
+        inner.width,
+        inner
+            .height
+            .saturating_sub(1 + u16::from(show_counters) + u16::from(show_labels)),
+    );
+    frame.render_widget(
+        Paragraph::new(coverage).style(Style::new().fg(theme::secondary())),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    if show_counters {
+        frame.render_widget(
+            Paragraph::new(counters).style(Style::new().fg(theme::text())),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+    draw_activity_trace(frame, graph, &data, max);
+    if show_labels {
+        let labels = format!(
+            "count 0-{max} peak-per-bucket | -15m..now | blank gap; underlined dots partial; bottom zero"
+        );
+        frame.render_widget(
+            Paragraph::new(labels).style(Style::new().fg(theme::muted())),
+            Rect::new(inner.x, graph.bottom(), inner.width, 1),
+        );
+    }
+    render_bottom_edge(
+        area,
+        theme::primary(),
+        theme::panel(),
+        theme::bg(),
+        frame.buffer_mut(),
+    );
+}
+
+fn draw_activity_trace(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &[crate::activity::ActivityBucket],
+    max: u64,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let top = u128::from(area.height) * 4 - 1;
+    let max = u128::from(max.max(1));
+    frame.render_widget(
+        Canvas::default()
+            .marker(Marker::Braille)
+            .background_color(theme::panel())
+            .x_bounds([0.0, f64::from(area.width) * 2.0 - 1.0])
+            .y_bounds([0.0, top as f64])
+            .paint(|ctx| {
+                let mut previous = None;
+                for (index, bucket) in data.iter().take(usize::from(area.width) * 2).enumerate() {
+                    let Some(count) = bucket.working else {
+                        previous = None;
+                        continue;
+                    };
+                    // Quantize only to Braille dots, with exact arithmetic even at u64::MAX.
+                    let y = ((u128::from(count).min(max) * top + max / 2) / max) as f64;
+                    let x = index as f64;
+                    ctx.draw(&Points {
+                        coords: &[(x, y)],
+                        color: theme::primary(),
+                    });
+                    // Partial buckets may contain hidden gaps: never interpolate into or out of them.
+                    if !bucket.partial {
+                        if let Some((x1, y1)) = previous {
+                            ctx.draw(&CanvasLine::new(x1, y1, x, y, theme::primary()));
+                        }
+                        previous = Some((x, y));
+                    } else {
+                        previous = None;
+                    }
+                }
+            }),
+        area,
+    );
+    // Flat lines and isolated points can have identical dots. Underline partial cells
+    // without replacing their glyphs; a cell shared with complete data stays conservative.
+    for (index, bucket) in data.iter().take(usize::from(area.width) * 2).enumerate() {
+        if bucket.partial
+            && let Some(count) = bucket.working
+        {
+            let y = (u128::from(count).min(max) * top + max / 2) / max;
+            frame.buffer_mut()[(area.x + (index / 2) as u16, area.y + ((top - y) / 4) as u16)]
+                .set_style(Style::new().add_modifier(Modifier::UNDERLINED));
+        }
     }
 }
 
@@ -1882,6 +2052,54 @@ fn draw_debug_overlay(
             lines.push(format!("  Message: {message}"));
         }
     }
+    let activity = &snapshot.herdr_activity;
+    lines.push(format!(
+        "Herdr activity: {}",
+        if activity.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+    if activity.enabled
+        || !activity.endpoints.is_empty()
+        || activity.discovery_error.is_some()
+        || activity.persistence_error.is_some()
+    {
+        lines.push(format!(
+            "  Remote session discovery configured: {} | discovering: {}",
+            activity.discover_remote_sessions, activity.discovering
+        ));
+        lines.push(format!(
+            "  Discovery error: {}",
+            activity_diagnostic_code(activity.discovery_error.as_deref())
+        ));
+        lines.push(format!(
+            "  Persistence error: {}",
+            activity_diagnostic_code(activity.persistence_error.as_deref())
+        ));
+        for endpoint in &activity.endpoints {
+            // IDs are user-visible metadata, not command output; escape terminal controls.
+            lines.push(format!(
+                "  Endpoint ID: {}",
+                endpoint.endpoint_id.escape_debug()
+            ));
+            lines.push(format!(
+                "    Transport: {:?} | Freshness: {:?}",
+                endpoint.transport, endpoint.freshness
+            ));
+            lines.push(format!(
+                "    Error kind: {}",
+                activity_diagnostic_code(endpoint.error_kind.as_deref())
+            ));
+            lines.push(format!(
+                "    Last success: {}",
+                endpoint
+                    .last_success_at
+                    .map_or_else(|| "never".into(), |time| time.to_rfc3339())
+            ));
+        }
+    }
     lines.push(format!("Sources: {}", snapshot.sources.len()));
     for source in &snapshot.sources {
         lines.push(format!(
@@ -1916,6 +2134,22 @@ fn draw_debug_overlay(
         .style(Style::new().fg(theme::muted())),
         Rect::new(popup.x, body.bottom(), width, 1),
     );
+}
+
+fn activity_diagnostic_code(value: Option<&str>) -> &str {
+    match value {
+        None => "none",
+        Some(code)
+            if !code.is_empty()
+                && code.len() <= 80
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
+        {
+            code
+        },
+        Some(_) => "invalid diagnostic code",
+    }
 }
 
 fn worktree_manager_label(snapshot: &RuntimeSnapshot) -> &'static str {
@@ -3844,36 +4078,384 @@ mod tests {
     #[test]
     fn tall_inbox_uses_upper_whitespace_for_live_agent_activity() {
         let mut snapshot = normal_snapshot();
+        snapshot.herdr_activity.enabled = true;
         let mut app = AppState {
             layout: crate::LayoutMode::Fixed,
             ..Default::default()
         };
-        app.agent_activity.record(&snapshot);
-
         let before = render(112, 48, &snapshot, &mut app);
         let now = Utc::now();
-        snapshot.runs.push(RunSummary {
-            id: "run-live".to_owned(),
-            issue_key: snapshot.issues[0].key.canonical(),
-            workspace: None,
-            agent: "pi".to_owned(),
-            state: RunState::Running,
-            message: None,
-            session_id: None,
-            started_at: now,
-            updated_at: now,
-        });
-        app.agent_activity.record(&snapshot);
+        snapshot
+            .herdr_activity
+            .samples
+            .push(crate::activity::sample(
+                now,
+                1,
+                agent_launcher_core::ActivityCompleteness::Complete,
+            ));
         let after = render(112, 48, &snapshot, &mut app);
 
-        assert!(before.contains("agent activity  ·  live"));
-        assert!(before.contains("quiet · 15m"));
-        for label in ["-15m", "-10m", "-5m", "now"] {
+        assert!(before.contains("Herdr agent activity"));
+        assert!(before.contains("unobserved"));
+        assert!(!before.contains("quiet"));
+        for label in ["count 0-1", "peak-per-bucket", "15m"] {
             assert!(before.contains(label));
         }
         assert_ne!(before, after);
-        assert!(after.contains("1 working · 15m"));
+        assert!(after.contains("1 working | 0 blocked | 0 unseen done | 0 idle | 0 unknown"));
         assert!(after.contains("Repair runtime dispatch"));
+    }
+
+    #[test]
+    fn live_activity_counts_markers_and_narrow_coverage() {
+        use agent_launcher_core::{ActivityCompleteness, HerdrActivitySnapshot};
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for width in [24, 48, 64, 112, 180, 454] {
+            for count in [0, 1, 3, 1000, u64::MAX] {
+                let mut sample = crate::activity::sample(now, count, ActivityCompleteness::Partial);
+                sample.fresh_endpoints = 1;
+                sample.expected_endpoints = 2;
+                let snapshot = HerdrActivitySnapshot {
+                    enabled: true,
+                    samples: vec![sample],
+                    ..Default::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                terminal
+                    .draw(|frame| draw_live_activity(frame, frame.area(), &snapshot, now))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = (0..8)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("1/2 fresh"), "{width}: {text}");
+                assert!(!text.contains('?'));
+                assert!(!text.contains('~'));
+                assert!(text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)));
+                if width >= 112 {
+                    assert!(text.contains(&format!("count 0-{} peak-per-bucket", count.max(1))));
+                    assert!(text.contains(&format!(">={count} working")));
+                    assert!(text.contains("discovery incomplete"));
+                }
+            }
+        }
+        let snapshot = HerdrActivitySnapshot {
+            enabled: true,
+            samples: vec![crate::activity::sample(
+                now,
+                0,
+                ActivityCompleteness::Complete,
+            )],
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(454, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_live_activity(frame, frame.area(), &snapshot, now))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(451, 5)].symbol(), "\u{2840}");
+        assert_eq!(buffer[(450, 5)].symbol(), " ");
+    }
+
+    fn trace_dots(
+        width: u16,
+        height: u16,
+        data: &[(Option<u64>, bool)],
+        max: u64,
+    ) -> Vec<(u16, u16)> {
+        let data = data
+            .iter()
+            .map(|&(working, partial)| crate::activity::ActivityBucket { working, partial })
+            .collect::<Vec<_>>();
+        let mut terminal = Terminal::new(TestBackend::new(width.max(1), height.max(1))).unwrap();
+        terminal
+            .draw(|frame| draw_activity_trace(frame, Rect::new(0, 0, width, height), &data, max))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut dots = Vec::new();
+        for x in 0..width {
+            for y in 0..height {
+                let glyph = buffer[(x, y)].symbol().chars().next().unwrap();
+                if glyph == ' ' {
+                    continue;
+                }
+                assert!(('\u{2801}'..='\u{28ff}').contains(&glyph), "{glyph:?}");
+                let bits = glyph as u32 - 0x2800;
+                for (dx, masks) in [[1, 2, 4, 64], [8, 16, 32, 128]].iter().enumerate() {
+                    for (dy, mask) in masks.iter().enumerate() {
+                        if bits & mask != 0 {
+                            dots.push((x * 2 + dx as u16, (height - 1 - y) * 4 + 3 - dy as u16));
+                        }
+                    }
+                }
+            }
+        }
+        dots.sort_unstable();
+        dots
+    }
+
+    #[test]
+    fn braille_trace_preserves_two_horizontal_and_four_vertical_positions_per_cell() {
+        let data = [0, 1, 2, 3].map(|n| (Some(n), true));
+        assert_eq!(trace_dots(2, 1, &data, 3), [(0, 0), (1, 1), (2, 2), (3, 3)]);
+        for count in 0..8 {
+            assert_eq!(trace_dots(1, 2, &[(Some(count), false)], 7), [(
+                0,
+                count as u16
+            )]);
+        }
+        assert_eq!(trace_dots(1, 2, &[(Some(u64::MAX), false)], u64::MAX), [(
+            0, 7
+        )]);
+        assert_eq!(
+            trace_dots(1, 2, &[(Some(u64::MAX / 2), false)], u64::MAX),
+            [(0, 3)]
+        );
+    }
+
+    #[test]
+    fn braille_trace_connects_only_adjacent_complete_buckets() {
+        let complete = [(Some(0), false), (Some(7), false)];
+        let connected = trace_dots(1, 2, &complete, 7);
+        assert_eq!(connected.len(), 8);
+        assert!(connected.contains(&(0, 0)));
+        assert!(connected.contains(&(1, 7)));
+        for partial in [
+            [(Some(0), true), (Some(7), false)],
+            [(Some(0), false), (Some(7), true)],
+            [(Some(0), true), (Some(7), true)],
+        ] {
+            // Compare dot geometry, not color: incomplete observations never gain interpolated counts.
+            assert_eq!(trace_dots(1, 2, &partial, 7), [(0, 0), (1, 7)]);
+        }
+        assert_eq!(
+            trace_dots(
+                2,
+                2,
+                &[(Some(0), false), (None, false), (Some(7), false)],
+                7
+            ),
+            [(0, 0), (2, 7)]
+        );
+        assert_eq!(
+            trace_dots(
+                2,
+                2,
+                &[
+                    (Some(0), false),
+                    (None, true),
+                    (None, true),
+                    (Some(7), false)
+                ],
+                7
+            ),
+            [(0, 0), (3, 7)]
+        );
+    }
+
+    #[test]
+    fn braille_trace_zero_is_visible_and_empty_or_tiny_areas_are_safe() {
+        assert_eq!(
+            trace_dots(1, 1, &[(Some(0), false), (Some(0), false)], 0),
+            [(0, 0), (1, 0)]
+        );
+        assert_eq!(trace_dots(1, 1, &[(Some(0), true), (None, true)], 1), [(
+            0, 0
+        )]);
+        for (width, height) in [(0, 0), (0, 1), (1, 0), (1, 1), (2, 3)] {
+            assert!(trace_dots(width, height, &[], 0).is_empty());
+            assert!(trace_dots(width, height, &[(None, true); 4], 1).is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_flat_trace_has_noncolor_marker_without_replacing_braille_dots() {
+        use crate::activity::ActivityBucket;
+        let mut terminal = Terminal::new(TestBackend::new(3, 1)).unwrap();
+        for count in [0, 1] {
+            terminal
+                .draw(|frame| {
+                    draw_activity_trace(
+                        frame,
+                        frame.area(),
+                        &[
+                            ActivityBucket {
+                                working: Some(count),
+                                partial: false,
+                            },
+                            ActivityBucket {
+                                working: Some(count),
+                                partial: false,
+                            },
+                            ActivityBucket {
+                                working: Some(count),
+                                partial: true,
+                            },
+                            ActivityBucket {
+                                working: Some(count),
+                                partial: true,
+                            },
+                            ActivityBucket::default(),
+                            ActivityBucket::default(),
+                        ],
+                        1,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 0)].symbol(), buffer[(1, 0)].symbol());
+            assert!(!buffer[(0, 0)].modifier.contains(Modifier::UNDERLINED));
+            assert!(buffer[(1, 0)].modifier.contains(Modifier::UNDERLINED));
+            assert_eq!(buffer[(2, 0)].symbol(), " ");
+            assert!(!buffer[(2, 0)].modifier.contains(Modifier::UNDERLINED));
+        }
+    }
+
+    #[test]
+    fn live_activity_exposes_all_counters_coverage_and_sanitized_error_flags() {
+        use agent_launcher_core::{ActivityCompleteness, ActivityCounts, HerdrActivitySnapshot};
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut sample = crate::activity::sample(now, 7, ActivityCompleteness::Partial);
+        sample.counts = Some(ActivityCounts {
+            working: 7,
+            blocked: 2,
+            unseen_done: 1,
+            idle: 3,
+            unknown: 4,
+        });
+        sample.expected_endpoints = 5;
+        sample.fresh_endpoints = 2;
+        sample.stale_endpoints = 1;
+        sample.failed_endpoints = 2;
+        sample.never_observed_endpoints = 2;
+        sample.excluded_endpoints = 3;
+        let snapshot = HerdrActivitySnapshot {
+            enabled: true,
+            samples: vec![sample],
+            persistence_error: Some("private diagnostic".to_owned()),
+            discovery_error: Some("private diagnostic".to_owned()),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(240, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_live_activity(frame, frame.area(), &snapshot, now))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..8)
+            .map(|y| {
+                (0..240)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in [
+            ">=7 working | 2 blocked | 1 unseen done | 3 idle | 4 unknown",
+            "2/5 fresh",
+            "1 stale",
+            "2 failed",
+            "2 never observed",
+            "3 excluded",
+            "discovery incomplete",
+            "persistence error",
+        ] {
+            assert!(text.contains(label), "{label}: {text}");
+        }
+        assert!(!text.contains("private diagnostic"));
+    }
+
+    #[test]
+    fn live_activity_scope_and_freshness_survive_default_and_narrow_widths() {
+        use agent_launcher_core::{ActivityCompleteness, HerdrActivitySnapshot};
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for width in [48, 64, 104] {
+            for remote in [false, true] {
+                for state in [
+                    "complete",
+                    "failed",
+                    "partial",
+                    "discovering",
+                    "unobserved",
+                    "disabled",
+                ] {
+                    let mut sample =
+                        crate::activity::sample(now, 3, ActivityCompleteness::Complete);
+                    sample.expected_endpoints = 5;
+                    sample.fresh_endpoints = 4;
+                    sample.stale_endpoints = 1;
+                    sample.failed_endpoints = 1;
+                    sample.excluded_endpoints = 2;
+                    sample.inventory_complete = state != "partial";
+                    let snapshot = HerdrActivitySnapshot {
+                        enabled: state != "disabled",
+                        discover_remote_sessions: remote,
+                        discovering: state == "discovering",
+                        discovery_error: (state == "failed").then(|| "permission".into()),
+                        persistence_error: Some("sample-write-failed".into()),
+                        samples: if state == "unobserved" {
+                            vec![]
+                        } else {
+                            vec![sample]
+                        },
+                        ..Default::default()
+                    };
+                    let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                    terminal
+                        .draw(|frame| draw_live_activity(frame, frame.area(), &snapshot, now))
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let header = (0..width)
+                        .map(|x| buffer[(x, 1)].symbol())
+                        .collect::<String>();
+                    if state == "disabled" {
+                        assert!(header.contains("disabled"), "{header}");
+                        assert!(!header.contains("unobserved"));
+                        assert!(!header.contains("fresh"));
+                        continue;
+                    }
+                    assert!(
+                        header.contains(if state == "unobserved" {
+                            "unobserved"
+                        } else {
+                            "4/5 fresh"
+                        }),
+                        "{width} {state}: {header}"
+                    );
+                    let incomplete = matches!(state, "failed" | "partial")
+                        || (remote && matches!(state, "discovering" | "unobserved"));
+                    let scope = if incomplete {
+                        if width >= 48 {
+                            "discovery incomplete"
+                        } else {
+                            "incomplete"
+                        }
+                    } else if remote {
+                        if width == 104 {
+                            "discovered-session coverage"
+                        } else if width >= 48 {
+                            "discovered sessions"
+                        } else {
+                            "disc"
+                        }
+                    } else if width == 104 {
+                        "configured-session coverage"
+                    } else if width >= 48 {
+                        "configured sessions"
+                    } else {
+                        "cfg"
+                    };
+                    assert!(header.contains(scope), "{width} {state}: {header}");
+                    if incomplete {
+                        assert!(!header.contains("discovered"));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4163,6 +4745,85 @@ mod tests {
         snapshot.sources.clear();
         render(112, 40, &snapshot, &mut app);
         assert_eq!(app.debug_scroll, 0);
+    }
+
+    #[test]
+    fn debug_exposes_activity_endpoint_health_and_sanitized_reasons() {
+        use agent_launcher_core::{
+            ActivityEndpointHealth, ActivityFreshness, ActivityTransportState,
+        };
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.herdr_activity.enabled = true;
+        snapshot.herdr_activity.discovery_error = Some("authentication".into());
+        snapshot.herdr_activity.persistence_error = Some("sample-write-failed".into());
+        for reason in [
+            "permission",
+            "authentication",
+            "server-stopped",
+            "unsupported-method",
+        ] {
+            snapshot
+                .herdr_activity
+                .endpoints
+                .push(ActivityEndpointHealth {
+                    endpoint_id: format!("local/{reason}"),
+                    transport: ActivityTransportState::Failed,
+                    freshness: ActivityFreshness::NeverObserved,
+                    last_success_at: None,
+                    error_kind: Some(reason.into()),
+                });
+        }
+        snapshot
+            .herdr_activity
+            .endpoints
+            .push(ActivityEndpointHealth {
+                endpoint_id: "local/default\n\u{1b}[31m".into(),
+                transport: ActivityTransportState::Reachable,
+                freshness: ActivityFreshness::Stale,
+                last_success_at: Some(chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap()),
+                error_kind: Some("ssh://user:secret@host/raw-output\n\u{1b}".into()),
+            });
+        for width in [48, 104] {
+            let mut app = AppState {
+                debug_overlay: true,
+                ..Default::default()
+            };
+            let mut text = render(width, 30, &snapshot, &mut app);
+            for scroll in 1..=app.debug_scroll_max {
+                app.debug_scroll = scroll;
+                text.push_str(&render(width, 30, &snapshot, &mut app));
+            }
+            for label in [
+                "Herdr activity: enabled",
+                "Discovery error: authentication",
+                "Persistence error: sample-write-failed",
+                "Endpoint ID: local/permission",
+                "Transport: Failed",
+                "Freshness: NeverObserved",
+                "Transport: Reachable",
+                "Freshness: Stale",
+                "Last success: never",
+                "invalid diagnostic code",
+            ] {
+                assert!(text.contains(label), "{width} missing {label}");
+            }
+            for reason in [
+                "permission",
+                "authentication",
+                "server-stopped",
+                "unsupported-method",
+            ] {
+                assert!(text.contains(&format!("Error kind: {reason}")));
+            }
+            assert!(text.contains("local/default\\n\\u{1b}[31m"));
+            assert!(!text.contains("secret"));
+            assert!(!text.contains('\u{1b}'));
+        }
+        assert_eq!(activity_diagnostic_code(None), "none");
+        assert_eq!(
+            activity_diagnostic_code(Some("future-reason_code")),
+            "future-reason_code"
+        );
     }
 
     #[test]

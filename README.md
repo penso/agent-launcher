@@ -49,6 +49,54 @@ replaces that metadata. Do not forward Herdr context variables to unrelated term
 See Herdr's [title synchronization](https://github.com/herdrdev/herdr/blob/v0.9.0/src/app/terminal_titles.rs)
 and [tab rename implementation](https://github.com/herdrdev/herdr/blob/v0.9.0/src/app/api/tabs.rs).
 
+### Herdr Activity
+
+The live top graph shows the **number of Herdr-recognized working agents**, not a
+synthetic activity score. It includes agents launched outside launcher and is
+independent of the selected repository, issue, backend, or Herdr UI machine.
+Blocked, idle, unseen-done, and unknown agents have separate counters. Herdr's
+`done` means an unseen result, not verified task success; `unknown` is a semantic
+state, not a disconnected host.
+
+Default coverage includes discovered running local sessions, enabled saved SSH
+target/session profiles, and explicit `[herdr_activity]` endpoints. Other sessions
+on remote hosts are **not** queried unless `discover_remote_sessions = true` is
+configured. Disabled profiles and explicit exclusions win over discovery. Use
+alias groups to deduplicate SSH aliases or local/loopback routes that identify the
+same account and host; physical-host equivalence cannot be inferred automatically.
+See `config.example.toml` for endpoints, exclusions, aliases, and XDG namespaces.
+Set `enabled = false` in `[herdr_activity]` to turn collection off.
+
+Collection uses read-only CLI commands and authenticated, noninteractive OpenSSH.
+It never attaches, starts servers, installs integrations, or upgrades Herdr. SSH
+host keys must already be trusted; agent/X11 forwarding is disabled. Inherited
+Herdr routing and XDG overrides are cleared, with optional explicit XDG namespaces.
+Arbitrary custom socket paths, unconfigured hosts, inaccessible accounts, and
+processes Herdr does not recognize are outside coverage.
+
+Inventories are polled every two seconds, with at most four concurrent requests,
+ten-second deadlines, and bounded retry backoff. Discovery refreshes every minute
+and on manual refresh. Observations expire after ten seconds; a recent observation
+can remain fresh while its next request has failed, and both conditions are shown.
+Partial counts are lower bounds. Debug (`Ctrl+G`, then `g`) shows sanitized discovery,
+persistence, and per-endpoint failure reasons without terminal output.
+
+The graph retains 15 minutes and shows the peak working count per display bucket,
+with a count scale rather than a 0-100 score. The Braille trace uses two buckets per
+character and four vertical dots per row. Adjacent complete buckets are connected;
+incomplete buckets are unconnected lower-bound dots with underlined cells (also
+distinct on flat traces), gaps are blank, and observed zero sits visibly on the
+bottom edge. Only aggregate counts and coverage are stored
+in the existing local SQLite database, with 30-minute retention. Restart restores
+original sample times; downtime and missed transitions are not reconstructed.
+Clock rollback invalidates affected stored history once the reset commits.
+
+Polling is sampled observation, not a lossless transition log or work-throughput
+measurement. Collection runs only while launcher runs. Setting
+`AGENT_LAUNCHER_DEMO_ACTIVITY` to any value, including an empty value, explicitly
+selects the existing labeled demo and disables real collection and sample writes;
+failed telemetry never falls back to demo data.
+
 ## Dispatch
 
 ### Diagnostics
