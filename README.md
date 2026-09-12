@@ -17,6 +17,18 @@ agent-launcher --remote git@gitlab.com:group/repository.git
 HTTPS, `git://`, `ssh://`, and SCP-style Git URLs are supported. The override is also used as the
 repository identity when selecting or creating a workspace backend.
 
+### Layout
+
+`--layout flexible` (the default) fills the available width and height with side
+padding. Taller terminals show more Issues/PR rows, with a compact activity panel
+above the normally sized, horizontally centered logo. Legends and command hints
+stay above the global footer at the bottom. Extra table width goes primarily to
+issue and PR titles; the activity panel and detail view also use the available width.
+Use `agent-launcher --layout fixed` for the original centered, 104-column-capped,
+fixed-height inbox. Detail views use the available height in both modes. Command
+and debug overlays retain their existing sizing. The flag can be combined
+with `--remote` and applies only to the current launch.
+
 ### Terminal Title
 
 The interactive TUI sets its own terminal title to `launcher` using Crossterm's OSC title
@@ -89,12 +101,16 @@ Undefined variables are rejected before an agent is started.
 
 ### PR Reviews
 
-The PRs tab shows GitHub PR numbers, titles, authors, a four-square diff indicator, and lifecycle
-status on one line. One to four filled squares mean 1-10, 11-100, 101-1000, or over 1000 changed
-lines; unused squares are dim outlines. Green/red squares approximate the addition/deletion ratio,
+The PRs tab shows GitHub PR numbers, titles, authors, activity, a diff indicator, and lifecycle
+status on one line. The indicator uses four squares below 120 table columns, six at
+120-159, and eight at 160 or more, based on rendered table width after padding and
+scrollbar space. Fixed layout retains four squares. Totals of 1-10, 11-100, 101-1000,
+or over 1000 changed lines fill 25%, 50%, 75%, or 100% of the indicator, rounded to
+the nearest cell (ties up, at least one). Unused squares are dim outlines.
+Green/red squares approximate the addition/deletion ratio,
 with both colors shown for mixed changes when at least two squares are filled. A single square
-uses the dominant color (green on ties). Zero changes show four outlines; either count unknown
-shows `?` followed by three outlines. PR details retain exact `+/-` counts.
+uses the dominant color (green on ties). Zero changes show all outlines; either count unknown
+shows `?` followed by outlines to fill the indicator. PR details retain exact `+/-` counts.
 Each tab retains its own filter and selection. Full refreshes
 retrieve open and draft PRs separately from issues; incremental updates also show closed/merged
 transitions until the next full reconciliation. Failed list requests preserve the cached inbox.
@@ -113,6 +129,35 @@ Backoff resets after a successful sync and lasts for the source's runtime lifeti
 restarts. No command-dispatch thread sleeps; the next refresh after expiry resumes syncing.
 Use `gh auth login --hostname github.com` to authenticate if needed, then restart the launcher
 so it picks up the credentials.
+
+### Item Activity
+
+The aligned `activity` column shows absolute engagement, not activity within a recent
+time window and not completion progress. `≡` means discussion comments; `○` means PR
+commits. Counts below ten use warm muted text; larger counts use the warm accent.
+Zero means the API reported zero; `?` means unavailable or not yet enriched.
+For PRs, discussion combines regular and inline review comments when both are known.
+If only one is known, `+` marks a partial total (for example `≡5+`, even `≡0+`).
+Large counts are truncated to whole units (`1k`, `2M`, etc.); details show exact separate
+comments, review comments, and commit counts, with `unknown` for missing fields.
+
+GitHub issues use REST `comments`; PRs use `comments`, `review_comments`, and `commits`
+from the existing PR detail fetches, plus comments from issue-list PR summaries when
+available. Omitted list/detail fields remain unknown or retain previously known counts.
+GitLab issues use `user_notes_count` when supplied; Beads has no available activity counts.
+Review comments count inline comments, not review submissions, approvals, or events.
+No review/event/commit counting endpoints are called. Enrichment keeps the existing
+ten-detail-per-sync budget, including a one-time refresh of older cached PR revisions.
+Changed update timestamps invalidate detail revisions; counts can remain stale while
+waiting for enrichment or during API failures. Missing activity fields alone do not
+cause repeated detail requests for an otherwise successfully fetched revision.
+
+Issues show discussion at 72 or more rendered table columns. PRs show discussion at
+76 columns and add commits at 100; below those breakpoints activity hides before
+core ID, status, or diff columns are sacrificed. Padding and scrollbars are excluded
+from these widths. Titles retain the flexible space beyond the bounded metadata columns.
+
+### Review Dispatch
 
 Use **Review PR** on the selected PR to launch the configured agent and, for native workspaces,
 choose a compute target. Reviews bypass issue prompt profiles and use a dedicated prompt with
@@ -138,6 +183,7 @@ The agent environment needs authenticated GitHub CLI or Git access to the PR and
 | `Ctrl+G`, then `d` | Dispatch issue / review PR | |
 | `Ctrl+G`, then `r` | Refresh | |
 | `Ctrl+G`, then `s` | Choose sorting | |
+| `Ctrl+G`, then `g` | Open Debug runtime status | |
 | `d` | | Dispatch issue / review PR |
 | `r` | | Refresh |
 | `i` | | Send input |
@@ -145,6 +191,13 @@ The agent environment needs authenticated GitHub CLI or Git access to the PR and
 | `s` | | Stop run |
 | `Esc` | Quit | Return to inbox |
 | `Ctrl-C` | Quit | Quit |
+
+Debug shows the live snapshot's selected backend and agent, detected worktree manager,
+backend availability, compute targets, local repository path and effective host/repository,
+source connection messages (including throttling), and last refresh. It does not read
+configuration or environment variables or display the raw remote URL. Use arrows,
+Page Up/Down, Home/End, or the mouse wheel over the pane to scroll; Esc closes it
+without changing the inbox search or selection.
 
 Click a tab to switch between Issues and PRs. Hover a row to select it, then click to open its details. Mouse-wheel
 scrolling over the list moves three items at a time; over details it moves three lines. Overlays

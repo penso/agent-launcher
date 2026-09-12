@@ -86,6 +86,8 @@ pub struct Issue {
     pub state: String,
     #[serde(default)]
     pub pull_request: Option<PullRequestMetadata>,
+    #[serde(default)]
+    pub activity: Option<ItemActivity>,
     pub url: Option<String>,
     pub author: Option<String>,
     pub labels: Vec<String>,
@@ -94,6 +96,22 @@ pub struct Issue {
     pub priority: Option<i64>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Absolute provider-reported engagement counts, not recent activity.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ItemActivity {
+    pub comments: Option<u64>,
+    pub review_comments: Option<u64>,
+    pub commits: Option<u64>,
+}
+
+impl ItemActivity {
+    pub fn retain_known(&mut self, previous: Self) {
+        self.comments = self.comments.or(previous.comments);
+        self.review_comments = self.review_comments.or(previous.review_comments);
+        self.commits = self.commits.or(previous.commits);
+    }
 }
 
 impl Issue {

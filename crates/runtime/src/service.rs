@@ -1926,6 +1926,7 @@ mod tests {
             description: Some(format!("Description for {id}")),
             state: state.to_owned(),
             pull_request: None,
+            activity: None,
             url: Some(format!("https://example.com/acme/widgets/issues/{id}")),
             author: None,
             labels: Vec::new(),

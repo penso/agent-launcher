@@ -38,6 +38,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
             || app.delete_overlay.is_some()
             || app.dispatch_overlay.is_some()
             || app.command_overlay
+            || app.debug_overlay
             || app.sort_overlay,
         ..Default::default()
     };
@@ -47,7 +48,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
         Route::Inbox => draw_inbox(frame, content, snapshot, app),
         Route::Detail => draw_detail(frame, content, snapshot, app),
     }
-    if app.dispatch_overlay.is_some() {
+    if app.debug_overlay {
+        draw_debug_overlay(frame, content, snapshot, app);
+    } else if app.dispatch_overlay.is_some() {
         draw_dispatch_overlay(frame, content, snapshot, app);
     } else if app.route == Route::Inbox {
         if app.sort_overlay {
@@ -72,7 +75,9 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
     } else {
         1
     };
-    let panel_width = body.width.saturating_sub(horizontal_margin * 2).min(104);
+    let panel_width = app
+        .layout
+        .content_width(body.width.saturating_sub(horizontal_margin * 2));
     let full_logo = panel_width >= 62 && body.height >= 17;
     let logo_height: u16 = if full_logo {
         2
@@ -91,14 +96,25 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         .saturating_add(logo_gap)
         .saturating_add(legend_height);
     let panel_height = body.height.min(fixed_height.saturating_add(18));
+    let top_space = body.height.saturating_sub(panel_height) / 2;
+    let (top_space, panel_height) = if app.layout == crate::LayoutMode::Flexible {
+        // Keep activity compact on tall screens and give the remaining height to rows.
+        let top_space = if panel_width >= 48 {
+            top_space.min(8)
+        } else {
+            0
+        };
+        (top_space, body.height.saturating_sub(top_space))
+    } else {
+        (top_space, panel_height)
+    };
     let panel = Rect::new(
         body.x + body.width.saturating_sub(panel_width) / 2,
-        body.y + body.height.saturating_sub(panel_height) / 2,
+        body.y + top_space,
         panel_width,
         panel_height,
     );
 
-    let top_space = panel.y.saturating_sub(body.y);
     if panel.width >= 48 && top_space >= 7 {
         let chart_height = top_space.saturating_sub(2).min(10);
         let chart = Rect::new(
@@ -338,6 +354,7 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
     let focused = !app.command_overlay
+        && !app.debug_overlay
         && !app.sort_overlay
         && app.dispatch_overlay.is_none()
         && app.input_overlay.is_none()
@@ -499,7 +516,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
     if app.tab == InboxTab::PullRequests {
         for (column, label) in pr_columns
             .into_iter()
-            .zip(["PR", "title", "author", "diff", "status"])
+            .zip(["PR", "title", "author", "diff", "status", "activity"])
         {
             frame.render_widget(
                 Paragraph::new(label)
@@ -567,6 +584,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
 
 #[derive(Clone, Copy)]
 struct Columns {
+    activity: usize,
     age: usize,
     source: usize,
     state: usize,
@@ -576,18 +594,21 @@ impl Columns {
     fn for_width(width: u16) -> Self {
         if width >= 72 {
             Self {
+                activity: 8,
                 age: 6,
                 source: 8,
                 state: 12,
             }
         } else if width >= 46 {
             Self {
+                activity: 0,
                 age: 5,
                 source: 5,
                 state: 8,
             }
         } else {
             Self {
+                activity: 0,
                 age: 4,
                 source: 3,
                 state: 2,
@@ -596,7 +617,9 @@ impl Columns {
     }
 
     fn title(self, width: u16) -> usize {
-        width.saturating_sub(4 + self.age as u16 + self.source as u16 + self.state as u16) as usize
+        width.saturating_sub(
+            4 + self.age as u16 + self.source as u16 + self.state as u16 + self.activity as u16,
+        ) as usize
     }
 }
 
@@ -626,9 +649,19 @@ fn draw_table_header(frame: &mut Frame<'_>, area: Rect, columns: Columns) {
         ),
     ]);
     let state_width = (columns.state as u16).min(area.width);
+    let activity_width = columns.activity as u16;
+    frame.render_widget(
+        Paragraph::new("activity").style(Style::new().fg(theme::muted())),
+        Rect::new(
+            area.right() - state_width - activity_width,
+            area.y,
+            activity_width,
+            1,
+        ),
+    );
     frame.render_widget(
         Paragraph::new(line),
-        Rect::new(area.x, area.y, area.width - state_width, 1),
+        Rect::new(area.x, area.y, area.width - state_width - activity_width, 1),
     );
     frame.render_widget(
         Paragraph::new(if columns.state <= 2 {
@@ -744,9 +777,19 @@ fn draw_table_row(
     ]);
     // Keep state independent of the terminal-cell width of the title.
     let state_width = (columns.state as u16).min(area.width);
+    let activity_width = columns.activity as u16;
+    frame.render_widget(
+        Paragraph::new(item_activity_line(issue, false)).style(Style::new().bg(bg)),
+        Rect::new(
+            area.right() - state_width - activity_width,
+            area.y,
+            activity_width,
+            1,
+        ),
+    );
     frame.render_widget(
         Paragraph::new(line),
-        Rect::new(area.x, area.y, area.width - state_width, 1),
+        Rect::new(area.x, area.y, area.width - state_width - activity_width, 1),
     );
     frame.render_widget(
         Paragraph::new(truncate(state, state_width as usize))
@@ -756,34 +799,130 @@ fn draw_table_row(
     );
 }
 
-fn pr_columns(area: Rect, number_width: u16) -> [Rect; 5] {
+fn pr_columns(area: Rect, number_width: u16) -> [Rect; 6] {
     // Reserve identity, diff, and lifecycle before sharing the rest with title/author.
     let available = area.width.saturating_sub(6);
     let number = number_width.min(available);
     let status = 6.min(available.saturating_sub(number));
-    let diff = 4.min(available.saturating_sub(number + status));
+    let diff_cells = match area.width {
+        160.. => 8,
+        120.. => 6,
+        _ => 4,
+    };
+    let diff = diff_cells.min(available.saturating_sub(number + status));
     let remaining = available.saturating_sub(number + status + diff);
+    let activity = match area.width {
+        100.. => 15,
+        76.. => 8,
+        _ => 0,
+    }
+    .min(remaining.saturating_sub(24));
+    let remaining = remaining.saturating_sub(activity + u16::from(activity > 0));
     let author = (remaining / 3).min(12);
-    let widths = [number, remaining - author, author, diff, status];
+    let widths = [number, remaining - author, author, activity, diff, status];
     let mut x = area.x.saturating_add(2).min(area.right());
-    widths.map(|width| {
+    let rects = widths.map(|width| {
         let rect = Rect::new(x, area.y, width.min(area.right() - x), 1);
-        x = rect.right().saturating_add(1).min(area.right());
+        x = rect
+            .right()
+            .saturating_add(u16::from(width > 0))
+            .min(area.right());
         rect
-    })
+    });
+    [rects[0], rects[1], rects[2], rects[4], rects[5], rects[3]]
 }
 
-fn pr_change_indicator(additions: Option<u64>, deletions: Option<u64>) -> Line<'static> {
+fn compact_activity_count(count: u128) -> String {
+    for (scale, suffix) in [
+        (1_000_000_000_000_000_000, "E"),
+        (1_000_000_000_000_000, "P"),
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "k"),
+    ] {
+        if count >= scale {
+            return format!("{}{suffix}", count / scale);
+        }
+    }
+    count.to_string()
+}
+
+fn item_activity_line(issue: &Issue, show_commits: bool) -> Line<'static> {
+    let activity = issue.activity.unwrap_or_default();
+    let (discussion, partial) = if issue.pull_request.is_some() {
+        match (activity.comments, activity.review_comments) {
+            (Some(a), Some(b)) => (Some(u128::from(a) + u128::from(b)), false),
+            (a, b) => (a.or(b).map(u128::from), a.or(b).is_some()),
+        }
+    } else {
+        (activity.comments.map(u128::from), false)
+    };
+    let count = discussion.map_or_else(
+        || "?".to_owned(),
+        |n| {
+            let compact = compact_activity_count(n);
+            format!(
+                "{compact}{}",
+                if partial {
+                    "+"
+                } else {
+                    ""
+                }
+            )
+        },
+    );
+    let mut spans = vec![Span::styled(
+        format!("≡{count:<6} "),
+        Style::new().fg(if discussion.is_some_and(|n| n >= 10) {
+            theme::primary()
+        } else {
+            theme::muted()
+        }),
+    )];
+    if show_commits {
+        let count = activity
+            .commits
+            .map_or_else(|| "?".to_owned(), |n| compact_activity_count(u128::from(n)));
+        spans.push(Span::styled(
+            format!("○{count}"),
+            Style::new().fg(if activity.commits.is_some_and(|n| n >= 10) {
+                theme::primary()
+            } else {
+                theme::muted()
+            }),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn pr_change_indicator(
+    additions: Option<u64>,
+    deletions: Option<u64>,
+    cells: u16,
+) -> Line<'static> {
+    if cells == 0 {
+        return Line::default();
+    }
     let (Some(additions), Some(deletions)) = (additions, deletions) else {
-        return Line::styled("?□□□", Style::new().fg(theme::muted()));
+        return Line::styled(
+            format!("?{}", "□".repeat(usize::from(cells - 1))),
+            Style::new().fg(theme::muted()),
+        );
     };
     let total = u128::from(additions) + u128::from(deletions);
-    let filled = match total {
+    let bucket = match total {
         0 => 0,
         1..=10 => 1,
         11..=100 => 2,
         101..=1000 => 3,
         _ => 4,
+    };
+    // Preserve quarter-capacity size buckets at every width, rounding ties up.
+    let filled = if total == 0 {
+        0
+    } else {
+        ((bucket * u128::from(cells) + 2) / 4).max(1)
     };
     let mut green = if total == 0 {
         0
@@ -794,7 +933,7 @@ fn pr_change_indicator(additions: Option<u64>, deletions: Option<u64>) -> Line<'
         green = green.clamp(1, filled - 1);
     }
     Line::from(
-        (0..4)
+        (0..u128::from(cells))
             .map(|cell| {
                 let (glyph, color) = if cell >= filled {
                     ("□", theme::muted())
@@ -814,7 +953,7 @@ fn draw_pr_row(
     area: Rect,
     issue: &Issue,
     selected: bool,
-    columns: [Rect; 5],
+    columns: [Rect; 6],
 ) {
     let pr = issue.pull_request.as_ref().expect("PR row");
     let bg = if selected {
@@ -845,12 +984,13 @@ fn draw_pr_row(
             ),
             Style::new().fg(theme::muted()),
         ),
-        pr_change_indicator(pr.additions, pr.deletions),
+        pr_change_indicator(pr.additions, pr.deletions, columns[3].width),
         Line::styled(
             issue.state.as_str(),
             Style::new().fg(issue_color(&issue.state)),
         )
         .alignment(Alignment::Right),
+        item_activity_line(issue, columns[5].width >= 15),
     ];
     for (mut column, line) in columns.into_iter().zip(lines) {
         column.y = area.y;
@@ -1056,7 +1196,7 @@ fn shortcut_line(width: u16) -> Line<'static> {
 
 fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let width = area.width.saturating_sub(2).min(64);
-    let height = area.height.saturating_sub(2).min(21);
+    let height = area.height.saturating_sub(2).min(22);
     if width == 0 || height == 0 {
         return;
     }
@@ -1067,6 +1207,16 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         height,
     );
     frame.render_widget(Clear, popup);
+    if width < 48 || height < 12 {
+        frame.render_widget(
+            Paragraph::new(
+                "g debug\nd dispatch/review\nr refresh\ns sort\nc clear search\nq quit\nEsc cancel",
+            )
+            .style(Style::new().bg(theme::element()).fg(theme::primary())),
+            popup,
+        );
+        return;
+    }
     let panel = Block::new()
         .style(Style::new().bg(theme::element()))
         .padding(Padding::new(2, 2, 1, 1));
@@ -1096,6 +1246,7 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         ),
         command_help_line("r", "refresh issue sources"),
         command_help_line("s", "choose issue sorting"),
+        command_help_line("g", "debug runtime status"),
         command_help_line("c", "clear search"),
         command_help_line("q", "quit agent-launcher"),
         command_help_line("Tab / BackTab", "switch Issues / PRs"),
@@ -1557,40 +1708,27 @@ fn draw_footer(
         .inner(Margin::new(u16::from(area.width >= 40), 0));
     let repository = snapshot.repository.as_ref().map_or_else(
         || "repository unavailable".to_owned(),
-        |repository| abbreviated_path(&repository.root),
+        |repository| {
+            repository.remote.as_ref().map_or_else(
+                || abbreviated_path(&repository.root),
+                |remote| format!("{}/{}", remote.host, remote.repository),
+            )
+        },
     );
-    let source = footer_source_label(snapshot);
-    let text = format!(
-        "{repository}  ·  {source}  ·  {}  ·  {}",
-        worktree_manager_label(snapshot),
-        if snapshot.selected_agent.is_empty() {
-            "none"
-        } else {
-            &snapshot.selected_agent
-        }
-    );
+    let mut text = footer_source_label(snapshot);
+    text.spans.push(Span::raw(format!(" {repository}")));
+    let identity_width = text.width();
     let version = env!("CARGO_PKG_VERSION");
-    if metrics.has_samples() && footer.width < 37 {
-        frame.render_widget(
-            Paragraph::new(format!(
-                "CPU {}%  MEM {}%",
-                metrics.cpu_percent, metrics.memory_percent
-            ))
-            .style(Style::new().fg(load_color(metrics.cpu_percent.max(metrics.memory_percent))))
-            .alignment(Alignment::Right),
-            footer,
-        );
-        return;
-    }
 
     let version_width = version.len() as u16;
     let version_x = footer.x + footer.width.saturating_sub(version_width);
     let mut left_width = footer.width.saturating_sub(version_width + 1);
-    if metrics.has_samples() {
+    // Keep the remote and source status ahead of optional host metrics.
+    if metrics.has_samples() && usize::from(left_width) >= identity_width + 32 {
         let available = footer.width.saturating_sub(version_width + 1);
         let spark_width = (footer.width / 5)
             .clamp(8, 24)
-            .min(available.saturating_sub(23));
+            .min(available.saturating_sub(identity_width as u16 + 24));
         let metrics_width = 23 + spark_width;
         let metrics_x = version_x.saturating_sub(metrics_width + 1);
         left_width = metrics_x.saturating_sub(footer.x + 1);
@@ -1614,14 +1752,14 @@ fn draw_footer(
         );
     }
     frame.render_widget(
-        Paragraph::new(truncate(&text, left_width as usize)).style(Style::new().fg(theme::muted())),
+        Paragraph::new(text).style(Style::new().fg(theme::muted())),
         Rect::new(footer.x, footer.y, left_width, 1),
     );
     frame.render_widget(
         Paragraph::new(version)
             .style(Style::new().fg(theme::muted()))
             .alignment(Alignment::Right),
-        footer,
+        Rect::new(version_x, footer.y, footer.width.min(version_width), 1),
     );
 }
 
@@ -1635,6 +1773,152 @@ fn load_color(percent: u64) -> ratatui::style::Color {
     }
 }
 
+fn draw_debug_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    app: &mut AppState,
+) {
+    let width = area.width.min(90);
+    let height = area.height.min(30);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    app.mouse.debug = popup;
+    app.debug_page_size = height.saturating_sub(2);
+    app.debug_scroll_max = 0;
+    if popup.is_empty() {
+        app.debug_scroll = 0;
+        return;
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::new().style(Style::new().bg(theme::element())), popup);
+    frame.render_widget(
+        Paragraph::new("Debug | Esc close").style(Style::new().fg(theme::primary()).bold()),
+        Rect::new(popup.x, popup.y, width, 1),
+    );
+    let body = Rect::new(popup.x, popup.y + 1, width, app.debug_page_size);
+    if body.is_empty() {
+        app.debug_scroll = 0;
+        return;
+    }
+    let mut lines = vec![
+        format!(
+            "Backend selected: {}",
+            snapshot
+                .selected_backend
+                .map_or_else(|| "none".into(), |kind| format!("{kind:?}").to_lowercase())
+        ),
+        format!(
+            "Worktree manager detected: {}",
+            worktree_manager_label(snapshot)
+        ),
+        format!(
+            "Selected agent: {}",
+            if snapshot.selected_agent.trim().is_empty() {
+                "none"
+            } else {
+                &snapshot.selected_agent
+            }
+        ),
+        format!(
+            "Initialized: {} | Refreshing: {}",
+            snapshot.initialized, snapshot.refreshing
+        ),
+        format!(
+            "Last refresh: {}",
+            snapshot
+                .last_refreshed_at
+                .map_or_else(|| "never".into(), |time| time.to_rfc3339())
+        ),
+        format!("Error: {}", snapshot.error.as_deref().unwrap_or("none")),
+    ];
+    if let Some(repository) = &snapshot.repository {
+        lines.push(format!("Local path: {}", repository.root.display()));
+        lines.push(format!(
+            "Effective host/repo: {}",
+            repository.remote.as_ref().map_or_else(
+                || "none".into(),
+                |remote| format!("{}/{}", remote.host, remote.repository)
+            )
+        ));
+    } else {
+        lines.push("Repository: unavailable".into());
+    }
+    lines.push(format!("Backends: {}", snapshot.backends.len()));
+    for backend in &snapshot.backends {
+        lines.push(format!(
+            "  {:?}: {} | manager running: {}",
+            backend.kind,
+            if backend.available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            backend.manager_running
+        ));
+        if let Some(message) = &backend.message {
+            lines.push(format!("  Message: {message}"));
+        }
+    }
+    lines.push(format!(
+        "Compute targets: {}",
+        snapshot.compute_targets.len()
+    ));
+    for target in &snapshot.compute_targets {
+        lines.push(format!(
+            "  {}: {:?} | active: {} / {} | dispatchable: {}",
+            target.name,
+            target.availability,
+            target.active_runs,
+            target
+                .max_active_runs
+                .map_or_else(|| "unlimited".into(), |max| max.to_string()),
+            target.is_dispatchable()
+        ));
+        if let Some(message) = &target.message {
+            lines.push(format!("  Message: {message}"));
+        }
+    }
+    lines.push(format!("Sources: {}", snapshot.sources.len()));
+    for source in &snapshot.sources {
+        lines.push(format!(
+            "  {}: {}",
+            source.name,
+            if source.connected {
+                "connected"
+            } else {
+                "disconnected"
+            }
+        ));
+        lines.push(format!(
+            "  Message: {}",
+            source.message.as_deref().unwrap_or("none")
+        ));
+    }
+    let paragraph = Paragraph::new(lines.join("\n"))
+        .style(Style::new().fg(theme::text()).bg(theme::element()))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    app.debug_scroll_max = paragraph
+        .line_count(body.width)
+        .saturating_sub(usize::from(body.height))
+        .min(usize::from(u16::MAX)) as u16;
+    app.debug_scroll = app.debug_scroll.min(app.debug_scroll_max);
+    frame.render_widget(paragraph.scroll((app.debug_scroll, 0)), body);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}/{} | Arrows PgUp/PgDn Home/End wheel",
+            u32::from(app.debug_scroll) + 1,
+            u32::from(app.debug_scroll_max) + 1
+        ))
+        .style(Style::new().fg(theme::muted())),
+        Rect::new(popup.x, body.bottom(), width, 1),
+    );
+}
+
 fn worktree_manager_label(snapshot: &RuntimeSnapshot) -> &'static str {
     [BackendKind::Superset, BackendKind::Herdr]
         .into_iter()
@@ -1644,38 +1928,52 @@ fn worktree_manager_label(snapshot: &RuntimeSnapshot) -> &'static str {
                 .iter()
                 .any(|backend| backend.kind == *kind && backend.manager_running)
         })
-        .map_or("please run this in a worktree manager", |kind| match kind {
+        .map_or("none detected", |kind| match kind {
             BackendKind::Superset => "superset",
             BackendKind::Herdr => "herdr",
             BackendKind::Native | BackendKind::Conductor => unreachable!(),
         })
 }
 
-fn footer_source_label(snapshot: &RuntimeSnapshot) -> String {
+fn footer_source_label(snapshot: &RuntimeSnapshot) -> Line<'static> {
     if snapshot.sources.is_empty() {
-        return "no source".to_owned();
+        return Line::from("no source");
     }
     let connected = snapshot
         .sources
         .iter()
         .filter(|source| source.connected)
         .count();
-    if snapshot.sources.len() == 1 {
+    let throttled = snapshot.sources.iter().any(|source| {
+        source
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("throttled"))
+    });
+    let color = if throttled || (connected > 0 && connected < snapshot.sources.len()) {
+        theme::primary()
+    } else if connected == 0 {
+        theme::error()
+    } else {
+        theme::done()
+    };
+    let label = if snapshot.sources.len() == 1 {
         let source = &snapshot.sources[0];
         let name = source.name.split(':').next().unwrap_or(&source.name);
-        format!(
-            "{name} {}",
-            if source.connected {
-                "online"
-            } else {
-                "offline"
-            }
-        )
+        if name == "github" {
+            return Line::from(Span::styled("\u{f09b}", Style::new().fg(color)));
+        } else {
+            name.to_owned()
+        }
     } else if connected == snapshot.sources.len() {
-        format!("{} sources online", snapshot.sources.len())
+        format!("{} sources", snapshot.sources.len())
     } else {
-        format!("{connected}/{} sources online", snapshot.sources.len())
-    }
+        format!("{connected}/{} sources", snapshot.sources.len())
+    };
+    Line::from(vec![
+        Span::raw(format!("{label} ")),
+        Span::styled("●", Style::new().fg(color)),
+    ])
 }
 
 fn abbreviated_path(path: &std::path::Path) -> String {
@@ -1757,6 +2055,7 @@ mod tests {
             description: Some("Detailed acceptance criteria".to_owned()),
             state: "open".to_owned(),
             pull_request: None,
+            activity: None,
             url: Some(format!("https://github.com/acme/launcher/issues/{id}")),
             author: Some("octocat".to_owned()),
             labels: vec!["runtime".to_owned()],
@@ -1898,6 +2197,404 @@ mod tests {
             ..pr.clone()
         }));
         snapshot
+    }
+
+    #[test]
+    fn flexible_layout_gives_extra_width_to_titles_and_activity_not_metadata_or_logo() {
+        let mut snapshot = pr_snapshot();
+        for issue in &mut snapshot.issues {
+            issue.title = "T".repeat(300);
+            issue.author = Some("a".repeat(40));
+        }
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let baseline = render_buffer(108, 60, &snapshot, &mut AppState {
+                tab,
+                layout: crate::LayoutMode::Fixed,
+                ..Default::default()
+            });
+            for width in [160, 240] {
+                let mut fixed = AppState {
+                    tab,
+                    layout: crate::LayoutMode::Fixed,
+                    ..Default::default()
+                };
+                let fixed_buffer = render_buffer(width, 60, &snapshot, &mut fixed);
+                let mut flexible = AppState {
+                    tab,
+                    ..Default::default()
+                };
+                assert_eq!(flexible.layout, crate::LayoutMode::Flexible);
+                let buffer = render_buffer(width, 60, &snapshot, &mut flexible);
+                // The fixed content is cell-for-cell identical, merely centered on a wider screen.
+                for y in 0..59 {
+                    for x in 0..108 {
+                        assert_eq!(baseline[(x, y)], fixed_buffer[(x + (width - 108) / 2, y)]);
+                    }
+                }
+                let fixed_row = fixed.mouse.rows[0].0;
+                let row = flexible.mouse.rows[0].0;
+                assert_eq!((row.x, row.right()), (4, width - 3));
+                assert!(row.y < fixed_row.y);
+                assert!(flexible.visible_rows > fixed.visible_rows);
+                assert_eq!(flexible.scroll, fixed.scroll);
+                let title_cells = |buffer: &Buffer, row: Rect| {
+                    (row.x..row.right())
+                        .filter(|&x| buffer[(x, row.y)].symbol() == "T")
+                        .count()
+                };
+                assert_eq!(
+                    title_cells(&buffer, row) - title_cells(&fixed_buffer, fixed_row),
+                    usize::from(
+                        width
+                            - 108
+                            - if tab == InboxTab::PullRequests {
+                                pr_columns(row, 3)[3].width - 4
+                            } else {
+                                0
+                            }
+                    )
+                );
+                if tab == InboxTab::PullRequests {
+                    let columns = pr_columns(row, 3);
+                    let old = pr_columns(fixed_row, 3);
+                    for index in [0, 2, 4] {
+                        assert_eq!(columns[index].width, old[index].width);
+                    }
+                    assert_eq!(columns[2].width, 12);
+                    assert_eq!(columns[4].width, 6);
+                    assert_eq!(
+                        (columns[2].x..columns[2].right())
+                            .filter(|&x| buffer[(x, row.y)].symbol() == "a")
+                            .count(),
+                        11 // The final author cell is the truncation ellipsis.
+                    );
+                } else {
+                    let columns = Columns::for_width(row.width);
+                    assert_eq!((columns.age, columns.source, columns.state), (6, 8, 12));
+                }
+                let status: String = (row.right() - 4..row.right())
+                    .map(|x| buffer[(x, row.y)].symbol())
+                    .collect();
+                assert_eq!(status, "open");
+                for y in 0..59 {
+                    for x in [0, 1, width - 2, width - 1] {
+                        assert_eq!(buffer[(x, y)].symbol(), " ");
+                        assert_eq!(buffer[(x, y)].bg, theme::bg());
+                    }
+                }
+                // Both logo lines retain their literal glyphs and centered position.
+                for index in 0..2 {
+                    let logo = format!(
+                        "{}   {}",
+                        theme::AGENT_LOGO[index],
+                        theme::LAUNCHER_LOGO[index]
+                    );
+                    let x = (width - logo.chars().count() as u16) / 2;
+                    let y = 8 + index as u16;
+                    let actual: String = (x..x + logo.chars().count() as u16)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    assert_eq!(actual, logo);
+                    for x in 0..width {
+                        assert_eq!(buffer[(x, y)], fixed_buffer[(x, 18 + index as u16)]);
+                    }
+                }
+                // The activity panel uses the same expanded edges as the listing.
+                assert_eq!(buffer[(2, 4)].bg, theme::panel());
+                assert_eq!(buffer[(width - 3, 4)].bg, theme::panel());
+                assert_eq!(fixed_buffer[(2, 4)].bg, theme::bg());
+            }
+        }
+    }
+
+    #[test]
+    fn flexible_height_expands_rows_to_bottom_with_activity_controls_and_mouse_geometry() {
+        let mut snapshot = pr_snapshot();
+        let templates = snapshot.issues.clone();
+        snapshot.issues = (0..200)
+            .map(|id| {
+                let mut issue = templates[id % 2].clone();
+                issue.key.native_id = id.to_string();
+                issue.title = format!("Visible row ID {id:03}");
+                if let Some(pr) = issue.pull_request.as_mut() {
+                    pr.number = id as u64 + 1;
+                }
+                issue
+            })
+            .collect();
+        for width in [80, 160, 240] {
+            for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                for height in [48, 80] {
+                    let mut fixed = AppState {
+                        tab,
+                        layout: crate::LayoutMode::Fixed,
+                        ..Default::default()
+                    };
+                    render_buffer(width, height, &snapshot, &mut fixed);
+                    assert_eq!(fixed.visible_rows, 11);
+                    assert_eq!(fixed.mouse.list.y, (height - 24) / 2 + 9);
+                    for selected in [0, 99] {
+                        let mut app = AppState {
+                            tab,
+                            selected,
+                            ..Default::default()
+                        };
+                        let buffer = render_buffer(width, height, &snapshot, &mut app);
+                        let line = |y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        };
+                        assert_eq!(app.visible_rows, usize::from(height - 21));
+                        assert!(app.visible_rows > fixed.visible_rows);
+                        assert_eq!(app.mouse.rows.len(), app.visible_rows);
+                        assert_eq!(app.mouse.list.bottom(), height - 4);
+                        assert_eq!(app.mouse.list.y, 17);
+                        assert_eq!(app.mouse.tabs[0].0.y, 12);
+                        assert!(line(2).contains("agent activity"));
+                        assert!(line(5).contains("-15m"));
+                        assert!(line(5).contains("now"));
+                        assert!(line(7).trim().is_empty());
+                        assert!(line(8).contains(theme::AGENT_LOGO[0]));
+                        assert!(line(9).contains(theme::LAUNCHER_LOGO[1]));
+                        assert!(line(10).trim().is_empty());
+                        assert!(line(height - 4).contains('╹'));
+                        assert!(line(height - 3).contains(&format!(
+                            "{}-{} of 100",
+                            app.scroll + 1,
+                            app.scroll + app.visible_rows
+                        )));
+                        assert!(line(height - 2).contains("Ctrl+G"));
+                        assert!(line(height - 1).contains("github.com/acme/launcher"));
+                        assert!(line(height - 1).contains(env!("CARGO_PKG_VERSION")));
+                        let list = app.mouse.list;
+                        let thumb_y = if selected == 0 {
+                            list.y
+                        } else {
+                            list.bottom() - 1
+                        };
+                        assert_eq!(buffer[(list.right() - 1, thumb_y)].bg, theme::border());
+                        if selected == 99 {
+                            assert_eq!(app.scroll + app.visible_rows, 100);
+                        }
+                        let (row, index, key) = app.mouse.rows.last().unwrap().clone();
+                        assert_eq!(row.y, height - 5);
+                        let issue = snapshot
+                            .issues
+                            .iter()
+                            .find(|issue| issue.key == key)
+                            .unwrap();
+                        assert!(line(row.y).contains(&issue.title));
+                        if let Some(pr) = &issue.pull_request {
+                            assert!(line(row.y).contains(&format!("#{}", pr.number)));
+                        }
+                        let click = MouseEventKind::Down(MouseButton::Left);
+                        for y in [
+                            2,
+                            8,
+                            list.y - 1,
+                            height - 4,
+                            height - 3,
+                            height - 2,
+                            height - 1,
+                        ] {
+                            assert!(!mouse(&mut app, &snapshot, click, row.right() - 1, y));
+                        }
+                        assert_eq!(
+                            mouse(
+                                &mut app,
+                                &snapshot,
+                                MouseEventKind::Moved,
+                                row.right() - 1,
+                                row.y
+                            ),
+                            selected != index
+                        );
+                        assert_eq!(app.selected, index);
+                        assert_eq!(app.route, Route::Inbox);
+                        assert!(mouse(&mut app, &snapshot, click, row.right() - 1, row.y));
+                        assert_eq!(app.detail_issue_key, Some(key));
+                        assert_eq!(app.route, Route::Detail);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flexible_height_resize_preserves_independent_tab_selection_and_detail_controls() {
+        let snapshot = mouse_snapshot();
+        let mut app = AppState {
+            selected: 35,
+            search_query: "Issue".into(),
+            ..Default::default()
+        };
+        let issue_key = app.selected_issue(&snapshot).unwrap().key.clone();
+        app.switch_tab();
+        app.selected = 22;
+        app.search_query = "Review".into();
+        let pr_key = app.selected_issue(&snapshot).unwrap().key.clone();
+        for height in [24, 48, 80, 32, 9, 80, 48, 24] {
+            for (tab, selected, query, key) in [
+                (InboxTab::Issues, 35, "Issue", &issue_key),
+                (InboxTab::PullRequests, 22, "Review", &pr_key),
+            ] {
+                app.switch_tab();
+                render_buffer(160, height, &snapshot, &mut app);
+                assert_eq!(app.tab, tab);
+                assert_eq!(app.selected, selected);
+                assert_eq!(app.search_query, query);
+                assert_eq!(&app.selected_issue(&snapshot).unwrap().key, key);
+                assert!((app.scroll..app.scroll + app.visible_rows).contains(&selected));
+                assert!(
+                    app.mouse
+                        .rows
+                        .iter()
+                        .any(|(_, index, row_key)| *index == selected && row_key == key)
+                );
+            }
+        }
+        app.open_detail(&snapshot);
+        let mut previous_height = 0;
+        for height in [24, 48, 80] {
+            let buffer = render_buffer(160, height, &snapshot, &mut app);
+            assert!(app.mouse.detail.height > previous_height);
+            previous_height = app.mouse.detail.height;
+            let controls: String = (0..160).map(|x| buffer[(x, height - 3)].symbol()).collect();
+            assert!(controls.contains("Esc back"));
+            assert!(controls.contains("review PR"));
+            assert!(app.mouse.detail.bottom() <= height - 3);
+        }
+    }
+
+    #[test]
+    fn flexible_mouse_hits_far_right_rows_and_detail_but_not_padding() {
+        let mut snapshot = mouse_snapshot();
+        for issue in &mut snapshot.issues {
+            issue.description = Some("long detail line ".repeat(1000));
+        }
+        for width in [160, 240] {
+            for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                let mut app = AppState {
+                    layout: crate::LayoutMode::Flexible,
+                    tab,
+                    scroll: 3,
+                    selected: 3,
+                    ..Default::default()
+                };
+                render_buffer(width, 24, &snapshot, &mut app);
+                let (row, index, key) = app.mouse.rows[1].clone();
+                assert_eq!(row.right(), width - 5); // Two cells reserved for the scrollbar.
+                assert_eq!(index, 4);
+                let click = MouseEventKind::Down(MouseButton::Left);
+                for x in [0, 1, width - 2, width - 1, row.right()] {
+                    assert!(!mouse(&mut app, &snapshot, click, x, row.y));
+                }
+                assert!(mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::Moved,
+                    row.right() - 1,
+                    row.y
+                ));
+                assert_eq!(app.selected, index);
+                assert_eq!(app.route, Route::Inbox);
+                assert!(mouse(&mut app, &snapshot, click, row.right() - 1, row.y));
+                assert_eq!(app.detail_issue_key, Some(key));
+                render_buffer(width, 24, &snapshot, &mut app);
+                let detail = app.mouse.detail;
+                assert_eq!((detail.x, detail.right()), (4, width - 3));
+                assert!(mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::ScrollDown,
+                    detail.right() - 1,
+                    detail.y
+                ));
+                assert_eq!(app.detail_scroll, 3);
+                let mut fixed = AppState {
+                    layout: crate::LayoutMode::Fixed,
+                    route: Route::Detail,
+                    detail_issue_key: app.detail_issue_key.clone(),
+                    ..Default::default()
+                };
+                render_buffer(width, 24, &snapshot, &mut fixed);
+                assert_eq!(fixed.mouse.detail.width, 101);
+                assert_eq!(fixed.mouse.detail.height, detail.height);
+                app.debug_overlay = true;
+                fixed.debug_overlay = true;
+                render_buffer(width, 24, &snapshot, &mut app);
+                render_buffer(width, 24, &snapshot, &mut fixed);
+                assert_eq!(app.mouse.debug, fixed.mouse.debug);
+                assert_eq!(app.mouse.debug.width, 90);
+                assert!(app.mouse.blocked);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_modes_are_safe_at_narrow_and_tiny_sizes() {
+        let snapshot = pr_snapshot();
+        for width in [0, 1, 2, 8, 18, 23, 24, 36, 55, 56, 62, 79, 80, 104, 108] {
+            for height in [0, 1, 3, 7, 8, 9, 17, 24, 31, 32, 38, 40, 48, 80] {
+                for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                    for route in [Route::Inbox, Route::Detail] {
+                        for debug_overlay in [false, true] {
+                            let mut fixed = AppState {
+                                layout: crate::LayoutMode::Fixed,
+                                tab,
+                                route,
+                                debug_overlay,
+                                detail_issue_key: Some(
+                                    snapshot.issues[usize::from(tab == InboxTab::PullRequests)]
+                                        .key
+                                        .clone(),
+                                ),
+                                ..Default::default()
+                            };
+                            let mut flexible = AppState {
+                                tab,
+                                route,
+                                debug_overlay,
+                                detail_issue_key: fixed.detail_issue_key.clone(),
+                                layout: crate::LayoutMode::Flexible,
+                                ..Default::default()
+                            };
+                            let fixed_buffer = render_buffer(width, height, &snapshot, &mut fixed);
+                            let flexible_buffer =
+                                render_buffer(width, height, &snapshot, &mut flexible);
+                            if height <= 17 || width < 24 || route == Route::Detail {
+                                assert_eq!(
+                                    fixed_buffer, flexible_buffer,
+                                    "{width}x{height}, {route:?}, {tab:?}"
+                                );
+                                assert_eq!(fixed.mouse.rows, flexible.mouse.rows);
+                            }
+                            for app in [&fixed, &flexible] {
+                                assert!(
+                                    app.mouse.rows.iter().all(|(rect, ..)| rect.right() <= width
+                                        && rect.bottom() < height)
+                                );
+                            }
+                            if route == Route::Inbox && width >= 24 && height >= 10 {
+                                assert!(flexible.visible_rows >= fixed.visible_rows);
+                                assert!(flexible.mouse.list.bottom() <= height - 4);
+                                if !debug_overlay {
+                                    let commands: String = (0..width)
+                                        .map(|x| flexible_buffer[(x, height - 2)].symbol())
+                                        .collect();
+                                    assert!(
+                                        commands.contains("Ctrl+G"),
+                                        "{width}x{height}: {commands}"
+                                    );
+                                }
+                            }
+                            assert_eq!(fixed.mouse.detail, flexible.mouse.detail);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2348,7 +3045,7 @@ mod tests {
             (1, u64::MAX, "grrr"),
             (u64::MAX, u64::MAX, "ggrr"),
         ] {
-            let line = pr_change_indicator(Some(additions), Some(deletions));
+            let line = pr_change_indicator(Some(additions), Some(deletions), 4);
             assert_eq!(line.width(), 4);
             for (span, color) in line.spans.iter().zip(colors.chars()) {
                 assert_eq!(
@@ -2376,10 +3073,205 @@ mod tests {
             (None, Some(0)),
             (Some(u64::MAX), None),
         ] {
-            let line = pr_change_indicator(counts.0, counts.1);
+            let line = pr_change_indicator(counts.0, counts.1, 4);
             assert_eq!(line.to_string(), "?□□□");
             assert_eq!(line.width(), 4);
             assert_eq!(line.style.fg, Some(theme::muted()));
+        }
+    }
+
+    #[test]
+    fn pr_indicator_scales_size_buckets_and_colors_to_cell_capacity() {
+        for (cells, fills) in [
+            (4, [0, 1, 1, 2, 2, 3, 3, 4]),
+            (6, [0, 2, 2, 3, 3, 5, 5, 6]),
+            (8, [0, 2, 2, 4, 4, 6, 6, 8]),
+        ] {
+            for (total, filled) in [0, 1, 10, 11, 100, 101, 1000, 1001].into_iter().zip(fills) {
+                for (additions, deletions, color) in
+                    [(total, 0, theme::done()), (0, total, theme::error())]
+                {
+                    let line = pr_change_indicator(Some(additions), Some(deletions), cells);
+                    assert_eq!(line.width(), usize::from(cells));
+                    for (index, span) in line.spans.iter().enumerate() {
+                        assert_eq!(
+                            span.content,
+                            if index < filled {
+                                "■"
+                            } else {
+                                "□"
+                            }
+                        );
+                        assert_eq!(
+                            span.style.fg,
+                            Some(if index < filled {
+                                color
+                            } else {
+                                theme::muted()
+                            })
+                        );
+                    }
+                }
+            }
+            for (additions, deletions, green, red) in [
+                (u64::MAX, 0, cells, 0),
+                (0, u64::MAX, 0, cells),
+                (u64::MAX, 1, cells - 1, 1),
+                (1, u64::MAX, 1, cells - 1),
+                (u64::MAX, u64::MAX, cells / 2, cells / 2),
+                (50, 51, cells / 2 - 1, fills[5] as u16 - (cells / 2 - 1)),
+            ] {
+                let line = pr_change_indicator(Some(additions), Some(deletions), cells);
+                assert_eq!(line.width(), usize::from(cells));
+                assert_eq!(
+                    line.spans
+                        .iter()
+                        .filter(|span| span.style.fg == Some(theme::done()))
+                        .count(),
+                    usize::from(green)
+                );
+                assert_eq!(
+                    line.spans
+                        .iter()
+                        .filter(|span| span.style.fg == Some(theme::error()))
+                        .count(),
+                    usize::from(red)
+                );
+            }
+            for counts in [(None, None), (Some(0), None), (None, Some(u64::MAX))] {
+                let line = pr_change_indicator(counts.0, counts.1, cells);
+                assert_eq!(line.width(), usize::from(cells));
+                assert_eq!(
+                    line.to_string(),
+                    format!("?{}", "□".repeat(usize::from(cells - 1)))
+                );
+                assert_eq!(line.style.fg, Some(theme::muted()));
+            }
+        }
+        for counts in [
+            (None, None),
+            (Some(0), Some(0)),
+            (Some(1), Some(1)),
+            (Some(u64::MAX), Some(u64::MAX)),
+        ] {
+            for cells in 0..4 {
+                assert_eq!(
+                    pr_change_indicator(counts.0, counts.1, cells).width(),
+                    usize::from(cells)
+                );
+            }
+        }
+        assert_eq!(pr_change_indicator(Some(1), Some(0), 1).to_string(), "■");
+    }
+
+    #[test]
+    fn pr_diff_resizes_at_table_width_boundaries_with_aligned_headers_and_mouse_hits() {
+        let mut snapshot = pr_snapshot();
+        let mut pr = snapshot.issues.pop().unwrap();
+        pr.title = "T".repeat(300);
+        pr.author = Some("a".repeat(40));
+        let metadata = pr.pull_request.as_mut().unwrap();
+        metadata.additions = Some(1001);
+        metadata.deletions = Some(0);
+        for count in [2, 20] {
+            snapshot.issues = (0..count)
+                .map(|index| Issue {
+                    key: IssueKey {
+                        native_id: index.to_string(),
+                        ..pr.key.clone()
+                    },
+                    ..pr.clone()
+                })
+                .collect();
+            let mut app = AppState {
+                tab: InboxTab::PullRequests,
+                ..Default::default()
+            };
+            // Resize both ways; scrollbar reservation must affect the breakpoint too.
+            for table_width in [119, 120, 121, 133, 159, 160, 161, 160, 159, 120, 119] {
+                let screen_width = table_width
+                    + 7
+                    + if count > 2 {
+                        2
+                    } else {
+                        0
+                    };
+                let buffer = render_buffer(screen_width, 24, &snapshot, &mut app);
+                let (row, index, key) = app.mouse.rows[1].clone();
+                assert_eq!(row.width, table_width);
+                let columns = pr_columns(row, 3);
+                let expected_cells = match table_width {
+                    160.. => 8,
+                    120.. => 6,
+                    _ => 4,
+                };
+                assert_eq!(columns[3].width, expected_cells);
+                assert_eq!(
+                    columns[1].width,
+                    table_width - 27 - expected_cells - columns[5].width - 1
+                );
+                assert_eq!(columns[2].width, 12);
+                assert_eq!(columns[4].width, 6);
+                assert_eq!(columns[4].right(), row.right());
+                for (column, label) in columns
+                    .iter()
+                    .zip(["PR", "title", "author", "diff", "status", "activity"])
+                {
+                    let x = if label == "status" {
+                        column.right() - label.len() as u16
+                    } else {
+                        column.x
+                    };
+                    let actual: String = (x..x + label.len() as u16)
+                        .map(|x| buffer[(x, app.mouse.list.y - 1)].symbol())
+                        .collect();
+                    assert_eq!(actual, label);
+                }
+                for (column, expected) in [
+                    (
+                        columns[1],
+                        format!("{}…", "T".repeat(usize::from(columns[1].width - 1))),
+                    ),
+                    (columns[2], format!("{}…", "a".repeat(11))),
+                    (columns[3], "■".repeat(usize::from(expected_cells))),
+                    (columns[4], "  open".to_owned()),
+                ] {
+                    let actual: String = (column.x..column.right())
+                        .map(|x| buffer[(x, row.y)].symbol())
+                        .collect();
+                    assert_eq!(actual, expected);
+                }
+                assert!(!mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::Moved,
+                    row.right(),
+                    row.y
+                ));
+                assert!(mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::Moved,
+                    columns[3].right() - 1,
+                    row.y
+                ));
+                assert_eq!(app.selected, index);
+                let selected_buffer = render_buffer(screen_width, 24, &snapshot, &mut app);
+                assert_eq!(
+                    selected_buffer[(row.right() - 1, row.y)].bg,
+                    theme::element()
+                );
+                assert!(mouse(
+                    &mut app,
+                    &snapshot,
+                    MouseEventKind::Down(MouseButton::Left),
+                    row.right() - 1,
+                    row.y
+                ));
+                assert_eq!(app.detail_issue_key, Some(key));
+                app.route = Route::Inbox;
+                app.selected = 0;
+            }
         }
     }
 
@@ -2394,6 +3286,7 @@ mod tests {
         for width in [36, 46, 80, 112] {
             let mut app = AppState {
                 tab: InboxTab::PullRequests,
+                layout: crate::LayoutMode::Fixed,
                 ..Default::default()
             };
             let buffer = render_buffer(width, 24, &snapshot, &mut app);
@@ -2537,7 +3430,7 @@ mod tests {
 
     #[test]
     fn pr_detail_has_comparison_context_and_explicit_review_controls() {
-        let snapshot = pr_snapshot();
+        let mut snapshot = pr_snapshot();
         let mut app = AppState {
             tab: InboxTab::PullRequests,
             ..AppState::default()
@@ -2558,6 +3451,164 @@ mod tests {
         assert!(!text.contains("d dispatch"));
         assert!(app.dispatch_overlay.is_none());
         assert!(app.status_message.is_none());
+        for counts in [
+            (Some(0), Some(0)),
+            (Some(u64::MAX), Some(u64::MAX)),
+            (None, Some(17)),
+        ] {
+            let pr = snapshot.issues[1].pull_request.as_mut().unwrap();
+            pr.additions = counts.0;
+            pr.deletions = counts.1;
+            let text = render(112, 48, &snapshot, &mut app);
+            let expected = format!(
+                "+{} -{}",
+                counts.0.map_or_else(|| "?".to_owned(), |n| n.to_string()),
+                counts.1.map_or_else(|| "?".to_owned(), |n| n.to_string()),
+            );
+            assert!(text.contains(&expected));
+        }
+    }
+
+    #[test]
+    fn activity_counts_are_compact_partial_and_warm_without_overflow() {
+        for (count, expected) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1k"),
+            (1999, "1k"),
+            (1_000_000, "1M"),
+            (u128::from(u64::MAX), "18E"),
+        ] {
+            assert_eq!(compact_activity_count(count), expected);
+        }
+        let mut snapshot = pr_snapshot();
+        let issue = &mut snapshot.issues[1];
+        for (comments, reviews, commits, expected, color) in [
+            (None, None, None, "≡?      ○?", theme::muted()),
+            (Some(0), Some(0), Some(0), "≡0      ○0", theme::muted()),
+            (Some(0), None, None, "≡0+     ○?", theme::muted()),
+            (None, Some(5), Some(1), "≡5+     ○1", theme::muted()),
+            (Some(5), Some(5), Some(10), "≡10     ○10", theme::primary()),
+            (
+                Some(u64::MAX),
+                Some(u64::MAX),
+                Some(u64::MAX),
+                "≡36E    ○18E",
+                theme::primary(),
+            ),
+        ] {
+            issue.activity = Some(agent_launcher_core::ItemActivity {
+                comments,
+                review_comments: reviews,
+                commits,
+            });
+            let line = item_activity_line(issue, true);
+            assert_eq!(line.to_string(), expected);
+            assert_eq!(line.spans[0].style.fg, Some(color));
+            assert!(line.width() <= 15);
+            assert_eq!(item_activity_line(issue, false).width(), 8);
+        }
+        issue.pull_request = None;
+        issue.activity = Some(agent_launcher_core::ItemActivity {
+            comments: Some(3),
+            review_comments: Some(9),
+            commits: None,
+        });
+        assert_eq!(item_activity_line(issue, false).to_string(), "≡3      ");
+    }
+
+    #[test]
+    fn activity_headers_rows_and_hover_align_across_unicode_resize_breakpoints() {
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut snapshot = pr_snapshot();
+            for issue in &mut snapshot.issues {
+                issue.title = "界 e\u{301} café ".repeat(30);
+                issue.activity = Some(agent_launcher_core::ItemActivity {
+                    comments: Some(1234),
+                    review_comments: Some(0),
+                    commits: Some(42),
+                });
+            }
+            let mut app = AppState {
+                tab,
+                ..Default::default()
+            };
+            for table_width in [71, 72, 75, 76, 99, 100, 120, 100, 76, 72, 40] {
+                let buffer = render_buffer(
+                    table_width
+                        + if table_width >= 73 {
+                            7
+                        } else {
+                            5
+                        },
+                    24,
+                    &snapshot,
+                    &mut app,
+                );
+                let row = app.mouse.rows[0].0;
+                assert_eq!(row.width, table_width);
+                let (x, width) = if tab == InboxTab::PullRequests {
+                    let columns = pr_columns(row, 3);
+                    assert_eq!(columns[4].right(), row.right());
+                    (columns[5].x, columns[5].width)
+                } else {
+                    let columns = Columns::for_width(row.width);
+                    (
+                        row.right() - columns.state as u16 - columns.activity as u16,
+                        columns.activity as u16,
+                    )
+                };
+                if width > 0 {
+                    let header: String = (x..x + 8)
+                        .map(|x| buffer[(x, app.mouse.list.y - 1)].symbol())
+                        .collect();
+                    assert_eq!(header, "activity");
+                    assert_eq!(buffer[(x, row.y)].symbol(), "≡");
+                    assert_eq!(buffer[(x, row.y)].fg, theme::primary());
+                    assert_eq!(buffer[(x, row.y)].bg, theme::element());
+                    assert_eq!(buffer[(x + 1, row.y)].symbol(), "1");
+                    if width >= 15 {
+                        assert_eq!(buffer[(x + 8, row.y)].symbol(), "○");
+                    }
+                    mouse(&mut app, &snapshot, MouseEventKind::Moved, x, row.y);
+                    assert_eq!(app.selected, 0);
+                    assert!(app.detail_issue_key.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn details_show_exact_activity_and_explicit_unknowns_for_both_tabs() {
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut snapshot = pr_snapshot();
+            let index = usize::from(tab == InboxTab::PullRequests);
+            snapshot.issues[index].activity = Some(agent_launcher_core::ItemActivity {
+                comments: Some(12345),
+                review_comments: Some(0),
+                commits: Some(u64::MAX),
+            });
+            let mut app = AppState {
+                tab,
+                ..Default::default()
+            };
+            app.open_detail(&snapshot);
+            let text = render(112, 60, &snapshot, &mut app);
+            assert!(text.contains("12345"));
+            assert!(!text.contains("12k"));
+            if tab == InboxTab::PullRequests {
+                assert!(text.contains("review comments"));
+                assert!(text.contains(&u64::MAX.to_string()));
+            } else {
+                assert!(!text.contains("review comments"));
+            }
+            snapshot.issues[index].activity = None;
+            let text = render(112, 60, &snapshot, &mut app);
+            assert!(
+                text.lines()
+                    .any(|line| line.contains("comments") && line.contains("unknown"))
+            );
+        }
     }
 
     #[test]
@@ -2736,8 +3787,38 @@ mod tests {
     }
 
     #[test]
+    fn footer_identifies_the_effective_remote_without_exposing_its_url() {
+        let mut snapshot = normal_snapshot();
+        let repository = snapshot.repository.as_mut().unwrap();
+        repository.root = PathBuf::from("/a/very/long/local/worktree/unrelated-to-the-remote");
+        let remote = repository.remote.as_mut().unwrap();
+        remote.repository = "moltis-org/moltis".into();
+        remote.url = "https://secret@github.com/moltis-org/moltis".into();
+        for host in ["github.com", "git.example.com"] {
+            snapshot
+                .repository
+                .as_mut()
+                .unwrap()
+                .remote
+                .as_mut()
+                .unwrap()
+                .host = host.into();
+            let text = render(112, 28, &snapshot, &mut AppState::default());
+            assert!(text.contains(&format!("{host}/moltis-org/moltis")));
+            assert!(!text.contains("secret"));
+            assert!(!text.contains("unrelated-to-the-remote"));
+        }
+        snapshot.repository.as_mut().unwrap().remote = None;
+        snapshot.repository.as_mut().unwrap().root = PathBuf::from("/local-only");
+        assert!(render(112, 28, &snapshot, &mut AppState::default()).contains("/local-only"));
+    }
+
+    #[test]
     fn normal_inbox_has_opencode_visual_contract_and_columns() {
-        let text = render(112, 28, &normal_snapshot(), &mut AppState::default());
+        let text = render(112, 28, &normal_snapshot(), &mut AppState {
+            layout: crate::LayoutMode::Fixed,
+            ..Default::default()
+        });
         assert!(text.contains(theme::AGENT_LOGO[0]));
         assert!(text.contains(theme::LAUNCHER_LOGO[0]));
         assert!(!text.contains("agents · issues · workspaces"));
@@ -2755,7 +3836,7 @@ mod tests {
         assert!(!text.contains("d dispatch"));
         assert!(!text.contains("Ctrl+P"));
         assert!(!text.contains("Tab/BackTab"));
-        assert!(text.contains("/repo  ·  github online  ·  superset  ·  opencode"));
+        assert!(text.contains("\u{f09b} github.com/acme/launcher"));
         assert!(text.contains(env!("CARGO_PKG_VERSION")));
         assert!(!text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     }
@@ -2763,7 +3844,10 @@ mod tests {
     #[test]
     fn tall_inbox_uses_upper_whitespace_for_live_agent_activity() {
         let mut snapshot = normal_snapshot();
-        let mut app = AppState::default();
+        let mut app = AppState {
+            layout: crate::LayoutMode::Fixed,
+            ..Default::default()
+        };
         app.agent_activity.record(&snapshot);
 
         let before = render(112, 48, &snapshot, &mut app);
@@ -2819,10 +3903,11 @@ mod tests {
         assert!(!line.contains('█'));
         let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
         for tab in [InboxTab::Issues, InboxTab::PullRequests] {
-            for overlay in [false, true] {
+            for overlay in 0..3 {
                 let app = AppState {
                     tab,
-                    command_overlay: overlay,
+                    command_overlay: overlay == 1,
+                    debug_overlay: overlay == 2,
                     ..Default::default()
                 };
                 terminal
@@ -2830,7 +3915,7 @@ mod tests {
                     .unwrap();
                 let cell = terminal.backend().buffer().cell((0, 0)).unwrap();
                 assert_eq!(cell.symbol(), "S");
-                if overlay {
+                if overlay != 0 {
                     assert_ne!(cell.bg, theme::text());
                 } else {
                     assert_eq!(cell.bg, theme::text());
@@ -2970,7 +4055,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_reports_the_detected_worktree_manager() {
+    fn footer_omits_the_detected_worktree_manager_and_agent() {
         let mut snapshot = normal_snapshot();
         snapshot.backends = vec![
             BackendStatus {
@@ -2995,7 +4080,252 @@ mod tests {
         snapshot.selected_backend = Some(BackendKind::Native);
 
         let text = render(112, 28, &snapshot, &mut AppState::default());
-        assert!(text.contains("/repo  ·  github online  ·  herdr  ·  opencode"));
+        assert!(text.contains("\u{f09b} github.com/acme/launcher"));
+        assert!(!text.contains("herdr"));
+        assert!(!text.contains("opencode"));
+    }
+
+    #[test]
+    fn debug_renders_live_snapshot_and_scrolls_responsively() {
+        let mut snapshot = normal_snapshot();
+        snapshot
+            .repository
+            .as_mut()
+            .unwrap()
+            .remote
+            .as_mut()
+            .unwrap()
+            .url = "https://secret-token@github.com/acme/launcher".into();
+        snapshot.backends[0].message = Some("backend unavailable right now".into());
+        snapshot.sources[0].connected = false;
+        snapshot.sources[0].message = Some("GitHub throttled; retry after tomorrow".into());
+        snapshot.error = Some("refresh failed".into());
+        snapshot.compute_targets.push(compute_target(
+            "remote",
+            ComputeTargetAvailability::Offline,
+            1,
+            Some(2),
+        ));
+        snapshot.last_refreshed_at = Some(Utc::now());
+        let mut app = AppState {
+            debug_overlay: true,
+            ..Default::default()
+        };
+        let text = render(112, 40, &snapshot, &mut app);
+        for expected in [
+            "Debug",
+            "Backend selected:",
+            "Worktree manager detected: superset",
+            "Selected agent: opencode",
+            "backend unavailable right now",
+            "Local path: /repo",
+            "Effective host/repo: github.com/acme/launcher",
+            "Compute targets: 1",
+            "Target remote: Offline | active: 1 / 2 | dispatchable: false",
+            "disconnected",
+            "GitHub throttled",
+            "refresh failed",
+            "Last refresh:",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("secret-token"));
+        assert!(text.contains(&snapshot.last_refreshed_at.unwrap().to_rfc3339()));
+        snapshot.selected_agent = "changed-agent".into();
+        assert!(render(112, 40, &snapshot, &mut app).contains("changed-agent"));
+        for (width, height) in [(0, 0), (1, 1), (10, 4), (24, 10), (40, 14), (80, 24)] {
+            app.debug_scroll = u16::MAX;
+            let text = render(width, height, &snapshot, &mut app);
+            assert!(app.mouse.blocked);
+            assert!(!text.contains("secret-token"));
+            if app.debug_page_size > 0 && width > 0 {
+                assert!(app.debug_scroll <= app.debug_scroll_max);
+            }
+        }
+        let empty = RuntimeSnapshot::default();
+        app.debug_scroll = 0;
+        let text = render(100, 30, &empty, &mut app);
+        for expected in [
+            "Backend selected: none",
+            "Selected agent: none",
+            "Repository: unavailable",
+            "Last refresh: never",
+            "Backends: 0",
+            "Sources: 0",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        app.debug_scroll = u16::MAX;
+        let text = render(40, 12, &snapshot, &mut app);
+        assert!(app.debug_scroll > 0);
+        assert!(text.contains("retry after"));
+        assert!(text.contains("tomorrow"));
+        snapshot.sources.clear();
+        render(112, 40, &snapshot, &mut app);
+        assert_eq!(app.debug_scroll, 0);
+    }
+
+    #[test]
+    fn debug_mouse_geometry_blocks_background_before_and_after_drawing() {
+        let snapshot = normal_snapshot();
+        let mut app = AppState::default();
+        render(80, 24, &snapshot, &mut app);
+        let row = app.mouse.rows[0].0;
+        app.debug_overlay = true;
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            assert!(!mouse(&mut app, &snapshot, kind, row.x, row.y));
+        }
+        render(40, 12, &snapshot, &mut app);
+        let pane = app.mouse.debug;
+        assert!(app.debug_scroll_max > 0);
+        assert!(mouse(
+            &mut app,
+            &snapshot,
+            MouseEventKind::ScrollDown,
+            pane.x,
+            pane.y
+        ));
+        assert_eq!(app.debug_scroll, 3);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert!(!mouse(&mut app, &snapshot, kind, pane.x, pane.y));
+        }
+        assert_eq!((app.selected, app.scroll), (0, 0));
+        app.debug_overlay = false;
+        assert!(!mouse(
+            &mut app,
+            &snapshot,
+            MouseEventKind::Down(MouseButton::Left),
+            pane.x,
+            pane.y
+        ));
+    }
+
+    #[test]
+    fn debug_command_is_discoverable_in_compact_overlay() {
+        for (width, height) in [(24, 8), (40, 12), (80, 24)] {
+            let mut app = AppState {
+                command_overlay: true,
+                ..Default::default()
+            };
+            let text = render(width, height, &normal_snapshot(), &mut app);
+            assert!(text.contains("debug"), "{width}x{height}: {text}");
+        }
+    }
+
+    #[test]
+    fn footer_source_status_is_compact_and_colored() {
+        let mut snapshot = normal_snapshot();
+        for (connected, message, color) in [
+            (true, None, theme::done()),
+            (false, Some("connection failed"), theme::error()),
+            (
+                true,
+                Some("GitHub throttled; retry after 2026-09-11"),
+                theme::primary(),
+            ),
+            (
+                false,
+                Some("GitHub throttled; retry after 2026-09-11"),
+                theme::primary(),
+            ),
+        ] {
+            snapshot.sources[0].connected = connected;
+            snapshot.sources[0].message = message.map(str::to_owned);
+            let label = footer_source_label(&snapshot);
+            assert_eq!(label.to_string(), "\u{f09b}");
+            assert_eq!(label.spans[0].style.fg, Some(color));
+
+            // Include widths that clip later spans, with and without host metrics.
+            for width in [40, 60, 80, 112] {
+                for sampled in [false, true] {
+                    let mut app = AppState::default();
+                    if sampled {
+                        app.host_metrics.record(82, 67);
+                    }
+                    let buffer = render_buffer(width, 28, &snapshot, &mut app);
+                    let icon = (0..width)
+                        .map(|x| buffer.cell((x, 27)).unwrap())
+                        .find(|cell| cell.symbol() == "\u{f09b}")
+                        .expect("source icon remains visible");
+                    assert_eq!(icon.fg, color);
+                }
+            }
+        }
+
+        snapshot.sources[0].message = None;
+        snapshot.sources[0].connected = true;
+        for name in ["gitlab:gitlab.com:acme/repo", "beads"] {
+            snapshot.sources[0].name = name.into();
+            assert_eq!(
+                footer_source_label(&snapshot).to_string(),
+                format!("{} ●", name.split(':').next().unwrap())
+            );
+        }
+        snapshot.sources.push(normal_snapshot().sources.remove(0));
+        for (first, second, label, color) in [
+            (true, true, "2 sources ●", theme::done()),
+            (true, false, "1/2 sources ●", theme::primary()),
+            (false, true, "1/2 sources ●", theme::primary()),
+            (false, false, "0/2 sources ●", theme::error()),
+        ] {
+            snapshot.sources[0].connected = first;
+            snapshot.sources[1].connected = second;
+            let status = footer_source_label(&snapshot);
+            assert_eq!(status.to_string(), label);
+            assert_eq!(status.spans[1].style.fg, Some(color));
+        }
+        for source in &mut snapshot.sources {
+            source.connected = true;
+        }
+        snapshot.sources[1].message = Some("GitHub throttled; retry after later".into());
+        let status = footer_source_label(&snapshot);
+        assert_eq!(status.to_string(), "2 sources ●");
+        assert_eq!(status.spans[1].style.fg, Some(theme::primary()));
+        snapshot.sources.clear();
+        assert_eq!(footer_source_label(&snapshot).to_string(), "no source");
+    }
+
+    #[test]
+    fn footer_clips_identity_without_overlapping_metrics_or_version() {
+        let snapshot = normal_snapshot();
+        let identity = "\u{f09b} github.com/acme/launcher";
+        let version = env!("CARGO_PKG_VERSION");
+        for width in 0..=120 {
+            for sampled in [false, true] {
+                let mut metrics = HostMetrics::default();
+                if sampled {
+                    metrics.record(82, 67);
+                }
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| draw_footer(frame, frame.area(), &snapshot, &metrics))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let text: String = (0..width)
+                    .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+                    .collect();
+                let text = text.trim();
+                if usize::from(width) >= version.len() {
+                    assert!(text.ends_with(version), "width {width}: {text}");
+                    let left = text.strip_suffix(version).unwrap().trim_end();
+                    if let Some((left, metrics)) = left.split_once("CPU") {
+                        assert!(left.starts_with("\u{f09b} github.com/acme/launcher"));
+                        assert!(identity.starts_with(left.trim_end()));
+                        assert!(metrics.contains("82% 15m"));
+                        assert!(metrics.ends_with("MEM  67%"));
+                    } else {
+                        assert!(identity.starts_with(left), "width {width}: {text}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3011,7 +4341,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_asks_for_a_worktree_manager_when_none_is_detected() {
+    fn footer_omits_worktree_manager_setup_advice() {
         let mut snapshot = normal_snapshot();
         snapshot.backends = vec![BackendStatus {
             kind: BackendKind::Native,
@@ -3022,7 +4352,7 @@ mod tests {
         snapshot.selected_backend = Some(BackendKind::Native);
 
         let text = render(112, 28, &snapshot, &mut AppState::default());
-        assert!(text.contains("please run this in a worktree manager"));
+        assert!(!text.contains("please run this in a worktree manager"));
         assert!(!text.contains(" ·  native  · "));
     }
 
@@ -3061,16 +4391,17 @@ mod tests {
     }
 
     #[test]
-    fn normal_detail_uses_accent_rails_and_preserves_actions() {
+    fn normal_detail_is_flat_with_warm_headings_and_preserves_actions() {
         let snapshot = normal_snapshot();
         let mut app = AppState {
+            layout: crate::LayoutMode::Fixed,
             route: Route::Detail,
             detail_issue_key: Some(snapshot.issues[0].key.clone()),
             ..AppState::default()
         };
 
         let text = render(88, 24, &snapshot, &mut app);
-        assert!(text.contains('┃'));
+        assert!(!text.contains('┃'));
         assert!(text.contains("#7  Repair runtime dispatch"));
         assert!(text.contains("Description"));
         assert!(text.contains("Detailed acceptance criteria"));
@@ -3078,6 +4409,25 @@ mod tests {
         assert!(text.contains("i send input"));
         assert!(text.contains("Esc back"));
         assert!(!text.contains('┌'));
+        let buffer = render_buffer(88, 24, &snapshot, &mut app);
+        for y in 0..23 {
+            for x in 0..88 {
+                assert_eq!(buffer[(x, y)].bg, theme::bg());
+            }
+        }
+        let body = app.mouse.detail;
+        assert_eq!(buffer[(body.x, body.y)].symbol(), "I");
+        assert_eq!(buffer[(body.x, body.y)].fg, theme::primary());
+        assert!(
+            buffer[(body.x, body.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        for y in 1..body.bottom() {
+            let rail = &buffer[(body.x - 2, y)];
+            assert_eq!(rail.symbol(), " ");
+            assert_ne!(rail.fg, theme::primary());
+        }
     }
 
     #[test]
@@ -3090,12 +4440,110 @@ mod tests {
         };
 
         let text = render(40, 10, &snapshot, &mut app);
-        assert!(text.contains('┃'));
+        assert!(!text.contains('┃'));
         assert!(text.contains("#7  Repair runtime dispatch"));
         assert!(text.contains("github · acme/launcher · open"));
         assert!(text.contains("d dispatch"));
         assert!(text.contains("i input"));
         assert!(text.contains("Esc back"));
+    }
+
+    #[test]
+    fn detail_actions_survive_small_and_tiny_layouts_without_rails() {
+        let snapshot = pr_snapshot();
+        for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
+            for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                let mut app = AppState {
+                    layout,
+                    tab,
+                    ..Default::default()
+                };
+                assert!(app.open_detail(&snapshot));
+                for (width, height) in [(18, 5), (20, 5), (24, 7), (36, 10), (40, 10), (88, 4)] {
+                    let text = render(width, height, &snapshot, &mut app);
+                    assert!(!text.contains('┃'));
+                    for action in [
+                        if tab == InboxTab::PullRequests {
+                            "d review PR"
+                        } else {
+                            "d dispatch"
+                        },
+                        "Esc",
+                    ] {
+                        assert!(
+                            text.contains(action),
+                            "{width}x{height}: missing {action}: {text}"
+                        );
+                    }
+                    assert!(text.contains(if tab == InboxTab::PullRequests {
+                        "#42"
+                    } else {
+                        "#7"
+                    }));
+                    assert!(app.dispatch_overlay.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_detail_resize_keeps_mouse_insets_and_reaches_end_of_wrapped_content() {
+        let mut snapshot = pr_snapshot();
+        for issue in &mut snapshot.issues {
+            issue.description =
+                Some("Wide words and narrow wrapping \u{754c}\u{754c}\u{754c}. ".repeat(80));
+            issue.blocked_by = vec!["dependency-1".into()];
+        }
+        for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
+            for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                let mut app = AppState {
+                    layout,
+                    tab,
+                    ..Default::default()
+                };
+                assert!(app.open_detail(&snapshot));
+                let key = app.detail_issue_key.clone();
+                for width in [40, 88, 160, 240, 40] {
+                    app.detail_scroll = u16::MAX;
+                    let text = render(width, 24, &snapshot, &mut app);
+                    assert_eq!(app.detail_scroll, app.detail_scroll_max);
+                    assert!(text.contains(if tab == InboxTab::PullRequests {
+                        "Not reviewed."
+                    } else {
+                        "Not dispatched."
+                    }));
+                    assert_eq!(app.detail_issue_key, key);
+                    let body = app.mouse.detail;
+                    for (x, y) in [
+                        (body.x - 1, body.y),
+                        (body.right(), body.y),
+                        (body.x, body.y - 1),
+                        (body.x, body.bottom()),
+                    ] {
+                        assert!(!mouse(&mut app, &snapshot, MouseEventKind::ScrollUp, x, y));
+                    }
+                    assert!(mouse(
+                        &mut app,
+                        &snapshot,
+                        MouseEventKind::ScrollUp,
+                        body.right() - 1,
+                        body.y
+                    ));
+                    assert_eq!(app.detail_scroll, app.detail_scroll_max.saturating_sub(3));
+                }
+                app.detail_scroll = 0;
+                let text = render(112, 48, &snapshot, &mut app);
+                for metadata in [
+                    "dependency-1",
+                    "octocat",
+                    "runtime",
+                    "P1",
+                    "https://github.com/acme/launcher/issues/",
+                ] {
+                    assert!(text.contains(metadata), "missing {metadata}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -3172,7 +4620,7 @@ mod tests {
         assert!(text.contains("workspace-7"));
         assert!(text.contains("migration plan ready"));
         assert!(text.contains("i send input"));
-        assert!(text.contains('┃'));
+        assert!(!text.contains('┃'));
     }
 
     #[test]

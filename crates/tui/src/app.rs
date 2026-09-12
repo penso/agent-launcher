@@ -66,6 +66,7 @@ pub(crate) enum DispatchStage {
 
 #[derive(Default)]
 pub(crate) struct AppState {
+    pub layout: crate::LayoutMode,
     pub mouse: crate::mouse::MouseGeometry,
     pub route: Route,
     pub tab: InboxTab,
@@ -84,6 +85,10 @@ pub(crate) struct AppState {
     pub delete_preview_request: Option<u64>,
     pub next_request_id: u64,
     pub command_overlay: bool,
+    pub debug_overlay: bool,
+    pub debug_scroll: u16,
+    pub debug_scroll_max: u16,
+    pub debug_page_size: u16,
     pub sort_overlay: bool,
     pub sort_cursor: usize,
     pub issue_sort: IssueSort,

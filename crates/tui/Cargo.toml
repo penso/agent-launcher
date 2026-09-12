@@ -11,7 +11,7 @@ chrono.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 fuzzy-matcher.workspace = true
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

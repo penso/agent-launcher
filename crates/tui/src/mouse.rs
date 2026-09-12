@@ -15,6 +15,7 @@ pub(crate) struct MouseGeometry {
     pub list: Rect,
     pub scroll: usize,
     pub detail: Rect,
+    pub debug: Rect,
     pub blocked: bool,
 }
 
@@ -25,6 +26,22 @@ pub(crate) fn handle_mouse(
     size: (u16, u16),
 ) -> bool {
     let hit = &app.mouse;
+    if app.debug_overlay {
+        if (hit.screen.width, hit.screen.height) != size
+            || !hit.debug.contains(Position::new(event.column, event.row))
+        {
+            return false;
+        }
+        let previous = app.debug_scroll;
+        match event.kind {
+            MouseEventKind::ScrollUp => app.debug_scroll = app.debug_scroll.saturating_sub(3),
+            MouseEventKind::ScrollDown => {
+                app.debug_scroll = app.debug_scroll.saturating_add(3).min(app.debug_scroll_max);
+            },
+            _ => return false,
+        }
+        return previous != app.debug_scroll;
+    }
     if hit.blocked
         || app.input_overlay.is_some()
         || app.delete_overlay.is_some()

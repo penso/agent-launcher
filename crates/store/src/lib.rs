@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS issues (
     priority INTEGER,
     created_at TEXT,
     updated_at TEXT,
-    pull_request_json TEXT
+    pull_request_json TEXT,
+    activity_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS issues_source_idx ON issues(source);
@@ -141,6 +142,14 @@ impl Store {
                 .execute(&mut *transaction)
                 .await?;
         }
+        if !columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "activity_json")
+        {
+            sqlx::query("ALTER TABLE issues ADD COLUMN activity_json TEXT")
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(Self { pool })
     }
@@ -180,7 +189,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT provider, host, repository, native_id, identifier, title, description, \
              state, url, author, labels_json, parent_id, blocked_by_json, priority, \
-             created_at, updated_at, pull_request_json FROM issues ORDER BY canonical_key ASC",
+             created_at, updated_at, pull_request_json, activity_json FROM issues ORDER BY canonical_key ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -193,7 +202,7 @@ impl Store {
         let rows = sqlx::query(
             "SELECT provider, host, repository, native_id, identifier, title, description, \
              state, url, author, labels_json, parent_id, blocked_by_json, priority, \
-             created_at, updated_at, pull_request_json FROM issues WHERE source = ? ORDER BY canonical_key ASC",
+             created_at, updated_at, pull_request_json, activity_json FROM issues WHERE source = ? ORDER BY canonical_key ASC",
         )
         .bind(source)
         .fetch_all(&self.pool)
@@ -459,8 +468,8 @@ async fn upsert_issue(
     sqlx::query(
         "INSERT INTO issues (canonical_key, source, provider, host, repository, native_id, \
          identifier, title, description, state, url, author, labels_json, parent_id, \
-         blocked_by_json, priority, created_at, updated_at, pull_request_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         blocked_by_json, priority, created_at, updated_at, pull_request_json, activity_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(canonical_key) DO UPDATE SET source = excluded.source, \
          provider = excluded.provider, host = excluded.host, repository = excluded.repository, \
          native_id = excluded.native_id, identifier = excluded.identifier, title = excluded.title, \
@@ -468,7 +477,7 @@ async fn upsert_issue(
          author = excluded.author, labels_json = excluded.labels_json, \
          parent_id = excluded.parent_id, blocked_by_json = excluded.blocked_by_json, \
          priority = excluded.priority, created_at = excluded.created_at, \
-         updated_at = excluded.updated_at, pull_request_json = excluded.pull_request_json",
+         updated_at = excluded.updated_at, pull_request_json = excluded.pull_request_json, activity_json = excluded.activity_json",
     )
     .bind(issue.key.canonical())
     .bind(source)
@@ -489,6 +498,7 @@ async fn upsert_issue(
     .bind(issue.created_at)
     .bind(issue.updated_at)
     .bind(serialize_optional(issue.pull_request.as_ref())?)
+    .bind(serialize_optional(issue.activity.as_ref())?)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -499,6 +509,10 @@ fn issue_from_row(row: &SqliteRow) -> Result<Issue> {
     let provider = IssueProvider::from_str(&provider)
         .map_err(|_| StoreError::InvalidIssueProvider(provider))?;
     Ok(Issue {
+        activity: row
+            .try_get::<Option<String>, _>("activity_json")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
         key: IssueKey {
             provider,
             host: row.try_get("host")?,
@@ -615,6 +629,7 @@ mod tests {
     fn issue(provider: IssueProvider, native_id: &str, title: &str) -> Issue {
         Issue {
             pull_request: None,
+            activity: None,
             key: IssueKey {
                 provider,
                 host: "example.com".to_string(),
@@ -690,6 +705,11 @@ mod tests {
     async fn pr_metadata_and_identity_survive_cache_updates() {
         let store = Store::in_memory().await.unwrap();
         let mut ordinary = issue(IssueProvider::Github, "123", "Issue");
+        ordinary.activity = Some(agent_launcher_core::ItemActivity {
+            comments: Some(0),
+            review_comments: None,
+            commits: Some(u64::MAX),
+        });
         ordinary.identifier = "#123".into();
         let mut pr = ordinary.clone();
         pr.key.native_id = "pr/123".into();
@@ -740,6 +760,7 @@ mod tests {
         let expected = issue(IssueProvider::Github, "123", "Existing issue");
         let mut value = serde_json::to_value(&expected).unwrap();
         value.as_object_mut().unwrap().remove("pull_request");
+        value.as_object_mut().unwrap().remove("activity");
         assert_eq!(serde_json::from_value::<Issue>(value).unwrap(), expected);
     }
 
@@ -763,9 +784,11 @@ mod tests {
                 .await
                 .unwrap();
             let schema = if legacy {
-                SCHEMA.replace(",\n    pull_request_json TEXT", "")
+                SCHEMA
+                    .replace(",\n    pull_request_json TEXT", "")
+                    .replace(",\n    activity_json TEXT", "")
             } else {
-                SCHEMA.to_owned()
+                SCHEMA.replace(",\n    activity_json TEXT", "")
             };
             sqlx::raw_sql(&schema).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO issues (canonical_key, source, provider, host, repository, native_id, identifier, title, state, labels_json, blocked_by_json) VALUES ('github:github.com:acme/app:1', 'github', 'github', 'github.com', 'acme/app', '1', '#1', 'Legacy', 'open', '[]', '[]')")
@@ -795,6 +818,31 @@ mod tests {
                 assert_eq!(issues.len(), 1);
                 assert_eq!(issues[0].title, "Legacy");
                 assert!(issues[0].pull_request.is_none());
+                assert_eq!(
+                    issues[0].activity,
+                    if reopen == 0 {
+                        None
+                    } else {
+                        Some(agent_launcher_core::ItemActivity {
+                            comments: Some(0),
+                            review_comments: Some(u64::MAX),
+                            commits: None,
+                        })
+                    }
+                );
+                let mut updated = issues[0].clone();
+                updated.activity = Some(agent_launcher_core::ItemActivity {
+                    comments: Some(0),
+                    review_comments: Some(u64::MAX),
+                    commits: None,
+                });
+                store
+                    .upsert_issues("github", &[updated.clone()])
+                    .await
+                    .unwrap();
+                assert_eq!(store.load_source_issues("github").await.unwrap(), vec![
+                    updated
+                ]);
                 for source in sources {
                     let invalidated = legacy && reopen == 0 && source.starts_with("github:");
                     assert_eq!(

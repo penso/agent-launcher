@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, Clear, Padding, Paragraph, Wrap},
 };
 
 use crate::{
@@ -39,7 +39,7 @@ pub(crate) fn draw_detail(
         1
     };
     let available = area.inner(Margin::new(margin, usize::from(area.height >= 12) as u16));
-    let content_width = available.width.min(104);
+    let content_width = app.layout.content_width(available.width);
     let content = Rect::new(
         available.x + available.width.saturating_sub(content_width) / 2,
         available.y,
@@ -108,34 +108,28 @@ fn draw_tiny_detail(
     issue: &Issue,
     latest_run: Option<&RunSummary>,
 ) {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("agent ", Style::new().fg(theme::muted()).bold()),
-            Span::styled("launcher", Style::new().fg(theme::text()).bold()),
-        ]),
-        Line::styled(
-            truncate(
-                &format!("{} {}", issue.identifier, issue.title),
-                area.width as usize,
-            ),
-            Style::new().fg(theme::text()),
+    let mut lines = vec![Line::styled(
+        truncate(
+            &format!("{} {}", issue.identifier, issue.title),
+            area.width as usize,
         ),
-    ];
+        Style::new().fg(theme::text()),
+    )];
     if let Some(run) = latest_run {
         lines.push(Line::styled(
             run_label(run.state),
             Style::new().fg(run_color(run.state)).bold(),
         ));
     }
-    lines.push(Line::styled(
-        if issue.pull_request.is_some() {
-            "Esc back · d review PR · i input · x delete"
-        } else {
-            "Esc back · d dispatch · i input · x delete"
-        },
-        Style::new().fg(theme::muted()),
-    ));
-    frame.render_widget(Paragraph::new(lines), area);
+    let controls_height = area.height.min(2);
+    let body = Rect::new(area.x, area.y, area.width, area.height - controls_height);
+    frame.render_widget(Paragraph::new(lines), body);
+    draw_controls(
+        frame,
+        Rect::new(area.x, body.bottom(), area.width, controls_height),
+        None,
+        issue.pull_request.is_some(),
+    );
 }
 
 fn draw_detail_header(
@@ -144,14 +138,7 @@ fn draw_detail_header(
     issue: &Issue,
     latest_run: Option<&RunSummary>,
 ) {
-    let accent = latest_run
-        .filter(|run| run.state.needs_attention())
-        .map_or(theme::primary(), |_| theme::error());
-    let inner = LeftBorderPanel::new()
-        .border_color(accent)
-        .content_bg(theme::panel())
-        .padding(Padding::new(1, 1, 0, 0))
-        .render(area, frame.buffer_mut());
+    let inner = Block::new().padding(Padding::new(2, 1, 0, 0)).inner(area);
     if inner.is_empty() {
         return;
     }
@@ -200,33 +187,25 @@ fn draw_detail_body(
     if area.is_empty() {
         return;
     }
-    let accent = latest_run
-        .filter(|run| run.state.needs_attention())
-        .map_or(theme::primary(), |_| theme::error());
-    let inner = LeftBorderPanel::new()
-        .border_color(accent)
-        .content_bg(theme::element())
-        .padding(Padding::new(1, 1, 1, 1))
-        .render(area, frame.buffer_mut());
+    let padding = u16::from(area.height >= 3);
+    let inner = Block::new()
+        .padding(Padding::new(2, 1, padding, padding))
+        .inner(area);
     if inner.is_empty() {
         return;
     }
     let lines = detail_lines(snapshot, issue, latest_run);
     app.mouse.detail = inner;
-    let visible_height = inner.height;
-    let inner_width = inner.width.max(1) as usize;
-    app.detail_scroll_max = visual_line_count(&lines, inner_width)
-        .saturating_sub(visible_height as usize)
+    let paragraph = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .style(Style::new().fg(theme::text()).bg(theme::bg()));
+    app.detail_scroll_max = paragraph
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize)
         .min(u16::MAX as usize) as u16;
     app.detail_scroll = app.detail_scroll.min(app.detail_scroll_max);
 
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .scroll((app.detail_scroll, 0))
-            .wrap(Wrap { trim: false })
-            .style(Style::new().fg(theme::text()).bg(theme::element())),
-        inner,
-    );
+    frame.render_widget(paragraph.scroll((app.detail_scroll, 0)), inner);
 }
 
 fn detail_lines(
@@ -265,13 +244,27 @@ fn detail_lines(
         ));
         lines.push(Line::styled(
             "Press d to review PR. Opening details does not start a review.",
-            Style::new().fg(theme::primary()),
+            Style::new().fg(theme::muted()),
         ));
     }
     lines.push(key_value("id", &issue.key.canonical()));
     lines.push(key_value("source", &issue.key.provider.to_string()));
     lines.push(key_value("repository", &issue.key.repository));
     lines.push(key_value("state", &issue.state));
+    let activity = issue.activity.unwrap_or_default();
+    let mut counts = vec![("comments", activity.comments)];
+    if issue.pull_request.is_some() {
+        counts.extend([
+            ("review comments", activity.review_comments),
+            ("commits", activity.commits),
+        ]);
+    }
+    for (label, count) in counts {
+        lines.push(key_value(
+            label,
+            &count.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+        ));
+    }
     if let Some(priority) = issue.priority {
         lines.push(key_value("priority", &format!("P{priority}")));
     }
@@ -372,20 +365,6 @@ fn detail_lines(
         ));
     }
     lines
-}
-
-fn visual_line_count(lines: &[Line<'_>], width: usize) -> usize {
-    lines
-        .iter()
-        .map(|line| {
-            let characters = line
-                .spans
-                .iter()
-                .map(|span| span.content.chars().count())
-                .sum::<usize>();
-            characters.max(1).div_ceil(width)
-        })
-        .sum()
 }
 
 fn event_lines(event: &EventEnvelope) -> Vec<Line<'static>> {
@@ -526,7 +505,31 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review
     if area.is_empty() {
         return;
     }
-    let controls = if area.width >= 82 {
+    let controls = if area.height == 1 && area.width < 38 {
+        vec![control_line(&[
+            ("Esc", " back"),
+            (
+                " d",
+                if review {
+                    " review"
+                } else {
+                    " dispatch"
+                },
+            ),
+        ])]
+    } else if area.width < 38 {
+        vec![
+            control_line(&[(
+                "d",
+                if review {
+                    " review PR"
+                } else {
+                    " dispatch"
+                },
+            )]),
+            control_line(&[("o s i x ↑↓ Esc", "")]),
+        ]
+    } else if area.width >= 82 {
         vec![control_line(&[
             (
                 "d",

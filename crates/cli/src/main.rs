@@ -33,6 +33,26 @@ struct Cli {
     /// Override the detected GitHub or GitLab repository remote.
     #[arg(long, value_name = "URL", value_parser = validate_remote_url)]
     remote: Option<String>,
+
+    /// Horizontal TUI layout: centered and capped, or full width with side padding.
+    #[arg(long, value_enum, default_value = "flexible")]
+    layout: LayoutArg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LayoutArg {
+    Fixed,
+    Flexible,
+}
+
+#[cfg(feature = "tui")]
+impl From<LayoutArg> for agent_launcher_tui::LayoutMode {
+    fn from(layout: LayoutArg) -> Self {
+        match layout {
+            LayoutArg::Fixed => Self::Fixed,
+            LayoutArg::Flexible => Self::Flexible,
+        }
+    }
 }
 
 fn validate_remote_url(value: &str) -> Result<String, String> {
@@ -91,7 +111,7 @@ enum Error {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let result = run(cli.remote.as_deref()).await;
+    let result = run(cli.remote.as_deref(), cli.layout.into()).await;
     if let Err(error) = result {
         eprintln!("agent-launcher: {error}");
         std::process::exit(1);
@@ -99,7 +119,10 @@ async fn main() {
 }
 
 #[cfg(feature = "tui")]
-async fn run(remote_url: Option<&str>) -> Result<(), Error> {
+async fn run(
+    remote_url: Option<&str>,
+    layout: agent_launcher_tui::LayoutMode,
+) -> Result<(), Error> {
     let cwd = std::env::current_dir().map_err(Error::CurrentDirectory)?;
     let (repository, sources) = sources_from_cwd_with_remote(&cwd, remote_url).await?;
     let mut config = load_config().await?;
@@ -207,7 +230,7 @@ async fn run(remote_url: Option<&str>) -> Result<(), Error> {
         store.upsert_run(&run).await?;
     }
     let runtime = RuntimeService::start(repository, sources, store, runner, config);
-    let tui_result = agent_launcher_tui::run(runtime.clone()).await;
+    let tui_result = agent_launcher_tui::run(runtime.clone(), layout).await;
     let shutdown_result = runtime.shutdown().await;
     tui_result?;
     shutdown_result?;
@@ -536,6 +559,54 @@ fn main() {
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_layout_default_values_and_remote_override() {
+        let default = Cli::try_parse_from(["agent-launcher"]).unwrap();
+        assert_eq!(default.layout, LayoutArg::Flexible);
+        assert_eq!(
+            agent_launcher_tui::LayoutMode::from(default.layout),
+            agent_launcher_tui::LayoutMode::default()
+        );
+        assert!(default.remote.is_none());
+        for (value, expected, mode) in [
+            (
+                "fixed",
+                LayoutArg::Fixed,
+                agent_launcher_tui::LayoutMode::Fixed,
+            ),
+            (
+                "flexible",
+                LayoutArg::Flexible,
+                agent_launcher_tui::LayoutMode::Flexible,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["agent-launcher", "--layout", value]).unwrap();
+            assert_eq!(cli.layout, expected);
+            assert_eq!(agent_launcher_tui::LayoutMode::from(cli.layout), mode);
+            for remote in [
+                "https://github.com/acme/launcher.git",
+                "git@gitlab.com:acme/tools/launcher.git",
+            ] {
+                for args in [["agent-launcher", "--layout", value, "--remote", remote], [
+                    "agent-launcher",
+                    "--remote",
+                    remote,
+                    "--layout",
+                    value,
+                ]] {
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    assert_eq!(cli.layout, expected);
+                    assert_eq!(cli.remote.as_deref(), Some(remote));
+                }
+            }
+        }
+        for value in ["wide", "", "Flexible"] {
+            let error = Cli::try_parse_from(["agent-launcher", "--layout", value]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+        assert!(Cli::try_parse_from(["agent-launcher", "--layout"]).is_err());
+    }
 
     #[test]
     fn parses_supported_remote_urls() {

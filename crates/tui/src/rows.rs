@@ -318,6 +318,7 @@ mod tests {
             description: None,
             state: "open".to_owned(),
             pull_request: None,
+            activity: None,
             url: None,
             author: None,
             labels: Vec::new(),

@@ -224,6 +224,7 @@ impl BeadsIssue {
 
         Issue {
             pull_request: None,
+            activity: None,
             key: IssueKey {
                 provider: source.provider,
                 host: source.host.clone(),
@@ -321,6 +322,7 @@ mod tests {
         );
 
         assert_eq!(issue.identifier, "app-12");
+        assert_eq!(issue.activity, None);
         assert_eq!(issue.parent_id.as_deref(), Some("app-1"));
         assert_eq!(issue.blocked_by, ["app-10", "app-11"]);
         assert_eq!(issue.priority, Some(1));

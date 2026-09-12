@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    Error,
+    Error, LayoutMode,
     app::{AppState, DeleteOverlay, DispatchOverlay, DispatchStage, InputOverlay, Route},
     metrics::HostMetricsSampler,
     render::draw,
@@ -51,7 +51,7 @@ enum UiActionResult {
 type UiActionSender = tokio::sync::mpsc::UnboundedSender<UiActionResult>;
 
 /// Runs the interactive terminal UI against a live runtime handle.
-pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
+pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error> {
     let mut cleanup = TerminalCleanup { title_saved: false };
     enable_raw_mode()?;
 
@@ -74,7 +74,10 @@ pub async fn run(runtime: RuntimeHandle) -> Result<(), Error> {
     let mut events = EventStream::new();
     let mut snapshots = runtime.subscribe();
     let mut snapshot = runtime.snapshot();
-    let mut app = AppState::default();
+    let mut app = AppState {
+        layout,
+        ..Default::default()
+    };
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
     if snapshot.initialized {
         app.agent_activity.initialize(&snapshot);
@@ -222,13 +225,7 @@ fn handle_key(
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
-    if app.route == Route::Inbox
-        && key.code == KeyCode::Char('g')
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-        && app.dispatch_overlay.is_none()
-    {
-        app.sort_overlay = false;
-        app.command_overlay = !app.command_overlay;
+    if handle_debug_key(app, key) {
         return false;
     }
     if app.reconcile_detail(snapshot) {
@@ -333,6 +330,49 @@ fn handle_list_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot
             app.scroll = 0;
         },
         _ => {},
+    }
+    false
+}
+
+fn handle_debug_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.debug_overlay {
+        let step = match key.code {
+            KeyCode::PageUp | KeyCode::PageDown => app.debug_page_size.max(1),
+            _ => 1,
+        };
+        match key.code {
+            KeyCode::Esc => app.debug_overlay = false,
+            KeyCode::Up | KeyCode::PageUp => {
+                app.debug_scroll = app.debug_scroll.saturating_sub(step);
+            },
+            KeyCode::Down | KeyCode::PageDown => {
+                app.debug_scroll = app
+                    .debug_scroll
+                    .saturating_add(step)
+                    .min(app.debug_scroll_max);
+            },
+            KeyCode::Home => app.debug_scroll = 0,
+            KeyCode::End => app.debug_scroll = app.debug_scroll_max,
+            _ => {},
+        }
+        return true;
+    }
+    if app.command_overlay && key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
+        app.command_overlay = false;
+        app.debug_overlay = true;
+        app.debug_scroll = 0;
+        app.debug_scroll_max = 0;
+        app.debug_page_size = 0;
+        return true;
+    }
+    if app.route == Route::Inbox
+        && key.code == KeyCode::Char('g')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && app.dispatch_overlay.is_none()
+    {
+        app.sort_overlay = false;
+        app.command_overlay = !app.command_overlay;
+        return true;
     }
     false
 }
@@ -1118,6 +1158,7 @@ mod tests {
             description: None,
             state: "open".to_owned(),
             pull_request: None,
+            activity: None,
             url: None,
             author: None,
             labels: Vec::new(),
@@ -1223,18 +1264,63 @@ mod tests {
         let snapshot = RuntimeSnapshot::default();
         let mut app = AppState::default();
         for tab in [KeyCode::Tab, KeyCode::BackTab] {
-            for character in "drs?".chars() {
+            for character in "drsg?".chars() {
+                assert!(!handle_debug_key(&mut app, KeyCode::Char(character).into()));
                 assert!(!handle_list_key(
                     &mut app,
                     KeyCode::Char(character).into(),
                     &snapshot
                 ));
             }
-            assert_eq!(app.search_query, "drs?");
+            assert_eq!(app.search_query, "drsg?");
             assert!(app.dispatch_overlay.is_none());
             handle_list_key(&mut app, tab.into(), &snapshot);
         }
-        assert_eq!(app.search_query, "drs?");
+        assert_eq!(app.search_query, "drsg?");
+    }
+
+    #[test]
+    fn debug_command_is_modal_and_preserves_list_state() {
+        let mut app = AppState {
+            search_query: "keep filter".into(),
+            selected: 4,
+            scroll: 2,
+            ..Default::default()
+        };
+        assert!(handle_debug_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)
+        ));
+        assert!(app.command_overlay);
+        assert!(handle_debug_key(&mut app, KeyCode::Char('g').into()));
+        assert!(app.debug_overlay);
+        assert!(!app.command_overlay);
+        app.debug_scroll_max = 20;
+        app.debug_page_size = 5;
+        for (key, expected) in [
+            (KeyCode::Down, 1),
+            (KeyCode::PageDown, 6),
+            (KeyCode::Up, 5),
+            (KeyCode::End, 20),
+            (KeyCode::PageUp, 15),
+            (KeyCode::Home, 0),
+        ] {
+            assert!(handle_debug_key(&mut app, key.into()));
+            assert_eq!(app.debug_scroll, expected);
+        }
+        for key in [
+            KeyCode::Char('d'),
+            KeyCode::Tab,
+            KeyCode::Enter,
+            KeyCode::Backspace,
+        ] {
+            assert!(handle_debug_key(&mut app, key.into()));
+        }
+        assert!(handle_debug_key(&mut app, KeyCode::Esc.into()));
+        assert!(!app.debug_overlay);
+        assert_eq!(app.search_query, "keep filter");
+        assert_eq!((app.selected, app.scroll), (4, 2));
+        assert!(app.dispatch_overlay.is_none());
     }
 
     #[test]

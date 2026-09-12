@@ -203,6 +203,7 @@ fn newest(
 
 #[derive(Debug, Deserialize)]
 struct GitLabIssue {
+    user_notes_count: Option<u64>,
     iid: u64,
     title: String,
     description: Option<String>,
@@ -219,6 +220,10 @@ impl GitLabIssue {
     fn into_issue(self, source: &SourceKey) -> Issue {
         Issue {
             pull_request: None,
+            activity: Some(agent_launcher_core::ItemActivity {
+                comments: self.user_notes_count,
+                ..Default::default()
+            }),
             key: IssueKey {
                 provider: source.provider,
                 host: source.host.clone(),
@@ -253,6 +258,34 @@ mod tests {
 
     use super::{GitLabIssue, gitlab_endpoint, is_public_gitlab_host, same_origin};
     use crate::SourceKey;
+
+    #[test]
+    fn maps_optional_user_notes_count() {
+        for count in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(42)),
+        ] {
+            let mut payload = serde_json::json!({"iid": 1, "title": "Notes", "state": "opened", "web_url": "https://gitlab.com/acme/app/-/issues/1", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"});
+            if let Some(count) = &count {
+                payload["user_notes_count"] = count.clone();
+            }
+            let issue = serde_json::from_value::<GitLabIssue>(payload)
+                .unwrap()
+                .into_issue(&SourceKey {
+                    provider: IssueProvider::Gitlab,
+                    host: "gitlab.com".into(),
+                    repository: "acme/app".into(),
+                });
+            assert_eq!(
+                issue.activity.unwrap().comments,
+                count.and_then(|n| n.as_u64())
+            );
+            assert_eq!(issue.activity.unwrap().commits, None);
+            assert_eq!(issue.activity.unwrap().review_comments, None);
+        }
+    }
 
     #[test]
     fn encodes_nested_project_path() {

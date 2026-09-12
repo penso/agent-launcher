@@ -163,6 +163,7 @@ impl IssueSource for GitHubSource {
                 .is_none_or(|last_full| now - last_full >= FULL_RECONCILIATION_INTERVAL);
         let mut issues = Vec::new();
         let mut pr_indices = HashMap::new();
+        let mut pr_comments = HashMap::new();
         let mut updated_at = checkpoint.and_then(|value| value.updated_at);
         let mut page = 1_u32;
 
@@ -198,6 +199,9 @@ impl IssueSource for GitHubSource {
 
             for record in records {
                 updated_at = newest(updated_at, Some(record.updated_at));
+                if record.pull_request.is_some() {
+                    pr_comments.insert(record.number, record.comments);
+                }
                 if record.pull_request.is_none() {
                     issues.push(record.into_issue(&self.key));
                 } else if !full {
@@ -233,7 +237,11 @@ impl IssueSource for GitHubSource {
                     })?;
                 for record in records {
                     let number = record.issue.number;
-                    let issue = record.into_issue(&self.key);
+                    let mut issue = record.into_issue(&self.key);
+                    let activity = issue.activity.as_mut().unwrap();
+                    activity.comments = activity
+                        .comments
+                        .or(pr_comments.get(&number).copied().flatten());
                     if let Some(&index) = pr_indices.get(&number) {
                         issues[index] = issue;
                     } else {
@@ -269,6 +277,12 @@ impl IssueSource for GitHubSource {
         let mut cursor = checkpoint.and_then(|c| c.pr_cursor);
         let mut pending = Vec::new();
         for (index, issue) in issues.iter_mut().enumerate() {
+            if let Some(old) = cached.get(&issue.key) {
+                issue
+                    .activity
+                    .get_or_insert_default()
+                    .retain_known(old.activity.unwrap_or_default());
+            }
             let Some(metadata) = issue.pull_request.as_mut() else {
                 continue;
             };
@@ -304,6 +318,10 @@ impl IssueSource for GitHubSource {
             match self.pull_request(number).await {
                 Ok(mut detail) => {
                     let revision = pr_revision(&detail);
+                    detail
+                        .activity
+                        .get_or_insert_default()
+                        .retain_known(issues[index].activity.unwrap_or_default());
                     let metadata = detail.pull_request.as_mut().expect("PR detail metadata");
                     if metadata.additions.is_some() && metadata.deletions.is_some() {
                         details.insert(issues[index].key.native_id.clone(), revision);
@@ -353,8 +371,9 @@ impl IssueSource for GitHubSource {
 
 fn pr_revision(issue: &Issue) -> String {
     let metadata = issue.pull_request.as_ref().expect("PR revision metadata");
+    // Refresh persisted pre-activity details once, within the existing rotating budget.
     format!(
-        "{:?}:{}:{}:{}",
+        "activity-v1:{:?}:{}:{}:{}",
         issue.updated_at, metadata.head_sha, metadata.base_sha, issue.state
     )
 }
@@ -514,6 +533,7 @@ fn newest(
 
 #[derive(Debug, Deserialize)]
 struct GitHubIssue {
+    comments: Option<u64>,
     number: u64,
     title: String,
     body: Option<String>,
@@ -543,6 +563,8 @@ impl GitHubIssue {
             merged_at: None,
             additions: None,
             deletions: None,
+            review_comments: None,
+            commits: None,
             base: GitHubPullRequestRef::default(),
             head: GitHubPullRequestRef::default(),
         }
@@ -552,6 +574,10 @@ impl GitHubIssue {
     fn into_issue(self, source: &SourceKey) -> Issue {
         Issue {
             pull_request: None,
+            activity: Some(agent_launcher_core::ItemActivity {
+                comments: self.comments,
+                ..Default::default()
+            }),
             key: IssueKey {
                 provider: source.provider,
                 host: source.host.clone(),
@@ -576,6 +602,8 @@ impl GitHubIssue {
 
 #[derive(Debug, Deserialize)]
 struct GitHubPullRequest {
+    review_comments: Option<u64>,
+    commits: Option<u64>,
     #[serde(flatten)]
     issue: GitHubIssue,
     #[serde(default)]
@@ -593,6 +621,9 @@ impl GitHubPullRequest {
     fn into_issue(self, source: &SourceKey) -> Issue {
         let number = self.issue.number;
         let mut issue = self.issue.into_issue(source);
+        let activity = issue.activity.as_mut().unwrap();
+        activity.review_comments = self.review_comments;
+        activity.commits = self.commits;
         issue.key.native_id = format!("pr/{number}");
         issue.state = if self.merged || self.merged_at.is_some() {
             "merged"
@@ -659,7 +690,8 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
             "base": {"ref": "main", "sha": "base-sha"},
             "head": {"ref": "feature", "sha": "head-sha", "repo": {"full_name": "fork/app"}},
-            "additions": 12, "deletions": 0
+            "additions": 12, "deletions": 0,
+            "comments": 2, "review_comments": 3, "commits": 4
         })
     }
 
@@ -667,6 +699,9 @@ mod tests {
         let mut value = pr_payload(number);
         value.as_object_mut().unwrap().remove("additions");
         value.as_object_mut().unwrap().remove("deletions");
+        for field in ["comments", "review_comments", "commits"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
         value
     }
 
@@ -695,6 +730,14 @@ mod tests {
                 .unwrap();
             server.await.unwrap();
             assert_eq!(result.issues.len(), 25);
+            assert_eq!(
+                result
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.activity.unwrap().commits == Some(4))
+                    .count(),
+                ((round + 1) * 10).min(25)
+            );
             assert_eq!(
                 result
                     .issues
@@ -750,6 +793,165 @@ mod tests {
             }
             cached = result.issues;
             checkpoint = result.checkpoint;
+        }
+    }
+
+    #[test]
+    fn activity_mapping_distinguishes_absent_null_and_zero() {
+        let source = SourceKey {
+            provider: IssueProvider::Github,
+            host: "github.com".into(),
+            repository: "acme/app".into(),
+        };
+        for value in [Value::Null, json!(0), json!(1234)] {
+            let mut payload = pr_list(7);
+            let absent = serde_json::from_value::<GitHubPullRequest>(payload.clone())
+                .unwrap()
+                .into_issue(&source);
+            assert_eq!(absent.activity.unwrap(), Default::default());
+            for field in ["comments", "review_comments", "commits"] {
+                payload[field] = value.clone();
+            }
+            let pr = serde_json::from_value::<GitHubPullRequest>(payload.clone())
+                .unwrap()
+                .into_issue(&source);
+            let activity = pr.activity.unwrap();
+            assert_eq!(activity.comments, value.as_u64());
+            assert_eq!(activity.review_comments, value.as_u64());
+            assert_eq!(activity.commits, value.as_u64());
+            let issue = serde_json::from_value::<GitHubIssue>(payload)
+                .unwrap()
+                .into_issue(&source);
+            assert_eq!(issue.activity.unwrap().comments, value.as_u64());
+            assert_eq!(issue.activity.unwrap().commits, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_sync_retains_issue_list_pr_comments_when_detail_is_unavailable() {
+        let mut stub = pr_payload(7);
+        stub["pull_request"] = json!({});
+        let (source, server) = mock_source(vec![
+            ("/repos/acme/app/issues?", 200, false, json!([stub])),
+            ("/repos/acme/app/pulls?", 200, false, json!([pr_list(7)])),
+            ("/repos/acme/app/pulls/7 ", 500, false, json!({})),
+        ])
+        .await;
+        let result = source.sync(None).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(result.issues.len(), 1);
+        assert_eq!(
+            result.issues[0].activity.unwrap(),
+            agent_launcher_core::ItemActivity {
+                comments: Some(2),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_activity_does_not_repeat_successful_detail_requests() {
+        let mut detail = pr_payload(7);
+        for field in ["comments", "review_comments", "commits"] {
+            detail.as_object_mut().unwrap().remove(field);
+        }
+        let (source, server) = mock_source(vec![
+            ("/repos/acme/app/issues?", 200, false, json!([])),
+            ("/repos/acme/app/pulls?", 200, false, json!([pr_list(7)])),
+            ("/repos/acme/app/pulls/7 ", 200, false, detail),
+            ("/repos/acme/app/issues?", 200, false, json!([])),
+            ("/repos/acme/app/pulls?", 200, false, json!([pr_list(7)])),
+        ])
+        .await;
+        let first = source.sync(None).await.unwrap();
+        let second = source
+            .sync_with_cache(Some(&first.checkpoint), &first.issues)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(second.issues[0].activity.unwrap(), Default::default());
+        assert_eq!(second.checkpoint.pr_details, first.checkpoint.pr_details);
+    }
+
+    #[tokio::test]
+    async fn activity_refreshes_legacy_revisions_and_comment_updates_without_extra_fetches() {
+        let key = SourceKey {
+            provider: IssueProvider::Github,
+            host: "github.com".into(),
+            repository: "acme/app".into(),
+        };
+        let mut old = serde_json::from_value::<GitHubPullRequest>(pr_payload(7))
+            .unwrap()
+            .into_issue(&key);
+        old.activity = None;
+        let mut checkpoint = SyncCheckpoint {
+            updated_at: Some(chrono::Utc::now()),
+            last_full_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        checkpoint.pr_details.insert(
+            "pr/7".into(),
+            super::pr_revision(&old).replace("activity-v1:", ""),
+        );
+        let mut cached = vec![old];
+        for round in 0..5 {
+            let mut list = pr_list(7);
+            let mut detail = pr_payload(7);
+            if round >= 1 {
+                list["updated_at"] = json!("2026-01-05T00:00:00Z");
+                detail["updated_at"] = list["updated_at"].clone();
+            }
+            detail["comments"] = json!(0);
+            detail["review_comments"] = json!(20);
+            if round == 0 {
+                detail = pr_payload(7);
+            }
+            if round == 2 {
+                detail.as_object_mut().unwrap().remove("commits");
+            }
+            let mut responses = vec![
+                ("/repos/acme/app/issues?", 200, false, json!([])),
+                ("/repos/acme/app/pulls?", 200, false, json!([list])),
+            ];
+            if round <= 2 {
+                responses.push((
+                    "/repos/acme/app/pulls/7 ",
+                    if round == 1 {
+                        500
+                    } else {
+                        200
+                    },
+                    false,
+                    detail,
+                ));
+            }
+            let (source, server) = mock_source(responses).await;
+            let result = source
+                .sync_with_cache(Some(&checkpoint), &cached)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            let activity = result.issues[0].activity.unwrap();
+            assert_eq!(
+                activity.comments,
+                Some(if round < 2 {
+                    2
+                } else {
+                    0
+                })
+            );
+            assert_eq!(
+                activity.review_comments,
+                Some(if round < 2 {
+                    3
+                } else {
+                    20
+                })
+            );
+            assert_eq!(activity.commits, Some(4));
+            checkpoint =
+                serde_json::from_value(serde_json::to_value(result.checkpoint).unwrap()).unwrap();
+            cached = serde_json::from_value(serde_json::to_value(result.issues).unwrap()).unwrap();
         }
     }
 
