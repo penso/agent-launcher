@@ -1428,6 +1428,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dispatch_worker_results_reach_visible_status() {
+        for result in [
+            Ok(()),
+            Err(agent_launcher_runtime::Error::RunAlreadyActive(
+                "run-1".into(),
+            )),
+            Err(agent_launcher_runtime::Error::LaunchFailed {
+                run_id: "run-1".into(),
+                message: "Initial prompt failed: invalid agent".into(),
+            }),
+        ] {
+            let expected = match &result {
+                Ok(()) => "agent dispatched".to_owned(),
+                Err(error) => format!("runtime error: {error}"),
+            };
+            let (actions, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            spawn_runtime_action(&actions, "agent dispatched", None, async move { result });
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut app = AppState::default();
+            apply_ui_action_result(&mut app, result);
+            assert_eq!(app.status_message.as_deref(), Some(expected.as_str()));
+            let backend = ratatui::backend::TestBackend::new(120, 40);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &RuntimeSnapshot::default(), &mut app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(&expected), "missing status: {expected}");
+        }
+    }
+
+    #[test]
+    fn herdr_profile_selection_finishes_the_chooser_without_a_target_stage() {
+        let selected = issue("1", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            prompt_profiles: vec!["implementer".into(), "designer".into()],
+            selected_backend: Some(BackendKind::Herdr),
+            selected_agent: "claude".into(),
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState::default();
+        assert_eq!(prepare_dispatch(&mut app, &snapshot), None);
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 1),
+            Some(LaunchAction::Dispatch {
+                issue: selected.key,
+                profile: Some("designer".into()),
+                target: None,
+            })
+        );
+        assert!(app.dispatch_overlay.is_none());
+        assert_eq!(snapshot.selected_agent, "claude");
+    }
+
     #[test]
     fn detail_dispatch_never_retargets_after_reorder_and_removal() {
         let first = issue("1", Duration::days(2));

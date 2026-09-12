@@ -26,6 +26,9 @@ pub struct RuntimeSnapshot {
     pub refreshing: bool,
     pub last_refreshed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    pub diagnostic_log_path: Option<std::path::PathBuf>,
+    pub diagnostic_log_error: Option<String>,
+    pub last_failure: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

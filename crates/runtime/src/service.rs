@@ -23,7 +23,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior},
 };
 
-use crate::{DesktopNotifier, Error, NoopNotifier, NotifyRustNotifier, Result};
+use crate::{DesktopNotifier, Diagnostics, Error, NoopNotifier, NotifyRustNotifier, Result};
 
 const COMMAND_CAPACITY: usize = 64;
 const RUN_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -45,6 +45,7 @@ enum DispatchAction<'a> {
 /// Cloneable command and snapshot interface to a running [`RuntimeService`].
 #[derive(Clone)]
 pub struct RuntimeHandle {
+    diagnostics: Diagnostics,
     commands: mpsc::Sender<CommandRequest>,
     snapshots: watch::Receiver<RuntimeSnapshot>,
     task: Arc<Mutex<Option<RuntimeJoin>>>,
@@ -54,7 +55,9 @@ pub struct RuntimeHandle {
 impl RuntimeHandle {
     /// Returns the most recently published snapshot.
     pub fn snapshot(&self) -> RuntimeSnapshot {
-        self.snapshots.borrow().clone()
+        let mut snapshot = self.snapshots.borrow().clone();
+        self.diagnostics.apply(&mut snapshot);
+        snapshot
     }
 
     /// Creates an independent snapshot subscription.
@@ -71,10 +74,16 @@ impl RuntimeHandle {
                 acknowledge,
             })
             .await
-            .map_err(|_| Error::CommandChannelClosed)?;
-        acknowledged
-            .await
-            .map_err(|_| Error::CommandAcknowledgmentDropped)?
+            .map_err(|_| {
+                self.diagnostics
+                    .record("command-channel", None, None, "failed");
+                Error::CommandChannelClosed
+            })?;
+        acknowledged.await.map_err(|_| {
+            self.diagnostics
+                .record("command-acknowledgment", None, None, "failed");
+            Error::CommandAcknowledgmentDropped
+        })?
     }
 
     pub async fn refresh(&self) -> Result<()> {
@@ -192,6 +201,7 @@ impl RuntimeHandle {
 
 /// Owns all mutable runtime state and serializes state changes through one loop.
 pub struct RuntimeService {
+    diagnostics: Diagnostics,
     repository: Repository,
     sources: Vec<Arc<dyn IssueSource>>,
     store: Store,
@@ -250,7 +260,12 @@ impl RuntimeService {
                 message: None,
             })
             .collect();
-        let snapshot = RuntimeSnapshot {
+        let diagnostics = store
+            .path()
+            .and_then(|path| path.parent())
+            .map(|parent| Diagnostics::new(parent.join("diagnostics.log")))
+            .unwrap_or_default();
+        let mut snapshot = RuntimeSnapshot {
             repository: Some(repository.clone()),
             sources: source_statuses,
             selected_agent: config.agent.name.clone(),
@@ -261,10 +276,12 @@ impl RuntimeService {
                 .collect(),
             ..RuntimeSnapshot::default()
         };
+        diagnostics.apply(&mut snapshot);
         let (snapshots, snapshot_rx) = watch::channel(snapshot.clone());
         let (command_tx, commands) = mpsc::channel(COMMAND_CAPACITY);
         let task = Arc::new(Mutex::new(None));
         let handle = RuntimeHandle {
+            diagnostics: diagnostics.clone(),
             commands: command_tx,
             snapshots: snapshot_rx,
             task: Arc::clone(&task),
@@ -272,6 +289,7 @@ impl RuntimeService {
         };
         (
             Self {
+                diagnostics,
                 repository,
                 sources: sources.into_iter().map(Arc::from).collect(),
                 store,
@@ -433,6 +451,49 @@ impl RuntimeService {
             command,
             acknowledge,
         } = request;
+        // Only operation labels, backend enums and opaque identity hashes reach the log.
+        let (operation, identity, backend) = match &command {
+            RuntimeCommand::Dispatch { issue, .. } => (
+                "dispatch",
+                Some(issue.canonical()),
+                self.snapshot.selected_backend,
+            ),
+            RuntimeCommand::Review { issue, .. } => (
+                "review",
+                Some(issue.canonical()),
+                self.snapshot.selected_backend,
+            ),
+            RuntimeCommand::SendInput { run_id, .. }
+            | RuntimeCommand::Stop { run_id }
+            | RuntimeCommand::Open { run_id } => {
+                let operation = match &command {
+                    RuntimeCommand::SendInput { .. } => "send-input",
+                    RuntimeCommand::Stop { .. } => "stop",
+                    _ => "open",
+                };
+                let backend = self
+                    .snapshot
+                    .runs
+                    .iter()
+                    .find(|run| run.id == *run_id)
+                    .and_then(|run| run.workspace.as_ref())
+                    .map(|workspace| workspace.backend);
+                (operation, Some(run_id.clone()), backend)
+            },
+            RuntimeCommand::DeleteWorktree { preview } => (
+                "delete-worktree",
+                Some(preview.run.id.clone()),
+                preview
+                    .run
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.backend),
+            ),
+            RuntimeCommand::Refresh => ("refresh", None, None),
+            RuntimeCommand::Shutdown => ("shutdown", None, None),
+        };
+        self.diagnostics
+            .record(operation, backend, identity.as_deref(), "started");
         if matches!(&command, RuntimeCommand::Refresh) {
             self.refresh_waiters.push(acknowledge);
             self.launch_detection();
@@ -501,6 +562,16 @@ impl RuntimeService {
         if result.is_ok() && matches!(name, "dispatch" | "review" | "stop" | "delete-worktree") {
             self.launch_detection();
         }
+        self.diagnostics.record(
+            operation,
+            backend,
+            identity.as_deref(),
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
         self.record_command_result(name, &result);
         let _ = acknowledge.send(result);
         shutdown
@@ -537,7 +608,7 @@ impl RuntimeService {
             _ => {},
         }
         let canonical = key.canonical();
-        if self.snapshot.runs.iter().any(|run| {
+        if let Some(run) = self.snapshot.runs.iter().find(|run| {
             run.issue_key == canonical
                 && (run.state.is_active()
                     || (matches!(run.state, RunState::Disconnected | RunState::Failed)
@@ -546,7 +617,11 @@ impl RuntimeService {
                             .as_ref()
                             .is_some_and(|workspace| workspace.backend == BackendKind::Native)))
         }) {
-            return Ok(());
+            return Err(if run.state.is_active() {
+                Error::RunAlreadyActive(run.id.clone())
+            } else {
+                Error::NativeRunRequiresRecovery(run.id.clone())
+            });
         }
         let backend = self.snapshot.selected_backend.ok_or_else(|| {
             Error::BackendUnavailable(backend_config_name(&self.config.backend).to_owned())
@@ -584,7 +659,14 @@ impl RuntimeService {
         };
         let result = self.runner.dispatch(backend, request).await?;
         let mut run = result.run;
-        if !result.capabilities.supports(Capability::Refresh) {
+        let launch_error = (run.state == RunState::Failed).then(|| Error::LaunchFailed {
+            run_id: run.id.clone(),
+            message: run
+                .message
+                .clone()
+                .unwrap_or_else(|| "backend reported failure".to_owned()),
+        });
+        if launch_error.is_none() && !result.capabilities.supports(Capability::Refresh) {
             run.state = RunState::Idle;
             run.message = Some("Status tracking is not exposed by this backend; open the workspace to follow progress".to_owned());
             run.updated_at = Utc::now();
@@ -599,7 +681,7 @@ impl RuntimeService {
         self.next_sequences.insert(run.id.clone(), 0);
         self.upsert_snapshot_run(run);
         self.publish();
-        Ok(())
+        launch_error.map_or(Ok(()), Err)
     }
 
     async fn delete_run_worktree(&mut self, preview: WorktreeDeletePreview) -> Result<()> {
@@ -709,12 +791,16 @@ impl RuntimeService {
         for source in &self.sources {
             let source_name = source.source_key().canonical();
             if source.retry_at().is_some() {
+                self.diagnostics
+                    .record("source-refresh", None, Some(&source_name), "throttled");
                 continue;
             }
             if !self.source_in_flight.insert(source_name.clone()) {
                 continue;
             }
             let source = Arc::clone(source);
+            self.diagnostics
+                .record("source-refresh", None, Some(&source_name), "started");
             let store = self.store.clone();
             launched = true;
             self.work.spawn(async move {
@@ -796,6 +882,16 @@ impl RuntimeService {
                 result,
             } => {
                 self.source_in_flight.remove(&source_name);
+                self.diagnostics.record(
+                    "source-refresh",
+                    None,
+                    Some(&source_name),
+                    if result.is_ok() {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    },
+                );
                 let retry_at = self
                     .sources
                     .iter()
@@ -822,6 +918,12 @@ impl RuntimeService {
                     },
                 }
                 if let Some(retry_at) = retry_at {
+                    self.diagnostics.record(
+                        "source-refresh",
+                        None,
+                        Some(&source_name),
+                        "throttled",
+                    );
                     let message = format!("GitHub throttled; retry after {retry_at}");
                     self.set_source_status(&source_name, true, Some(message.clone()));
                     self.set_error_without_publish(format!("source:{source_name}"), message);
@@ -1033,6 +1135,18 @@ impl RuntimeService {
     }
 
     fn apply_detections(&mut self, detections: Vec<BackendDetection>) {
+        for detection in &detections {
+            self.diagnostics.record(
+                "backend-detection",
+                Some(detection.backend),
+                None,
+                if detection.available {
+                    "succeeded"
+                } else {
+                    "unavailable"
+                },
+            );
+        }
         let selected = select_backend(&self.config.backend, &detections);
         self.snapshot.selected_backend = selected;
         self.snapshot.backends = detections
@@ -1125,6 +1239,18 @@ impl RuntimeService {
             self.set_error_without_publish("command:refresh", failure.clone());
         }
         let waiters = std::mem::take(&mut self.refresh_waiters);
+        for _ in &waiters {
+            self.diagnostics.record(
+                "refresh",
+                None,
+                None,
+                if failure.is_empty() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+            );
+        }
         self.update_refreshing();
         self.publish();
         for waiter in waiters {
@@ -1143,7 +1269,19 @@ impl RuntimeService {
     }
 
     fn set_error_without_publish(&mut self, key: impl Into<String>, message: String) {
-        self.errors.insert(key.into(), message);
+        let key = key.into();
+        let operation = if key.starts_with("store:") {
+            "store"
+        } else if key.starts_with("run:") {
+            "run-refresh"
+        } else {
+            "runtime"
+        };
+        if !key.starts_with("command:") && !key.starts_with("source:") {
+            self.diagnostics
+                .record(operation, None, Some(&key), "failed");
+        }
+        self.errors.insert(key, message);
         self.update_error_text();
     }
 
@@ -1168,7 +1306,9 @@ impl RuntimeService {
     }
 
     fn publish(&self) {
-        self.snapshots.send_replace(self.snapshot.clone());
+        let mut snapshot = self.snapshot.clone();
+        self.diagnostics.apply(&mut snapshot);
+        self.snapshots.send_replace(snapshot);
     }
 }
 
@@ -1689,6 +1829,7 @@ mod tests {
         requests: Mutex<Vec<DispatchRequest>>,
         runs: Mutex<HashMap<String, RunSummary>>,
         next_status: Mutex<Option<(RunState, Option<String>, Option<String>)>>,
+        dispatch_failure: Mutex<Option<String>>,
         refresh_gate: Mutex<Option<RefreshGate>>,
     }
 
@@ -1710,6 +1851,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 runs: Mutex::new(HashMap::new()),
                 next_status: Mutex::new(None),
+                dispatch_failure: Mutex::new(None),
                 refresh_gate: Mutex::new(None),
             })
         }
@@ -1775,6 +1917,7 @@ mod tests {
         ) -> agent_launcher_runner::Result<DispatchResult> {
             let number = self.dispatches.fetch_add(1, Ordering::SeqCst) + 1;
             let now = Utc::now();
+            let failure = self.dispatch_failure.lock().unwrap().take();
             let run = RunSummary {
                 id: format!("run-{number}"),
                 issue_key: request.issue.key.canonical(),
@@ -1786,8 +1929,12 @@ mod tests {
                     branch: format!("agent/{number}"),
                 }),
                 agent: request.agent.clone(),
-                state: RunState::Running,
-                message: None,
+                state: if failure.is_some() {
+                    RunState::Failed
+                } else {
+                    RunState::Running
+                },
+                message: failure,
                 session_id: Some(format!("session-{number}")),
                 started_at: now,
                 updated_at: now,
@@ -2131,11 +2278,17 @@ mod tests {
                     handle.review(regular.key.clone(), None).await,
                     Err(Error::ReviewRequiresPullRequest(key)) if key == regular.key
                 ));
-                handle
+                let review_result = handle
                     .review(pr.key.clone(), target.map(str::to_owned))
-                    .await
-                    .unwrap();
-                handle.dispatch(regular.key.clone(), None).await.unwrap();
+                    .await;
+                let dispatch_result = handle.dispatch(regular.key.clone(), None).await;
+                if already_running {
+                    assert!(matches!(review_result, Err(Error::RunAlreadyActive(_))));
+                    assert!(matches!(dispatch_result, Err(Error::RunAlreadyActive(_))));
+                } else {
+                    review_result.unwrap();
+                    dispatch_result.unwrap();
+                }
                 assert_eq!(backend.dispatches.load(Ordering::SeqCst), 2);
                 if already_running {
                     assert_eq!(handle.snapshot().runs.len(), 2);
@@ -2196,6 +2349,119 @@ mod tests {
             assert_eq!(store.load_runs().await.unwrap().len(), 2);
             handle.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_prompt_is_reported_and_preserved_for_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "launcher-command-log-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(root.join("state.sqlite3")).await.unwrap();
+        let selected = issue("44", "Rejected prompt", "open");
+        let (source, _) = MockSource::new(vec![Ok(SyncResult {
+            issues: vec![selected.clone()],
+            checkpoint: SyncCheckpoint::default(),
+            mode: SyncMode::Full,
+        })]);
+        let backend = MockBackend::new(BackendKind::Native, true);
+        *backend.dispatch_failure.lock().unwrap() =
+            Some("Initial prompt failed: invalid agent".into());
+        let handle = RuntimeService::start_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[Arc::clone(&backend)]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let mut snapshots = handle.subscribe();
+        wait_for(&mut snapshots, |snapshot| {
+            snapshot.issues.len() == 1 && snapshot.selected_backend == Some(BackendKind::Native)
+        })
+        .await;
+        assert!(matches!(handle.dispatch(selected.key.clone(), None).await,
+            Err(Error::LaunchFailed { run_id, message })
+                if run_id == "run-1" && message.contains("invalid agent")));
+        assert!(
+            handle
+                .snapshot()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("invalid agent")
+        );
+        let runs = store.load_runs().await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, RunState::Failed);
+        assert_eq!(handle.snapshot().runs[0].state, RunState::Failed);
+        assert!(matches!(handle.dispatch(selected.key, None).await,
+            Err(Error::NativeRunRequiresRecovery(id)) if id == "run-1"));
+        assert_eq!(backend.dispatches.load(Ordering::SeqCst), 1);
+        handle.shutdown().await.unwrap();
+        let log_path = handle.snapshot().diagnostic_log_path.unwrap();
+        assert_eq!(log_path, root.join("diagnostics.log"));
+        let text = std::fs::read_to_string(log_path).unwrap();
+        assert!(text.lines().any(|line| line.contains("operation=dispatch") && line.contains("outcome=started")));
+        assert!(
+            text.lines()
+                .any(|line| line.contains("operation=dispatch") && line.contains("outcome=failed"))
+        );
+        assert!(text.contains("operation=shutdown"));
+        assert!(!text.contains("invalid agent"));
+        assert!(handle.snapshot().last_failure.unwrap().contains("dispatch"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_failures_never_copy_external_error_text() {
+        let root = std::env::temp_dir().join(format!(
+            "launcher-redact-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let (mut service, handle) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![],
+            Store::in_memory().await.unwrap(),
+            runner(&[]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        service.diagnostics = Diagnostics::new(root.join("diagnostics.log"));
+        let mut handle = handle;
+        handle.diagnostics = service.diagnostics.clone();
+        let sensitive = "Authorization: Bearer token password=secret https://user:pass@host/?key=secret\nprompt body and terminal contents";
+        service.record_command_result(
+            "send-input",
+            &Err(Error::LaunchFailed {
+                run_id: sensitive.into(),
+                message: sensitive.into(),
+            }),
+        );
+        service.set_error("store:issues", sensitive.into());
+        let text = std::fs::read_to_string(root.join("diagnostics.log")).unwrap();
+        for secret in [
+            "Authorization",
+            "password",
+            "https",
+            "prompt",
+            "terminal",
+            "secret",
+        ] {
+            assert!(!text.contains(secret));
+            assert!(
+                !handle
+                    .snapshot()
+                    .last_failure
+                    .as_deref()
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2560,7 +2826,18 @@ mod tests {
         let issue_key = ready.issues[0].key.clone();
 
         handle.dispatch(issue_key.clone(), None).await.unwrap();
-        handle.dispatch(issue_key, None).await.unwrap();
+        assert!(matches!(
+            handle.dispatch(issue_key, None).await,
+            Err(Error::RunAlreadyActive(id)) if id == "run-1"
+        ));
+        assert!(
+            handle
+                .snapshot()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("already active")
+        );
         wait_for(&mut snapshots, |snapshot| snapshot.runs.len() == 1).await;
         assert_eq!(superset.dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(native.dispatches.load(Ordering::SeqCst), 0);

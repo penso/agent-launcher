@@ -125,10 +125,13 @@ async fn run(
 ) -> Result<(), Error> {
     let cwd = std::env::current_dir().map_err(Error::CurrentDirectory)?;
     let (repository, sources) = sources_from_cwd_with_remote(&cwd, remote_url).await?;
+    let data_dir = repository_data_dir(&repository.git_dir)?;
+    let diagnostics = agent_launcher_runtime::Diagnostics::new(data_dir.join("diagnostics.log"));
+    diagnostics.record("startup", None, None, "started");
+    let result = async {
     let mut config = load_config().await?;
     config.prompt_profiles = load_prompt_profiles(&config_root()?).await?;
     validate_config(&config)?;
-    let data_dir = repository_data_dir(&repository.git_dir)?;
     tokio::fs::create_dir_all(&data_dir)
         .await
         .map_err(|source| Error::CreateDataDirectory {
@@ -230,11 +233,24 @@ async fn run(
         store.upsert_run(&run).await?;
     }
     let runtime = RuntimeService::start(repository, sources, store, runner, config);
+    diagnostics.record("startup", None, None, "succeeded");
     let tui_result = agent_launcher_tui::run(runtime.clone(), layout).await;
     let shutdown_result = runtime.shutdown().await;
     tui_result?;
     shutdown_result?;
     Ok(())
+    }.await;
+    diagnostics.record(
+        "cli-session",
+        None,
+        None,
+        if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        },
+    );
+    result
 }
 
 #[cfg(feature = "tui")]

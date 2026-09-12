@@ -49,7 +49,7 @@ impl HerdrBackend {
     }
 
     async fn command(&self, args: Vec<OsString>) -> Result<Value> {
-        tracing::debug!(command = ?args, "running Herdr CLI");
+        tracing::debug!("running Herdr CLI");
         run_json(&self.config.executable, &args, None).await
     }
 
@@ -178,14 +178,14 @@ impl Backend for HerdrBackend {
                 .as_deref()
                 .unwrap_or(&format!("agent/{workspace_name}-{}", &issue_hash[..8])),
         );
-        let response = self
-            .command(worktree_create_args(
-                &request.repository.root,
-                &branch,
-                &workspace_name,
-                request.base_branch.as_deref(),
-            ))
-            .await?;
+        let args = resolved_worktree_create_args(
+            &request.repository.root,
+            &branch,
+            &workspace_name,
+            request.base_branch.as_deref(),
+        )
+        .await?;
+        let response = self.command(args).await?;
         let worktree = parse_worktree(&response)?;
 
         let agent_name = format!("launcher-{}", &Uuid::new_v4().simple().to_string()[..23]);
@@ -507,6 +507,94 @@ fn status_args() -> Vec<OsString> {
     vec!["status".into(), "--json".into()]
 }
 
+async fn resolved_worktree_create_args(
+    source: &std::path::Path,
+    branch: &str,
+    label: &str,
+    base: Option<&str>,
+) -> Result<Vec<OsString>> {
+    let git = std::path::Path::new("git");
+    let output = run_output(
+        git,
+        &["worktree", "list", "--porcelain", "-z"].map(OsString::from),
+        Some(source),
+    )
+    .await?;
+    // Git lists the primary worktree first. NUL delimiters preserve whitespace
+    // and avoid Git's path quoting.
+    let record = output.split("\0\0").next().unwrap_or_default();
+    if record.split('\0').any(|field| field == "bare") {
+        return Err(Error::InvalidRequest(
+            "Herdr requires a non-bare primary checkout; use a repository cloned without --bare"
+                .into(),
+        ));
+    }
+    let primary = record
+        .split('\0')
+        .next()
+        .and_then(|field| field.strip_prefix("worktree "))
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .ok_or_else(|| Error::InvalidResponse("Git did not report a primary checkout".into()))?;
+    let common_dir = run_output(
+        git,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"].map(OsString::from),
+        Some(source),
+    )
+    .await?;
+    let common_dir = PathBuf::from(common_dir.trim_end_matches('\n'));
+    let source_git_dir = run_output(
+        git,
+        &["rev-parse", "--absolute-git-dir"].map(OsString::from),
+        Some(source),
+    )
+    .await?;
+    let missing_primary = || {
+        Error::InvalidRequest(
+            "Herdr cannot locate the primary checkout; launch from the primary checkout \
+             or configure its core.worktree for the separate Git directory"
+                .into(),
+        )
+    };
+    let primary = if tokio::fs::canonicalize(source_git_dir.trim_end_matches('\n')).await?
+        == tokio::fs::canonicalize(&common_dir).await?
+    {
+        source.to_path_buf()
+    } else {
+        // For separate git-dirs, Git's list guesses from the metadata path.
+        // Let Git honor the primary's core.worktree (including config.worktree).
+        let path = run_output(
+            git,
+            &[
+                OsString::from("--git-dir"),
+                common_dir.as_os_str().to_owned(),
+                OsString::from("rev-parse"),
+                OsString::from("--show-toplevel"),
+            ],
+            Some(std::path::Path::new(primary)),
+        )
+        .await
+        .map_err(|_| missing_primary())?;
+        let path = PathBuf::from(path.trim_end_matches('\n'));
+        if path == common_dir || !path.join(".git").exists() {
+            return Err(missing_primary());
+        }
+        path
+    };
+    let base = match base {
+        Some(base) => base.to_owned(),
+        // Herdr resolves HEAD relative to --cwd, not the original workspace.
+        None => run_output(
+            git,
+            &["rev-parse", "--verify", "HEAD^{commit}"].map(OsString::from),
+            Some(source),
+        )
+        .await?
+        .trim()
+        .to_owned(),
+    };
+    Ok(worktree_create_args(&primary, branch, label, Some(&base)))
+}
+
 fn worktree_create_args(
     repository: &std::path::Path,
     branch: &str,
@@ -619,6 +707,156 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    struct TestRepository(PathBuf);
+
+    impl TestRepository {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("herdr-source-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(std::fs::canonicalize(path).unwrap())
+        }
+    }
+
+    impl Drop for TestRepository {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args([
+                "-c",
+                "user.name=Herdr Test",
+                "-c",
+                "user.email=herdr@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn resolves_primary_checkout_and_preserves_source_base() {
+        for separate_git_dir in [false, true] {
+            let temp = TestRepository::new();
+            let primary = temp.0.join("primary checkout \u{e9}");
+            let linked = temp.0.join("linked checkout \u{e9}");
+            let git_dir = temp.0.join("separate metadata");
+            if separate_git_dir {
+                git(&temp.0, &[
+                    "init",
+                    "--separate-git-dir",
+                    git_dir.to_str().unwrap(),
+                    primary.to_str().unwrap(),
+                ]);
+            } else {
+                git(&temp.0, &["init", primary.to_str().unwrap()]);
+            }
+            git(&primary, &["commit", "--allow-empty", "-m", "primary"]);
+            let primary_head = git(&primary, &["rev-parse", "HEAD"]);
+            assert_eq!(
+                resolved_worktree_create_args(&primary, "agent/fix", "fix", None)
+                    .await
+                    .unwrap(),
+                worktree_create_args(&primary, "agent/fix", "fix", Some(&primary_head)),
+            );
+            git(&primary, &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ]);
+            git(&linked, &["commit", "--allow-empty", "-m", "linked"]);
+            let linked_head = git(&linked, &["rev-parse", "HEAD"]);
+            assert_ne!(primary_head, linked_head);
+            if separate_git_dir {
+                let error = resolved_worktree_create_args(&linked, "agent/fix", "fix", None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("launch from the primary checkout")
+                );
+                git(&primary, &["config", "extensions.worktreeConfig", "true"]);
+                git(&primary, &[
+                    "config",
+                    "--worktree",
+                    "core.worktree",
+                    "../primary checkout \u{e9}",
+                ]);
+            }
+            assert_eq!(
+                resolved_worktree_create_args(&linked, "agent/fix", "fix", None)
+                    .await
+                    .unwrap(),
+                worktree_create_args(&primary, "agent/fix", "fix", Some(&linked_head)),
+            );
+            for base in ["HEAD~1", "linked"] {
+                assert_eq!(
+                    resolved_worktree_create_args(&linked, "agent/fix", "fix", Some(base))
+                        .await
+                        .unwrap(),
+                    worktree_create_args(&primary, "agent/fix", "fix", Some(base)),
+                );
+            }
+            git(&linked, &["checkout", "--detach"]);
+            assert_eq!(
+                resolved_worktree_create_args(&linked, "agent/fix", "fix", None)
+                    .await
+                    .unwrap(),
+                worktree_create_args(&primary, "agent/fix", "fix", Some(&linked_head)),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_bare_primary_with_actionable_error() {
+        let temp = TestRepository::new();
+        let seed = temp.0.join("seed");
+        let bare = temp.0.join("bare.git");
+        let linked = temp.0.join("linked");
+        git(&temp.0, &["init", seed.to_str().unwrap()]);
+        git(&seed, &["commit", "--allow-empty", "-m", "seed"]);
+        git(&temp.0, &[
+            "clone",
+            "--bare",
+            seed.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
+        git(&bare, &[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ]);
+        for source in [&bare, &linked] {
+            let error = resolved_worktree_create_args(source, "agent/fix", "fix", None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidRequest(_)));
+            assert!(
+                error
+                    .to_string()
+                    .contains("use a repository cloned without --bare")
+            );
+        }
     }
 
     #[test]

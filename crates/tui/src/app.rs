@@ -99,6 +99,17 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn visible_status(&self, snapshot: &RuntimeSnapshot) -> Option<String> {
+        let error = snapshot
+            .error
+            .as_ref()
+            .or(snapshot.diagnostic_log_error.as_ref());
+        match (self.status_message.as_ref(), error) {
+            (Some(status), Some(error)) => Some(format!("{status} | {error}")),
+            (status, error) => status.or(error).cloned(),
+        }
+    }
+
     pub fn switch_tab(&mut self) {
         self.tab = match self.tab {
             InboxTab::Issues => InboxTab::PullRequests,

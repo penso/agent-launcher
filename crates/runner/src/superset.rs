@@ -46,7 +46,7 @@ impl SupersetBackend {
 
     async fn command(&self, args: Vec<OsString>) -> Result<Value> {
         let args = json_command_args(args);
-        tracing::debug!(command = ?args, "running Superset CLI");
+        tracing::debug!("running Superset CLI");
         run_json(&self.config.executable, &args, None).await
     }
 

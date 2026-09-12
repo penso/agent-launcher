@@ -152,8 +152,9 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
 }
 
 fn draw_tiny_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
-    let message = if let Some(error) = snapshot.error.as_deref() {
-        error
+    let status = app.visible_status(snapshot);
+    let message = if let Some(status) = status.as_deref() {
+        status
     } else if !snapshot.initialized {
         "Loading sources..."
     } else if no_source_detected(snapshot) {
@@ -407,17 +408,7 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
         return;
     }
 
-    let source_count = snapshot.sources.len();
-    let metadata = format!(
-        "{} {} · {}",
-        source_count,
-        if source_count == 1 {
-            "source"
-        } else {
-            "sources"
-        },
-        app.issue_sort.label()
-    );
+    let metadata = app.issue_sort.label();
     let mut tabs = Vec::new();
     let mut x = inner.x;
     for tab in [InboxTab::Issues, InboxTab::PullRequests] {
@@ -1113,16 +1104,15 @@ fn draw_legends(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
 }
 
 fn status_line<'a>(snapshot: &'a RuntimeSnapshot, app: &'a AppState) -> Line<'a> {
-    if let Some(error) = snapshot.error.as_deref() {
+    if let Some(status) = app.visible_status(snapshot) {
+        let color = if snapshot.error.is_some() || snapshot.diagnostic_log_error.is_some() {
+            theme::error()
+        } else {
+            theme::muted()
+        };
         return Line::from(vec![
-            Span::styled("● ", Style::new().fg(theme::error())),
-            Span::styled(error, Style::new().fg(theme::error())),
-        ]);
-    }
-    if let Some(status) = app.status_message.as_deref() {
-        return Line::from(vec![
-            Span::styled("● ", Style::new().fg(theme::primary())),
-            Span::styled(status, Style::new().fg(theme::muted())),
+            Span::styled("● ", Style::new().fg(color)),
+            Span::styled(status, Style::new().fg(color)),
         ]);
     }
     let working = snapshot
@@ -1836,6 +1826,15 @@ fn draw_debug_overlay(
         ),
         format!("Error: {}", snapshot.error.as_deref().unwrap_or("none")),
     ];
+    if let Some(path) = &snapshot.diagnostic_log_path {
+        lines.push(format!("Diagnostic log: {}", path.display()));
+    }
+    if let Some(error) = &snapshot.diagnostic_log_error {
+        lines.push(format!("Logging warning: {error}"));
+    }
+    if let Some(failure) = &snapshot.last_failure {
+        lines.push(format!("Last diagnostic failure: {failure}"));
+    }
     if let Some(repository) = &snapshot.repository {
         lines.push(format!("Local path: {}", repository.root.display()));
         lines.push(format!(
@@ -3824,7 +3823,8 @@ mod tests {
         assert!(!text.contains("agents · issues · workspaces"));
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains("Search issues…"));
-        assert!(text.contains(" Issues    PRs   1 source · newest first"));
+        assert!(text.contains(" Issues    PRs   newest first"));
+        assert!(!text.contains("1 source"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
         assert!(text.contains("age"));
@@ -4163,6 +4163,24 @@ mod tests {
         snapshot.sources.clear();
         render(112, 40, &snapshot, &mut app);
         assert_eq!(app.debug_scroll, 0);
+    }
+
+    #[test]
+    fn debug_exposes_persistent_log_and_nonfatal_logging_warning() {
+        let snapshot = RuntimeSnapshot {
+            diagnostic_log_path: Some("/data/repo/diagnostics.log".into()),
+            diagnostic_log_error: Some("Diagnostic log unavailable; fallback: stderr".into()),
+            last_failure: Some("operation=dispatch outcome=failed".into()),
+            ..RuntimeSnapshot::default()
+        };
+        let mut app = AppState {
+            debug_overlay: true,
+            ..Default::default()
+        };
+        let text = render(112, 40, &snapshot, &mut app);
+        assert!(text.contains("/data/repo/diagnostics.log"));
+        assert!(text.contains("fallback: stderr"));
+        assert!(text.contains("operation=dispatch outcome=failed"));
     }
 
     #[test]
@@ -4703,7 +4721,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_error_takes_priority_over_success_message() {
+    fn action_status_remains_visible_alongside_runtime_errors() {
         let mut snapshot = normal_snapshot();
         snapshot.error = Some("backend mutation failed".to_owned());
         let mut app = AppState {
@@ -4711,9 +4729,20 @@ mod tests {
             ..AppState::default()
         };
 
-        let text = render(80, 20, &snapshot, &mut app);
-        assert!(text.contains("backend mutation failed"));
-        assert!(!text.contains("workspace opened"));
+        for status in [
+            "opening workspace...",
+            "workspace opened",
+            "runtime error: open failed",
+        ] {
+            app.status_message = Some(status.into());
+            let text = render(112, 40, &snapshot, &mut app);
+            assert!(text.contains("backend mutation failed"));
+            assert!(text.contains(status));
+            app.route = Route::Detail;
+            app.detail_issue_key = Some(snapshot.issues[0].key.clone());
+            assert!(render(112, 40, &snapshot, &mut app).contains(status));
+            app.route = Route::Inbox;
+        }
     }
 
     #[test]

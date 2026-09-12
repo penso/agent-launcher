@@ -91,6 +91,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: SqlitePool,
+    path: Option<std::path::PathBuf>,
 }
 
 /// Descriptive alias for [`Store`].
@@ -99,11 +100,18 @@ pub type SqliteStore = Store;
 impl Store {
     /// Opens or creates a database at `path` and initializes its schema.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_owned();
         let options = SqliteConnectOptions::new()
-            .filename(path)
+            .filename(&path)
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(5));
-        Self::connect(options, 5).await
+        let mut store = Self::connect(options, 5).await?;
+        store.path = Some(path);
+        Ok(store)
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Opens a private in-memory database, primarily for tests.
@@ -151,7 +159,7 @@ impl Store {
                 .await?;
         }
         transaction.commit().await?;
-        Ok(Self { pool })
+        Ok(Self { pool, path: None })
     }
 
     /// Atomically replaces the issues belonging to `source`.

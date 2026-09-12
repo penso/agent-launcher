@@ -57,11 +57,12 @@ pub(crate) fn draw_detail(
         return;
     }
 
+    let status = app.visible_status(snapshot);
     let controls_height = if content.width >= 82 {
         1
     } else {
         2
-    };
+    } + u16::from(status.is_some() && content.height >= 6);
     let header_height = if content.height >= 12 {
         3
     } else {
@@ -91,7 +92,7 @@ pub(crate) fn draw_detail(
     draw_controls(
         frame,
         controls,
-        snapshot.error.as_deref().or(app.status_message.as_deref()),
+        status.as_deref(),
         issue.pull_request.is_some(),
     );
     if app.input_overlay.is_some() {
@@ -565,13 +566,18 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review
         ]
     };
     let mut controls = controls;
-    if let Some(status) = status
-        && let Some(last) = controls.last_mut()
-    {
-        last.spans.push(Span::styled(
-            format!("  ·  {status}"),
-            Style::new().fg(theme::muted()),
-        ));
+    if let Some(status) = status {
+        if usize::from(area.height) > controls.len() {
+            controls.push(Line::styled(
+                status.to_owned(),
+                Style::new().fg(theme::muted()),
+            ));
+        } else if let Some(last) = controls.last_mut() {
+            last.spans.push(Span::styled(
+                format!("  ·  {status}"),
+                Style::new().fg(theme::muted()),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(controls).alignment(Alignment::Center), area);
 }

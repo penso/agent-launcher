@@ -60,6 +60,15 @@ pub enum Error {
     #[error("run was not found: {0}")]
     RunNotFound(String),
 
+    #[error("run `{0}` is already active; open the existing workspace instead")]
+    RunAlreadyActive(String),
+
+    #[error("existing native run `{0}` must be resumed or deleted before launching again")]
+    NativeRunRequiresRecovery(String),
+
+    #[error("run `{run_id}` failed to start: {message}")]
+    LaunchFailed { run_id: String, message: String },
+
     #[error("run `{0}` has no workspace")]
     WorkspaceUnavailable(String),
 

@@ -106,7 +106,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("{program} exited with status {status}: {stderr}")]
+    #[error("{} ({program} exited with status {status})", if stderr.is_empty() { "command failed without stderr" } else { stderr })]
     CommandFailed {
         program: String,
         status: String,

@@ -33,7 +33,7 @@ pub(crate) async fn run_output_with_timeout(
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| Error::CommandTimedOut {
-            program: command_display(program, args),
+            program: program.display().to_string(),
             timeout,
         })?
         .map_err(|error| {
@@ -45,12 +45,12 @@ pub(crate) async fn run_output_with_timeout(
         })?;
     if !output.status.success() {
         return Err(Error::CommandFailed {
-            program: command_display(program, args),
+            program: program.display().to_string(),
             status: output
                 .status
                 .code()
                 .map_or_else(|| "signal".to_string(), |code| code.to_string()),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            stderr: command_error_reason(&String::from_utf8_lossy(&output.stderr), args),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -87,18 +87,38 @@ pub(crate) fn parse_json_output(output: &str) -> Result<Value> {
             return Ok(value);
         }
     }
-    Err(Error::InvalidResponse(format!(
-        "command did not return JSON: {}",
-        trimmed.chars().take(240).collect::<String>()
-    )))
+    // Output may contain an echoed prompt or terminal contents.
+    Err(Error::InvalidResponse("command did not return JSON".into()))
 }
 
-pub(crate) fn command_display(program: &Path, args: &[OsString]) -> String {
-    std::iter::once(program.as_os_str())
-        .chain(args.iter().map(OsString::as_os_str))
-        .map(|part| shell_quote(&part.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join(" ")
+fn command_error_reason(stderr: &str, args: &[OsString]) -> String {
+    let mut reason = stderr.trim().to_owned();
+    if let Ok(value) = serde_json::from_str::<Value>(&reason)
+        && let Some(message) = value.pointer("/error/message").and_then(Value::as_str)
+    {
+        reason = match value.pointer("/error/code").and_then(Value::as_str) {
+            Some(code) => format!("{message} [{code}]"),
+            None => message.to_owned(),
+        };
+    }
+    // Herdr uses a positional prompt; Superset uses --prompt. Do not leak
+    // either if the child echoes it in a diagnostic.
+    for (index, arg) in args.iter().enumerate() {
+        let positional_prompt = index == 3
+            && args.first().is_some_and(|arg| arg == "agent")
+            && args.get(1).is_some_and(|arg| arg == "prompt");
+        let flagged_prompt = index > 0 && args[index - 1] == "--prompt";
+        if positional_prompt || flagged_prompt {
+            let prompt = arg.to_string_lossy();
+            if !prompt.is_empty() {
+                reason = reason.replace(prompt.as_ref(), "[redacted]");
+                let encoded =
+                    serde_json::to_string(prompt.as_ref()).expect("string encodes as JSON");
+                reason = reason.replace(&encoded[1..encoded.len() - 1], "[redacted]");
+            }
+        }
+    }
+    reason.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -197,5 +217,91 @@ mod tests {
     fn quotes_shell_arguments() {
         assert_eq!(shell_quote("it's safe"), "'it'\\''s safe'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_command_reports_reason_before_context_without_arguments() {
+        let args = [
+            "-c",
+            "printf 'repository trust required\\ntry again after approval\\n' >&2; exit 7",
+            "private prompt never belongs in errors",
+        ]
+        .map(OsString::from);
+        let error = run_output(Path::new("/bin/sh"), &args, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "repository trust required try again after approval (/bin/sh exited with status 7)"
+        );
+        assert!(!format!("{error:?}").contains("private prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_command_without_stderr_does_not_expose_stdout() {
+        let args = ["-c", "printf 'private prompt'; exit 1"].map(OsString::from);
+        let error = run_output(Path::new("/bin/sh"), &args, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "command failed without stderr (/bin/sh exited with status 1)"
+        );
+        assert!(!format!("{error:?}").contains("private prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_timeout_does_not_expose_arguments() {
+        let args = ["-c", "exec sleep 5", "private prompt"].map(OsString::from);
+        let error =
+            run_output_with_timeout(Path::new("/bin/sh"), &args, None, Duration::from_millis(20))
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::CommandTimedOut { .. }));
+        assert!(!error.to_string().contains("private prompt"));
+        assert!(!format!("{error:?}").contains("private prompt"));
+    }
+
+    #[test]
+    fn structured_errors_put_message_before_code_and_omit_envelope() {
+        assert_eq!(
+            command_error_reason(
+                r#"{"id":"req","error":{"code":"linked_worktree_source","message":"New and open worktree actions start from the repo parent workspace."}}"#,
+                &[],
+            ),
+            "New and open worktree actions start from the repo parent workspace. [linked_worktree_source]"
+        );
+    }
+
+    #[test]
+    fn echoed_prompts_are_redacted_in_plain_and_json_errors() {
+        let prompt = "private prompt\nwith \"quotes\"";
+        for args in [vec!["agent", "prompt", "launcher-123", prompt], vec![
+            "--prompt", prompt,
+        ]] {
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            for stderr in [
+                format!("prompt rejected: {prompt}"),
+                json!({"error": {"code": "rejected", "message": format!("prompt rejected: {prompt}")}}).to_string(),
+                json!({"diagnostic": prompt}).to_string(),
+            ] {
+                let reason = command_error_reason(&stderr, &args);
+                assert!(!reason.contains("private prompt"));
+                assert!(reason.contains("[redacted]"));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_json_does_not_expose_output() {
+        let error = parse_json_output("private prompt").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid backend response: command did not return JSON"
+        );
+        assert!(!format!("{error:?}").contains("private prompt"));
     }
 }

@@ -16,6 +16,9 @@ agent-launcher --remote git@gitlab.com:group/repository.git
 
 HTTPS, `git://`, `ssh://`, and SCP-style Git URLs are supported. The override is also used as the
 repository identity when selecting or creating a workspace backend.
+It does not clone that repository or change the local checkout. Herdr and local native dispatch
+still use the repository where you launched `agent-launcher`; run from the intended repository's
+checkout to dispatch work there, even when `--remote` points the inbox at another repository.
 
 ### Layout
 
@@ -49,10 +52,39 @@ and [tab rename implementation](https://github.com/herdrdev/herdr/blob/v0.9.0/sr
 
 ## Dispatch
 
+### Diagnostics
+
+Press `Ctrl+G`, then `g` to open Debug, including the persistent diagnostic log path,
+the latest diagnostic failure, and any logging warning. `diagnostics.log` lives beside
+the repository's `state.sqlite3` in its existing per-repository user data directory.
+The log appends across launches, rotating at 1 MiB to `diagnostics.log.1` (one backup).
+New log files are owner-only on Unix. Logging failures are nonfatal and fall back to
+stderr with a warning also shown in Debug.
+
+Records contain UTC timestamps, levels, fixed operation/outcome labels, backend kinds,
+and hashed identity references. They deliberately exclude raw errors, prompts, input,
+terminal output, credentials, URLs, and command arguments. Failures are categorized
+by operation rather than attempting unreliable secret-pattern redaction. Use the
+existing on-screen error and source/backend status for actionable details. Dispatch,
+review, input, stop, open, and deletion show pending and success/failure UI statuses;
+their runtime starts and outcomes persist even after a later successful operation.
+Source refresh/backoff, backend detection, and runtime/store failures are recorded too.
+CLI failures after the repository data path is established are recorded as session
+failures; earlier repository discovery/argument errors remain stderr-only. This is
+an operation log, not a terminal transcript or a replacement for backend server logs.
+
 The default backend is `auto`: use Superset when the current repository is registered there, then
 Herdr when its server is running and compatible, otherwise create a native Git worktree and run
 OpenCode. Conductor Cloud is also available explicitly. Native workspaces can run on a named pool
 of SSH targets, optionally waking Daytona, Coder, or an Azure VM before connecting.
+
+Herdr dispatch from a linked worktree uses the repository's primary checkout for worktree creation.
+Unless an explicit base is supplied, the new worktree starts at the original workspace's current
+`HEAD` commit, not the primary checkout's branch. Uncommitted changes are not copied. Repositories
+with a bare primary worktree are unsupported by this backend; use a non-bare clone instead.
+For a separately located Git directory, linked-worktree dispatch requires the primary checkout's
+`core.worktree` to be configured. Git does not otherwise record its location; launch from that
+primary checkout if it is not configured. The launcher never writes this configuration for you.
 
 For SSH workspaces, agent-launcher starts one detached OpenCode server per worktree and connects to
 it through a disposable local SSH tunnel. If the tunnel or launcher exits, the next refresh or input
