@@ -63,12 +63,9 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
-    if let Some(mut command) = herdr_tab_title_command(
-        std::env::var("HERDR_ENV").ok().as_deref(),
-        std::env::var("HERDR_TAB_ID").ok().as_deref(),
-    ) {
+    if std::env::var("HERDR_ENV").as_deref() == Ok("1") {
         // Cosmetic only: an unavailable host must not prevent the launcher from starting.
-        let _ = tokio::time::timeout(Duration::from_secs(1), command.status()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), rename_herdr_tab()).await;
     }
 
     let mut events = EventStream::new();
@@ -189,6 +186,29 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     Ok(())
 }
 
+async fn rename_herdr_tab() -> Option<()> {
+    // Resolve the caller, not UI focus: inherited tab IDs can be missing or stale.
+    let output = tokio::process::Command::new("herdr")
+        .args(["pane", "current", "--current"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let tab_id = response.pointer("/result/pane/tab_id")?.as_str()?;
+    herdr_tab_title_command(Some("1"), Some(tab_id))?
+        .status()
+        .await
+        .ok()?
+        .success()
+        .then_some(())
+}
+
 fn herdr_tab_title_command(
     env: Option<&str>,
     tab_id: Option<&str>,
@@ -197,7 +217,7 @@ fn herdr_tab_title_command(
     if env != Some("1") {
         return None;
     }
-    // Never use UI focus or enumerate sibling tabs. Herdr injects this caller-scoped ID.
+    // Never use UI focus or enumerate sibling tabs.
     let mut command = tokio::process::Command::new("herdr");
     command
         .args(["tab", "rename", "--", tab_id, "launcher"])

@@ -12,6 +12,7 @@ crossterm.workspace = true
 futures-util.workspace = true
 fuzzy-matcher.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+serde_json.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

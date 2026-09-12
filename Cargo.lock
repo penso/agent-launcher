@@ -106,6 +106,7 @@ dependencies = [
  "futures-util",
  "fuzzy-matcher",
  "ratatui",
+ "serde_json",
  "sysinfo",
  "thiserror 2.0.20",
  "tokio",

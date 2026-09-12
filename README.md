@@ -39,14 +39,13 @@ command. It saves and restores the previous title with xterm title-stack sequenc
 (including errors and handled termination signals), where the terminal supports them.
 Forced termination or terminals without title-stack support cannot guarantee restoration.
 Herdr 0.9.0 captures OSC titles as terminal metadata, separately from its tab labels.
-When `HERDR_ENV=1` and `HERDR_TAB_ID` is nonempty, startup also invokes
-`herdr tab rename -- <HERDR_TAB_ID> launcher` with a one-second timeout and suppressed output.
-This targets only the inherited tab ID, never UI focus or a list of other terminals.
+When `HERDR_ENV=1`, startup resolves its live tab using `herdr pane current --current`,
+then invokes `herdr tab rename -- <tab_id> launcher`. The entire operation has a
+one-second timeout and suppressed output. This targets only the calling pane's tab,
+never UI focus or a list of other terminals, and does not require `HERDR_TAB_ID`.
 Failure is nonfatal. The custom tab label persists after exit: Herdr has no reset-to-auto API.
 Its OSC tracker does not track title-stack restoration either; a later shell OSC title update
-replaces that metadata. If a pane is moved between tabs, restart from a fresh shell context
-before launching: an inherited tab ID may refer to its original tab. Do not forward Herdr
-context variables to unrelated terminals.
+replaces that metadata. Do not forward Herdr context variables to unrelated terminals.
 See Herdr's [title synchronization](https://github.com/herdrdev/herdr/blob/v0.9.0/src/app/terminal_titles.rs)
 and [tab rename implementation](https://github.com/herdrdev/herdr/blob/v0.9.0/src/app/api/tabs.rs).
 

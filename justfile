@@ -20,3 +20,9 @@ test:
 
 run:
     cargo +{{nightly_toolchain}} run -p agent-launcher-cli
+
+# Build and install the release binary to ~/.local/bin.
+install:
+    cargo +{{nightly_toolchain}} build --release -p agent-launcher-cli
+    mkdir -p "$HOME/.local/bin"
+    cp target/release/agent-launcher "$HOME/.local/bin/agent-launcher"
