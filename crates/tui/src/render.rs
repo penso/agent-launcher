@@ -445,13 +445,6 @@ fn draw_activity_panel(
             );
         }
     }
-    render_bottom_edge(
-        area,
-        theme::primary(),
-        theme::panel(),
-        theme::bg(),
-        frame.buffer_mut(),
-    );
 }
 
 fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -4408,6 +4401,31 @@ mod tests {
                         .split_whitespace()
                         .collect::<Vec<_>>()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn activity_panel_bottom_padding_has_no_border_artifacts() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for (width, height) in [(24, 4), (48, 6), (104, 8)] {
+            for tick in [0, 112, 225] {
+                let snapshot = crate::activity::demo_snapshot(tick, now);
+                for demo in [false, true] {
+                    let mut terminal =
+                        Terminal::new(TestBackend::new(width + 4, height + 4)).unwrap();
+                    let area = Rect::new(2, 2, width, height);
+                    terminal
+                        .draw(|frame| {
+                            draw_activity_panel(frame, area, &snapshot, now, demo, None);
+                        })
+                        .unwrap();
+                    for x in area.x..area.right() {
+                        let cell = &terminal.backend().buffer()[(x, area.bottom() - 1)];
+                        assert_eq!(cell.symbol(), " ");
+                        assert_eq!(cell.bg, theme::panel());
+                    }
+                }
             }
         }
     }
