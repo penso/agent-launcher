@@ -78,6 +78,7 @@ dependencies = [
  "notify-rust",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

@@ -10,7 +10,7 @@ use agent_launcher_core::{
     RunState, RunSummary, RuntimeCommand, RuntimeSnapshot, SourceStatus, WorktreeDeleteAction,
     WorktreeDeletePreview, WorktreeInspection,
 };
-use agent_launcher_issues::{IssueSource, SyncCheckpoint, SyncMode};
+use agent_launcher_issues::{IssueSource, SyncCheckpoint, SyncMode, SyncResult};
 use agent_launcher_runner::{
     BackendDetection, Capability, DispatchRequest, Error as RunnerError, Runner, StatusResult,
 };
@@ -88,6 +88,11 @@ impl RuntimeHandle {
 
     pub async fn refresh(&self) -> Result<()> {
         self.send(RuntimeCommand::Refresh).await
+    }
+
+    /// Permanently deletes a Beads issue after explicit user confirmation.
+    pub async fn delete_issue(&self, issue: IssueKey) -> Result<()> {
+        self.send(RuntimeCommand::DeleteIssue { issue }).await
     }
 
     pub async fn dispatch(&self, issue: IssueKey, profile: Option<String>) -> Result<()> {
@@ -215,6 +220,8 @@ pub struct RuntimeService {
     work: JoinSet<WorkResult>,
     notifications: JoinSet<()>,
     source_in_flight: HashSet<String>,
+    source_generations: HashMap<String, u64>,
+    source_refresh_pending: HashSet<String>,
     run_in_flight: HashMap<String, u64>,
     run_refresh_pending: HashSet<String>,
     run_refresh_unsupported: HashSet<String>,
@@ -257,6 +264,7 @@ impl RuntimeService {
             .iter()
             .map(|source| SourceStatus {
                 name: source.source_key().canonical(),
+                supports_delete: source.supports_delete(),
                 connected: false,
                 message: None,
             })
@@ -304,6 +312,8 @@ impl RuntimeService {
                 work: JoinSet::new(),
                 notifications: JoinSet::new(),
                 source_in_flight: HashSet::new(),
+                source_generations: HashMap::new(),
+                source_refresh_pending: HashSet::new(),
                 run_in_flight: HashMap::new(),
                 run_refresh_pending: HashSet::new(),
                 run_refresh_unsupported: HashSet::new(),
@@ -508,6 +518,9 @@ impl RuntimeService {
         } = request;
         // Only operation labels, backend enums and opaque identity hashes reach the log.
         let (operation, identity, backend) = match &command {
+            RuntimeCommand::DeleteIssue { issue } => {
+                ("delete-issue", Some(issue.canonical()), None)
+            },
             RuntimeCommand::Dispatch { issue, .. } => (
                 "dispatch",
                 Some(issue.canonical()),
@@ -563,6 +576,9 @@ impl RuntimeService {
         }
         let (name, result, shutdown) = match command {
             RuntimeCommand::Refresh => unreachable!("refresh handled above"),
+            RuntimeCommand::DeleteIssue { issue } => {
+                ("delete-issue", self.delete_issue(&issue).await, false)
+            },
             RuntimeCommand::Dispatch {
                 issue,
                 profile,
@@ -843,6 +859,76 @@ impl RuntimeService {
         Ok(())
     }
 
+    async fn delete_issue(&mut self, key: &IssueKey) -> Result<()> {
+        if key.provider != IssueProvider::Beads {
+            return Err(Error::DeleteIssueRejected(
+                "only Beads supports issue deletion",
+            ));
+        }
+        let source = self
+            .sources
+            .iter()
+            .find(|source| {
+                let scope = source.source_key();
+                scope.provider == key.provider
+                    && scope.host == key.host
+                    && scope.repository == key.repository
+            })
+            .cloned()
+            .ok_or(Error::DeleteIssueRejected("no matching configured source"))?;
+        if !source.supports_delete() {
+            return Err(Error::DeleteIssueRejected(
+                "source does not support deletion",
+            ));
+        }
+        let name = source.source_key().canonical();
+        let cached = self.store.load_source_issues(&name).await?;
+        let issue = cached
+            .iter()
+            .find(|issue| issue.key == *key)
+            .ok_or_else(|| Error::IssueNotFound(key.clone()))?;
+        if issue.pull_request.is_some() {
+            return Err(Error::DeleteIssueRejected(
+                "pull requests cannot be deleted",
+            ));
+        }
+        if self.store.load_runs().await?.iter().any(|run| {
+            run.issue_key == key.canonical()
+                && (run.state.is_active()
+                    || run.state == RunState::Disconnected
+                    || run.session_id.is_some()
+                    || run.workspace.is_some())
+        }) {
+            return Err(Error::DeleteIssueRejected(
+                "live or resumable runs must be resolved before deleting the issue",
+            ));
+        }
+        // Fetch workers never persist. Invalidate even on failure: a timed-out mutation
+        // may have succeeded and needs a fresh read rather than an old checkpoint.
+        *self.source_generations.entry(name.clone()).or_default() += 1;
+        let result = source
+            .delete_issue(key)
+            .await
+            .map_err(|source| Error::IssueSource {
+                source_name: name.clone(),
+                source,
+            });
+        let result = match result {
+            Ok(()) => {
+                self.snapshot.issues.retain(|issue| issue.key != *key);
+                self.store
+                    .delete_issue(&name, key)
+                    .await
+                    .map_err(Error::DeleteIssueCache)
+            },
+            Err(error) => Err(error),
+        };
+        self.source_refresh_pending.insert(name);
+        self.launch_source_refreshes();
+        self.publish();
+        result
+    }
+
     fn launch_source_refreshes(&mut self) {
         let mut launched = false;
         for source in &self.sources {
@@ -856,6 +942,11 @@ impl RuntimeService {
                 continue;
             }
             let source = Arc::clone(source);
+            self.source_refresh_pending.remove(&source_name);
+            let generation = *self
+                .source_generations
+                .entry(source_name.clone())
+                .or_default();
             self.diagnostics
                 .record("source-refresh", None, Some(&source_name), "started");
             let store = self.store.clone();
@@ -863,6 +954,7 @@ impl RuntimeService {
             self.work.spawn(async move {
                 WorkResult::Source {
                     source_name: source_name.clone(),
+                    generation,
                     result: sync_source(source_name, source, store).await,
                 }
             });
@@ -936,9 +1028,29 @@ impl RuntimeService {
         match result {
             WorkResult::Source {
                 source_name,
+                generation,
                 result,
             } => {
                 self.source_in_flight.remove(&source_name);
+                if self
+                    .source_generations
+                    .get(&source_name)
+                    .copied()
+                    .unwrap_or_default()
+                    != generation
+                {
+                    if self.source_refresh_pending.contains(&source_name) {
+                        self.launch_source_refreshes();
+                    }
+                    self.update_refreshing();
+                    self.complete_refreshes_if_idle();
+                    self.publish();
+                    return;
+                }
+                let result = match result {
+                    Ok(result) => persist_source(&self.store, &source_name, result).await,
+                    Err(error) => Err(error),
+                };
                 self.diagnostics.record(
                     "source-refresh",
                     None,
@@ -1245,6 +1357,9 @@ impl RuntimeService {
         } else {
             self.snapshot.sources.push(SourceStatus {
                 name: name.to_owned(),
+                supports_delete: self.sources.iter().any(|source| {
+                    source.source_key().canonical() == name && source.supports_delete()
+                }),
                 connected,
                 message,
             });
@@ -1531,7 +1646,8 @@ async fn git_output(path: &std::path::Path, args: &[&str]) -> std::result::Resul
 enum WorkResult {
     Source {
         source_name: String,
-        result: Result<()>,
+        generation: u64,
+        result: Result<SyncResult>,
     },
     Run {
         run_id: String,
@@ -1545,7 +1661,7 @@ async fn sync_source(
     source_name: String,
     source: Arc<dyn IssueSource>,
     store: Store,
-) -> Result<()> {
+) -> Result<SyncResult> {
     let checkpoint = store
         .source_checkpoint(&source_name)
         .await?
@@ -1557,26 +1673,28 @@ async fn sync_source(
         })
         .transpose()?;
     let cached = store.load_source_issues(&source_name).await?;
-    let result = source
+    source
         .sync_with_cache(checkpoint.as_ref(), &cached)
         .await
         .map_err(|source| Error::IssueSource {
             source_name: source_name.clone(),
             source,
-        })?;
+        })
+}
 
+async fn persist_source(store: &Store, source_name: &str, result: SyncResult) -> Result<()> {
     match result.mode {
-        SyncMode::Full => store.replace_issues(&source_name, &result.issues).await?,
-        SyncMode::Delta => store.upsert_issues(&source_name, &result.issues).await?,
+        SyncMode::Full => store.replace_issues(source_name, &result.issues).await?,
+        SyncMode::Delta => store.upsert_issues(source_name, &result.issues).await?,
         SyncMode::NotModified => {},
     }
     let checkpoint =
         serde_json::to_value(result.checkpoint).map_err(|source| Error::Checkpoint {
-            source_name: source_name.clone(),
+            source_name: source_name.to_owned(),
             source,
         })?;
     store
-        .set_source_checkpoint(&source_name, &checkpoint)
+        .set_source_checkpoint(source_name, &checkpoint)
         .await?;
     Ok(())
 }
@@ -1780,6 +1898,8 @@ mod tests {
     }
 
     struct MockSourceState {
+        deletes: AtomicUsize,
+        delete_failure: Mutex<bool>,
         results: Mutex<VecDeque<std::result::Result<SyncResult, agent_launcher_issues::Error>>>,
         checkpoints: Mutex<Vec<Option<SyncCheckpoint>>>,
         caches: Mutex<Vec<Vec<Issue>>>,
@@ -1806,6 +1926,8 @@ mod tests {
             results: Vec<std::result::Result<SyncResult, agent_launcher_issues::Error>>,
         ) -> (Self, Arc<MockSourceState>) {
             let state = Arc::new(MockSourceState {
+                deletes: AtomicUsize::new(0),
+                delete_failure: Mutex::new(false),
                 results: Mutex::new(results.into()),
                 checkpoints: Mutex::new(Vec::new()),
                 caches: Mutex::new(Vec::new()),
@@ -1826,6 +1948,22 @@ mod tests {
     impl IssueSource for MockSource {
         fn source_key(&self) -> &SourceKey {
             &self.key
+        }
+
+        fn supports_delete(&self) -> bool {
+            self.key.provider == IssueProvider::Beads
+        }
+
+        async fn delete_issue(
+            &self,
+            _: &IssueKey,
+        ) -> std::result::Result<(), agent_launcher_issues::Error> {
+            self.state.deletes.fetch_add(1, Ordering::SeqCst);
+            if *self.state.delete_failure.lock().unwrap() {
+                Err(agent_launcher_issues::Error::CommandTimeout)
+            } else {
+                Ok(())
+            }
         }
 
         fn retry_at(&self) -> Option<chrono::DateTime<Utc>> {
@@ -2874,6 +3012,361 @@ mod tests {
         .await;
         assert_visible(&cached, &prs);
         restored.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_delete_success_cache_failure_is_explicit_and_reconciles() {
+        let root = std::env::temp_dir().join(format!(
+            "launcher-delete-cache-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let path = root.join("store.sqlite");
+        let store = Store::open(&path).await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let mut target = issue("app-1", "Target", "open");
+        target.key.provider = IssueProvider::Beads;
+        let scope = SourceKey {
+            provider: target.key.provider,
+            host: target.key.host.clone(),
+            repository: target.key.repository.clone(),
+        };
+        let name = scope.canonical();
+        store
+            .replace_issues(&name, &[target.clone()])
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_delete BEFORE DELETE ON issues BEGIN SELECT RAISE(FAIL, 'fixture cache failure'); END").execute(&pool).await.unwrap();
+        let (source, state) = MockSource::with_key(scope, vec![Ok(SyncResult {
+            issues: vec![],
+            checkpoint: SyncCheckpoint::default(),
+            mode: SyncMode::Full,
+        })]);
+        let (mut service, _) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        service.snapshot.issues = vec![target.clone()];
+        let error = service.delete_issue(&target.key).await.unwrap_err();
+        assert!(matches!(error, Error::DeleteIssueCache(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("issue was deleted at the source")
+        );
+        assert!(error.to_string().contains("reconciliation scheduled"));
+        assert_eq!(state.deletes.load(Ordering::SeqCst), 1);
+        assert!(service.snapshot.issues.is_empty());
+        assert_eq!(store.load_issues().await.unwrap(), vec![target]);
+        assert!(service.source_in_flight.contains(&name));
+        sqlx::query("DROP TRIGGER reject_delete")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let refresh = service.work.join_next().await.unwrap().unwrap();
+        service.handle_work_result(refresh).await;
+        assert!(store.load_issues().await.unwrap().is_empty());
+        assert!(service.snapshot.issues.is_empty());
+        drop(service);
+        drop(store);
+        pool.close().await;
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_delete_issue_routes_command_and_publishes_removal() {
+        let store = Store::in_memory().await.unwrap();
+        let mut target = issue("app-1", "Target", "open");
+        target.key.provider = IssueProvider::Beads;
+        let scope = SourceKey {
+            provider: target.key.provider,
+            host: target.key.host.clone(),
+            repository: target.key.repository.clone(),
+        };
+        store
+            .replace_issues(&scope.canonical(), &[target.clone()])
+            .await
+            .unwrap();
+        let (source, state) = MockSource::with_key(scope, vec![]);
+        let handle = RuntimeService::start_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[MockBackend::new(BackendKind::Native, true)]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let mut snapshots = handle.subscribe();
+        let snapshot = wait_for(&mut snapshots, |snapshot| {
+            snapshot.last_refreshed_at.is_some() && !snapshot.refreshing
+        })
+        .await;
+        assert!(snapshot.sources[0].supports_delete);
+        handle.delete_issue(target.key).await.unwrap();
+        assert!(handle.snapshot().issues.is_empty());
+        assert!(store.load_issues().await.unwrap().is_empty());
+        assert_eq!(state.deletes.load(Ordering::SeqCst), 1);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue_deletion_retains_cache_on_source_failure_and_rejects_unsafe_targets() {
+        let store = Store::in_memory().await.unwrap();
+        let mut target = issue("app-1", "Target", "open");
+        target.key.provider = IssueProvider::Beads;
+        let scope = SourceKey {
+            provider: target.key.provider,
+            host: target.key.host.clone(),
+            repository: target.key.repository.clone(),
+        };
+        let name = scope.canonical();
+        let (source, state) = MockSource::with_key(scope, vec![]);
+        let (mut service, _) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        store
+            .replace_issues(&name, &[target.clone()])
+            .await
+            .unwrap();
+        service.snapshot.issues = vec![target.clone()];
+        assert!(service.snapshot.sources[0].supports_delete);
+        for field in 0..4 {
+            let mut key = target.key.clone();
+            match field {
+                0 => key.provider = IssueProvider::Github,
+                1 => key.provider = IssueProvider::Gitlab,
+                2 => key.repository = "other".into(),
+                _ => key.host = "other".into(),
+            }
+            assert!(matches!(
+                service.delete_issue(&key).await,
+                Err(Error::DeleteIssueRejected(_))
+            ));
+        }
+        let mut missing = target.key.clone();
+        missing.native_id = "app-2".into();
+        assert!(matches!(
+            service.delete_issue(&missing).await,
+            Err(Error::IssueNotFound(_))
+        ));
+        let mut pr = target.clone();
+        pr.pull_request = Some(PullRequestMetadata {
+            number: 1,
+            additions: None,
+            deletions: None,
+            base_ref: "main".into(),
+            head_ref: "pr".into(),
+            base_sha: "a".repeat(40),
+            head_sha: "b".repeat(40),
+            head_repository: None,
+        });
+        store.replace_issues(&name, &[pr]).await.unwrap();
+        assert!(matches!(
+            service.delete_issue(&target.key).await,
+            Err(Error::DeleteIssueRejected(_))
+        ));
+        store
+            .replace_issues(&name, &[target.clone()])
+            .await
+            .unwrap();
+        assert_eq!(state.deletes.load(Ordering::SeqCst), 0);
+        *state.delete_failure.lock().unwrap() = true;
+        assert!(matches!(
+            service.delete_issue(&target.key).await,
+            Err(Error::IssueSource { .. })
+        ));
+        assert_eq!(store.load_issues().await.unwrap(), vec![target.clone()]);
+        assert_eq!(service.snapshot.issues, vec![target]);
+        assert_eq!(state.deletes.load(Ordering::SeqCst), 1);
+        service.work.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_source_refresh_cannot_resurrect_deleted_issue_or_checkpoint() {
+        let store = Store::in_memory().await.unwrap();
+        let mut target = issue("app-1", "Target", "open");
+        target.key.provider = IssueProvider::Beads;
+        let scope = SourceKey {
+            provider: target.key.provider,
+            host: target.key.host.clone(),
+            repository: target.key.repository.clone(),
+        };
+        let name = scope.canonical();
+        let old_checkpoint = SyncCheckpoint {
+            etag: Some("before".into()),
+            ..SyncCheckpoint::default()
+        };
+        let fresh_checkpoint = SyncCheckpoint {
+            etag: Some("fresh".into()),
+            ..SyncCheckpoint::default()
+        };
+        store
+            .replace_issues(&name, &[target.clone()])
+            .await
+            .unwrap();
+        store
+            .set_source_checkpoint(&name, &serde_json::to_value(&old_checkpoint).unwrap())
+            .await
+            .unwrap();
+        let (source, state) = MockSource::with_key(scope, vec![
+            Ok(SyncResult {
+                issues: vec![target.clone()],
+                checkpoint: SyncCheckpoint {
+                    etag: Some("stale".into()),
+                    ..SyncCheckpoint::default()
+                },
+                mode: SyncMode::Full,
+            }),
+            Ok(SyncResult {
+                issues: vec![],
+                checkpoint: fresh_checkpoint.clone(),
+                mode: SyncMode::Full,
+            }),
+        ]);
+        let (mut service, _) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        service.snapshot.issues = vec![target.clone()];
+        service.launch_source_refreshes();
+        // Fetch completes before deletion, but its result has not reached the owner loop.
+        let stale = service.work.join_next().await.unwrap().unwrap();
+        assert_eq!(
+            store.source_checkpoint(&name).await.unwrap(),
+            Some(serde_json::to_value(&old_checkpoint).unwrap())
+        );
+        service.delete_issue(&target.key).await.unwrap();
+        assert!(service.source_refresh_pending.contains(&name));
+        assert!(store.load_issues().await.unwrap().is_empty());
+        service.handle_work_result(stale).await;
+        assert!(store.load_issues().await.unwrap().is_empty());
+        assert_eq!(
+            store.source_checkpoint(&name).await.unwrap(),
+            Some(serde_json::to_value(&old_checkpoint).unwrap())
+        );
+        assert!(service.source_in_flight.contains(&name));
+        assert!(!service.source_refresh_pending.contains(&name));
+        let fresh = service.work.join_next().await.unwrap().unwrap();
+        service.handle_work_result(fresh).await;
+        assert!(store.load_issues().await.unwrap().is_empty());
+        assert!(service.snapshot.issues.is_empty());
+        assert_eq!(
+            store.source_checkpoint(&name).await.unwrap(),
+            Some(serde_json::to_value(fresh_checkpoint).unwrap())
+        );
+        assert_eq!(state.checkpoints.lock().unwrap().as_slice(), &[
+            Some(old_checkpoint.clone()),
+            Some(old_checkpoint)
+        ]);
+        assert!(state.caches.lock().unwrap()[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn issue_deletion_blocks_resumable_runs_but_preserves_finished_history() {
+        let store = Store::in_memory().await.unwrap();
+        let mut target = issue("app-1", "Target", "open");
+        target.key.provider = IssueProvider::Beads;
+        let scope = SourceKey {
+            provider: target.key.provider,
+            host: target.key.host.clone(),
+            repository: target.key.repository.clone(),
+        };
+        let name = scope.canonical();
+        let (source, state) = MockSource::with_key(scope, vec![]);
+        let (mut service, _) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![Box::new(source)],
+            store.clone(),
+            runner(&[]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        store
+            .replace_issues(&name, &[target.clone()])
+            .await
+            .unwrap();
+        let mut run = RunSummary {
+            id: "history".into(),
+            issue_key: target.key.canonical(),
+            workspace: None,
+            agent: "claude".into(),
+            state: RunState::Running,
+            message: None,
+            session_id: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        for state in [
+            RunState::Provisioning,
+            RunState::Starting,
+            RunState::Running,
+            RunState::NeedsInput,
+            RunState::Idle,
+            RunState::Disconnected,
+        ] {
+            run.state = state;
+            store.upsert_run(&run).await.unwrap();
+            assert!(matches!(
+                service.delete_issue(&target.key).await,
+                Err(Error::DeleteIssueRejected(_))
+            ));
+        }
+        run.state = RunState::Completed;
+        run.session_id = Some("resumable".into());
+        store.upsert_run(&run).await.unwrap();
+        assert!(matches!(
+            service.delete_issue(&target.key).await,
+            Err(Error::DeleteIssueRejected(_))
+        ));
+        run.session_id = None;
+        run.workspace = Some(WorkspaceRef {
+            id: "workspace".into(),
+            backend: BackendKind::Native,
+            host: None,
+            path: None,
+            branch: "main".into(),
+        });
+        store.upsert_run(&run).await.unwrap();
+        assert!(matches!(
+            service.delete_issue(&target.key).await,
+            Err(Error::DeleteIssueRejected(_))
+        ));
+        run.workspace = None;
+        store.upsert_run(&run).await.unwrap();
+        let event = EventEnvelope {
+            run_id: run.id.clone(),
+            sequence: 0,
+            timestamp: run.updated_at,
+            payload: RunEvent::Output {
+                stream: OutputStream::Stdout,
+                text: "history".into(),
+            },
+        };
+        store.append_event(&event).await.unwrap();
+        assert_eq!(state.deletes.load(Ordering::SeqCst), 0);
+        service.delete_issue(&target.key).await.unwrap();
+        assert_eq!(store.load_runs().await.unwrap(), vec![run.clone()]);
+        assert_eq!(store.load_events(&run.id).await.unwrap(), vec![event]);
+        assert_eq!(state.deletes.load(Ordering::SeqCst), 1);
+        service.work.shutdown().await;
     }
 
     #[tokio::test]

@@ -78,6 +78,28 @@ mod tests {
 
     use super::{GitHubSource, GitLabSource, IssueSource, command_line_remote};
 
+    #[tokio::test]
+    async fn remote_sources_explicitly_reject_deletion() {
+        let sources: Vec<Box<dyn IssueSource>> = vec![
+            Box::new(GitHubSource::new("github.com".into(), "acme/app".into(), None).unwrap()),
+            Box::new(GitLabSource::new("gitlab.com".into(), "acme/app".into(), None).unwrap()),
+        ];
+        for source in sources {
+            let scope = source.source_key();
+            let key = agent_launcher_core::IssueKey {
+                provider: scope.provider,
+                host: scope.host.clone(),
+                repository: scope.repository.clone(),
+                native_id: "1".into(),
+            };
+            assert!(!source.supports_delete());
+            assert!(matches!(
+                source.delete_issue(&key).await,
+                Err(super::Error::DeleteUnsupported)
+            ));
+        }
+    }
+
     #[test]
     fn builds_sources_for_command_line_remote_formats() {
         let cases = [

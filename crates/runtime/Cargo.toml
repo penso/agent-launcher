@@ -20,3 +20,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+sqlx.workspace = true

@@ -89,8 +89,9 @@ persistence, per-endpoint failure reasons, and latest-sample totals and coverage
 The graph retains 15 minutes and shows the peak working count per display bucket,
 with a count scale rather than a 0-100 score. The Braille trace uses two buckets per
 character and four vertical dots per row. Adjacent complete buckets are connected;
-incomplete buckets are unconnected lower-bound dots with underlined cells (also
-distinct on flat traces), gaps are blank, and observed zero sits visibly on the
+incomplete buckets are dim, unconnected lower-bound dots without underlines.
+The header's `partial` status and Debug coverage provide textual context (flat
+partial and complete dots can have the same geometry). Gaps are blank, and observed zero sits visibly on the
 bottom edge. A compact footer shows `-15m`, the peak agent count, and `now` when
 space permits; the graph keeps most of the panel's height. Only aggregate counts
 and coverage are stored in the existing local SQLite database, with 30-minute retention. Restart restores
@@ -108,11 +109,15 @@ Polling is sampled observation, not a lossless transition log or work-throughput
 measurement. Collection runs only while launcher runs. Setting
 `AGENT_LAUNCHER_DEMO_ACTIVITY` to any value, including an empty value, explicitly
 selects a labeled demo and disables real collection and sample writes. Renderer-only
-synthetic two-second samples use the same panel, count scale, colors, partial dots,
-and gaps as live activity. It starts empty at tick 0 and adds two samples per 80ms
-UI tick (four virtual seconds): tick 1 has two right-edge samples, and tick 225
-has the full 450-sample window after nominally 18 seconds. It then rolls continuously
-without restarting the logo reveal. Failed telemetry
+synthetic two-second samples use the same panel, colors, partial dots, and gaps as
+live activity. A dedicated 30 fps redraw timer uses monotonic elapsed time, leaving
+the 80ms spinner tick unchanged. The demo starts empty and fills its 15-minute
+virtual window in 18 seconds, then scrolls continuously without restarting the logo
+reveal, even after delayed frames. Only the demo projects fractional-time waveform
+heights at fixed-point precision; its counters remain integral and its stable scale
+is 0-8 agents. Motion scales with graph width (at most one horizontal Braille dot
+per scheduled frame up to 270 columns); terminal dot resolution still limits motion.
+Live counts, peak bucketing, and missing observations are never interpolated. Failed telemetry
 never falls back to demo data.
 
 ### Reusable Braille Widgets
@@ -140,9 +145,10 @@ let widget = BrailleSparkline::new(&samples)
 
 `Line` (default) connects only adjacent complete observations. `Dots` never
 interpolates. `Filled` draws independent vertical Braille columns, two per cell;
-partial observations remain isolated, underlined lower-bound dots in every variant.
-Gaps stay blank and real zero remains a bottom dot. An underline applies to the
-whole cell when a partial dot shares it with complete data.
+partial observations remain isolated, dim lower-bound dots in every variant.
+Gaps stay blank and real zero remains a bottom dot. Dimming applies to the
+whole cell when a partial dot shares it with complete data. The widget clears old
+dim/underline markers on redraw and suppresses underlines even in its supplied style.
 
 Each sample occupies one horizontal dot, with four vertical dots per character row.
 The first `area.width * 2` samples are displayed without stretching or resampling;
@@ -334,8 +340,20 @@ The agent environment needs authenticated GitHub CLI or Git access to the PR and
 | `i` | | Send input |
 | `o` | | Open workspace/session |
 | `s` | | Stop run |
+| `x` | | Confirm worktree deletion (`x worktree`) |
+| `Shift+X` (`X`) | | Confirm permanent source issue deletion (`X issue`, Beads issues only) |
 | `Esc` | Quit | Return to inbox |
 | `Ctrl-C` | Quit | Quit |
+
+Source issue deletion is separate from worktree deletion. The confirmation captures the exact
+issue key, identifier, title, provider, host, and repository, even across refreshes. Review the
+full target and warnings, then press `Enter` once to submit or `Esc` to cancel. If the terminal
+cannot display all warnings, Enter is disabled until resized. While deletion is pending,
+the modal blocks further input and duplicate submissions until the runtime replies.
+Deletion is permanent: it removes dependency links, updates references, and orphans dependents.
+Worktrees and run history are **not deleted**. Active or resumable runs block source deletion;
+resolve those runs first. GitHub, GitLab, and PR deletion are unsupported; use the provider's
+own tools instead. The launcher never substitutes closing an issue for deletion.
 
 Debug shows the live snapshot's selected backend and agent, detected worktree manager,
 backend availability, compute targets, local repository path and effective host/repository,

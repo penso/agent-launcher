@@ -51,6 +51,14 @@ pub(crate) struct DeleteOverlay {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct IssueDeleteOverlay {
+    pub issue_key: IssueKey,
+    pub identifier: String,
+    pub title: String,
+    pub pending: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DispatchOverlay {
     pub issue_key: IssueKey,
     pub cursor: usize,
@@ -80,6 +88,8 @@ pub(crate) struct AppState {
     pub input_overlay: Option<InputOverlay>,
     pub delete_overlay: Option<DeleteOverlay>,
     pub delete_confirmation_visible: bool,
+    pub issue_delete_overlay: Option<IssueDeleteOverlay>,
+    pub issue_delete_confirmation_visible: bool,
     pub dispatch_overlay: Option<DispatchOverlay>,
     pub delete_preview_request: Option<u64>,
     pub next_request_id: u64,
@@ -94,6 +104,7 @@ pub(crate) struct AppState {
     pub status_message: Option<String>,
     pub host_metrics: HostMetrics,
     pub tick: u32,
+    pub demo_started: Option<std::time::Instant>,
     pub activity_history_origin: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -178,6 +189,10 @@ impl AppState {
     }
 
     pub fn reconcile_detail(&mut self, snapshot: &RuntimeSnapshot) -> bool {
+        // The confirmation owns its target, even if a refresh removes it from the list.
+        if self.issue_delete_overlay.is_some() {
+            return false;
+        }
         if self.route != Route::Detail || self.detail_issue(snapshot).is_some() {
             return false;
         }

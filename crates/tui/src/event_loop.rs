@@ -22,13 +22,17 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
     Error, LayoutMode,
-    app::{AppState, DeleteOverlay, DispatchOverlay, DispatchStage, InputOverlay, Route},
+    app::{
+        AppState, DeleteOverlay, DispatchOverlay, DispatchStage, InputOverlay, IssueDeleteOverlay,
+        Route,
+    },
     metrics::HostMetricsSampler,
     render::draw,
     rows::IssueSort,
 };
 
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+const DEMO_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
 const METRICS_INTERVAL: Duration = Duration::from_secs(5);
 // Xterm title-stack operations; ignored by terminals without title-stack support.
 const PUSH_TITLE: Print<&str> = Print("\x1b[22;0t");
@@ -36,6 +40,10 @@ const POP_TITLE: Print<&str> = Print("\x1b[23;0t");
 const LAUNCHER_TITLE: SetTitle<&str> = SetTitle("launcher");
 
 enum UiActionResult {
+    IssueDelete {
+        issue_key: agent_launcher_core::IssueKey,
+        result: agent_launcher_runtime::Result<()>,
+    },
     Runtime {
         result: agent_launcher_runtime::Result<()>,
         success: &'static str,
@@ -72,6 +80,8 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     let mut snapshot = runtime.snapshot();
     let mut app = AppState {
         layout,
+        demo_started: std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY")
+            .map(|_| std::time::Instant::now()),
         ..Default::default()
     };
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -79,6 +89,9 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     metrics_sampler.sample(&mut app.host_metrics);
     let mut ticker = tokio::time::interval(ANIMATION_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut demo_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + DEMO_INTERVAL, DEMO_INTERVAL);
+    demo_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut metrics_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + METRICS_INTERVAL,
         METRICS_INTERVAL,
@@ -97,6 +110,12 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                        if app.issue_delete_overlay.is_some()
+                            && crossterm::terminal::size().ok()
+                                != Some((app.mouse.screen.width, app.mouse.screen.height))
+                        {
+                            app.issue_delete_confirmation_visible = false;
+                        }
                         let should_quit = handle_key(
                             &mut app,
                             key,
@@ -123,6 +142,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                     },
                     Some(Ok(Event::Resize(_, _))) => {
                         app.mouse = Default::default();
+                        app.issue_delete_confirmation_visible = false;
                         needs_draw = true;
                     },
                     Some(Ok(_)) => {},
@@ -146,6 +166,10 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                 if animation_active(&snapshot, &app) {
                     needs_draw = true;
                 }
+            }
+            _ = demo_tick.tick(), if app.demo_started.is_some() => {
+                // Redraw only: spinner cadence and telemetry sampling stay unchanged.
+                needs_draw = true;
             }
             _ = metrics_tick.tick() => {
                 metrics_sampler.sample(&mut app.host_metrics);
@@ -225,6 +249,17 @@ fn handle_key(
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
+    if app.issue_delete_overlay.is_some() {
+        if let Some(issue_key) = prepare_issue_delete(app, key) {
+            let runtime = runtime.clone();
+            let actions = actions.clone();
+            tokio::spawn(async move {
+                let result = runtime.delete_issue(issue_key.clone()).await;
+                let _ = actions.send(UiActionResult::IssueDelete { issue_key, result });
+            });
+        }
+        return false;
+    }
     if handle_debug_key(app, key) {
         return false;
     }
@@ -253,6 +288,9 @@ fn handle_key(
 
     if app.route == Route::Inbox {
         return handle_list_key(app, key, snapshot);
+    }
+    if handle_issue_delete_shortcut(app, key, snapshot) {
+        return false;
     }
     match (app.route, key.code) {
         (Route::Detail, KeyCode::Esc) => app.reset_detail(),
@@ -452,6 +490,76 @@ fn apply_sort(app: &mut AppState, sort: IssueSort) {
     app.selected = 0;
     app.scroll = 0;
     app.status_message = Some(format!("issues sorted {}", sort.label()));
+}
+
+fn handle_issue_delete_shortcut(
+    app: &mut AppState,
+    key: KeyEvent,
+    snapshot: &RuntimeSnapshot,
+) -> bool {
+    if app.route != Route::Detail || key.code != KeyCode::Char('X') {
+        return false;
+    }
+    open_issue_delete(app, snapshot);
+    true
+}
+
+fn open_issue_delete(app: &mut AppState, snapshot: &RuntimeSnapshot) {
+    if app.route != Route::Detail || app.issue_delete_overlay.is_some() {
+        return;
+    }
+    let Some(issue) = app.detail_issue(snapshot) else {
+        return;
+    };
+    if issue.key.provider != agent_launcher_core::IssueProvider::Beads
+        || issue.pull_request.is_some()
+    {
+        app.status_message = Some(
+            "Unsupported: use provider tools. Source deletion supports Beads issues only, not PRs; closing is not deletion.".into(),
+        );
+        return;
+    }
+    app.issue_delete_overlay = Some(IssueDeleteOverlay {
+        issue_key: issue.key.clone(),
+        identifier: issue.identifier.clone(),
+        title: issue.title.clone(),
+        pending: false,
+    });
+    // A late worktree inspection must not replace this confirmation.
+    app.delete_preview_request = None;
+    app.issue_delete_confirmation_visible = false;
+    app.status_message = None;
+}
+
+fn prepare_issue_delete(
+    app: &mut AppState,
+    key: KeyEvent,
+) -> Option<agent_launcher_core::IssueKey> {
+    let overlay = app.issue_delete_overlay.as_mut()?;
+    if overlay.pending {
+        return None;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.issue_delete_overlay = None;
+            app.issue_delete_confirmation_visible = false;
+            app.status_message = Some("source issue deletion cancelled".into());
+        },
+        KeyCode::Enter
+            if app.issue_delete_confirmation_visible && key.kind == KeyEventKind::Press =>
+        {
+            overlay.pending = true;
+            app.issue_delete_confirmation_visible = false;
+            app.status_message = Some("deleting source issue...".into());
+            return Some(overlay.issue_key.clone());
+        },
+        KeyCode::Enter => {
+            app.status_message =
+                Some("resize the terminal to review the full target and deletion warnings".into());
+        },
+        _ => {},
+    }
+    None
 }
 
 fn handle_delete_key(
@@ -1000,6 +1108,23 @@ fn spawn_runtime_action(
 
 fn apply_ui_action_result(app: &mut AppState, result: UiActionResult) {
     match result {
+        UiActionResult::IssueDelete { issue_key, result } => {
+            if !app
+                .issue_delete_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.pending && overlay.issue_key == issue_key)
+            {
+                return;
+            }
+            app.issue_delete_overlay = None;
+            app.issue_delete_confirmation_visible = false;
+            apply_delete_result(
+                app,
+                result,
+                "source issue deleted; worktrees and run history retained",
+                &issue_key.canonical(),
+            );
+        },
         UiActionResult::Runtime {
             result,
             success,
@@ -1168,6 +1293,261 @@ mod tests {
             created_at: Some(Utc::now() - age),
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn issue_delete_is_detail_only_uppercase_and_rejects_unsupported_sources() {
+        let mut target = issue("1", Duration::zero());
+        target.key.provider = IssueProvider::Beads;
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![target.clone()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        assert!(!handle_issue_delete_shortcut(
+            &mut app,
+            KeyCode::Char('X').into(),
+            &snapshot
+        ));
+        app.open_detail(&snapshot);
+        assert!(!handle_issue_delete_shortcut(
+            &mut app,
+            KeyCode::Char('x').into(),
+            &snapshot
+        ));
+        assert!(app.issue_delete_overlay.is_none());
+        assert!(handle_issue_delete_shortcut(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+            &snapshot
+        ));
+        assert_eq!(
+            app.issue_delete_overlay.as_ref().unwrap().issue_key,
+            target.key
+        );
+        assert!(app.delete_overlay.is_none());
+        prepare_issue_delete(&mut app, KeyCode::Esc.into());
+        for unsupported in [
+            issue("1", Duration::zero()),
+            Issue {
+                key: IssueKey {
+                    provider: IssueProvider::Gitlab,
+                    ..target.key.clone()
+                },
+                ..target.clone()
+            },
+            Issue {
+                pull_request: pull_request("1").pull_request,
+                ..target.clone()
+            },
+        ] {
+            snapshot.issues = vec![unsupported.clone()];
+            app.detail_issue_key = Some(unsupported.key);
+            open_issue_delete(&mut app, &snapshot);
+            assert!(app.issue_delete_overlay.is_none());
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Unsupported: use provider tools")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_delete_captures_identity_blocks_duplicate_submit_and_matches_async_result() {
+        let mut target = issue("id:%:1", Duration::zero());
+        target.key.provider = IssueProvider::Beads;
+        target.key.host = "local:host%".into();
+        target.key.repository = "repo:one%".into();
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![target.clone()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        app.open_detail(&snapshot);
+        open_issue_delete(&mut app, &snapshot);
+        assert!(prepare_issue_delete(&mut app, KeyCode::Enter.into()).is_none());
+        assert!(!app.issue_delete_overlay.as_ref().unwrap().pending);
+        prepare_issue_delete(&mut app, KeyCode::Esc.into());
+        assert!(app.issue_delete_overlay.is_none());
+        open_issue_delete(&mut app, &snapshot);
+        snapshot.issues.clear();
+        assert!(!app.reconcile_detail(&snapshot));
+        assert_eq!(
+            app.issue_delete_overlay.as_ref().unwrap().title,
+            target.title
+        );
+        app.issue_delete_confirmation_visible = true;
+        let captured = prepare_issue_delete(&mut app, KeyCode::Enter.into()).unwrap();
+        assert_eq!(captured, target.key);
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('X'),
+            KeyCode::Char('x'),
+        ] {
+            assert!(prepare_issue_delete(&mut app, key.into()).is_none());
+            assert!(app.issue_delete_overlay.as_ref().unwrap().pending);
+        }
+        let mut other = captured.clone();
+        other.repository = "repo%3Aone%".into();
+        assert_ne!(other.canonical(), captured.canonical());
+        apply_ui_action_result(&mut app, UiActionResult::IssueDelete {
+            issue_key: other.clone(),
+            result: Ok(()),
+        });
+        assert!(app.issue_delete_overlay.is_some());
+        app.detail_issue_key = Some(other.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tx.send(UiActionResult::IssueDelete {
+                issue_key: captured,
+                result: Ok(()),
+            })
+            .unwrap();
+        });
+        apply_ui_action_result(&mut app, rx.recv().await.unwrap());
+        assert!(app.issue_delete_overlay.is_none());
+        assert_eq!(app.detail_issue_key, Some(other));
+        assert_eq!(app.route, Route::Detail);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("run history retained")
+        );
+    }
+
+    #[test]
+    fn issue_delete_result_closes_only_matching_detail_and_reports_errors() {
+        for success in [false, true] {
+            let mut target = issue("1", Duration::zero());
+            target.key.provider = IssueProvider::Beads;
+            let snapshot = RuntimeSnapshot {
+                issues: vec![target.clone()],
+                ..Default::default()
+            };
+            let mut app = AppState::default();
+            app.open_detail(&snapshot);
+            open_issue_delete(&mut app, &snapshot);
+            app.issue_delete_confirmation_visible = true;
+            let key = prepare_issue_delete(&mut app, KeyCode::Enter.into()).unwrap();
+            apply_ui_action_result(&mut app, UiActionResult::IssueDelete {
+                issue_key: key,
+                result: if success {
+                    Ok(())
+                } else {
+                    Err(agent_launcher_runtime::Error::RunAlreadyActive(
+                        "run-1".into(),
+                    ))
+                },
+            });
+            assert_eq!(
+                app.route,
+                if success {
+                    Route::Inbox
+                } else {
+                    Route::Detail
+                }
+            );
+            assert!(app.issue_delete_overlay.is_none());
+            if !success {
+                assert!(
+                    app.status_message
+                        .as_deref()
+                        .unwrap()
+                        .contains("runtime error")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_delete_requires_fully_drawn_target_and_warnings_and_blocks_mouse() {
+        let mut target = issue("1", Duration::zero());
+        target.key.provider = IssueProvider::Beads;
+        target.title = "Target with Unicode 界 and a newline\nnot a warning".into();
+        let snapshot = RuntimeSnapshot {
+            issues: vec![target],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        app.open_detail(&snapshot);
+        open_issue_delete(&mut app, &snapshot);
+        for (width, height, visible) in [
+            (120, 40, true),
+            (30, 8, false),
+            (1, 1, false),
+            (60, 40, true),
+            (120, 12, false),
+        ] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &mut app))
+                .unwrap();
+            assert_eq!(
+                app.issue_delete_confirmation_visible, visible,
+                "{width}x{height}"
+            );
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            if width == 120 && visible {
+                for warning in [
+                    "Permanent source deletion",
+                    "dependency links",
+                    "orphans dependents",
+                    "run history are NOT deleted",
+                    "Enter permanently delete issue",
+                    "\\nnot a warning",
+                    "provider    beads",
+                    "host        \"github.com\"",
+                    "repository  \"acme/launcher\"",
+                    "exact key   \"beads:github.com:acme/launcher:1\"",
+                ] {
+                    assert!(text.contains(warning), "missing {warning}");
+                }
+            }
+            if !visible {
+                assert!(prepare_issue_delete(&mut app, KeyCode::Enter.into()).is_none());
+            }
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::ScrollDown,
+                    column: 5,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &snapshot,
+                (width, height)
+            ));
+            assert_eq!(app.detail_scroll, 0);
+            for key in [
+                KeyCode::Char('d'),
+                KeyCode::Char('x'),
+                KeyCode::Tab,
+                KeyCode::Down,
+            ] {
+                assert!(prepare_issue_delete(&mut app, key.into()).is_none());
+            }
+            assert!(!app.issue_delete_overlay.as_ref().unwrap().pending);
+        }
+        app.issue_delete_overlay.as_mut().unwrap().title = "very long target ".repeat(1000);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &mut app))
+            .unwrap();
+        assert!(!app.issue_delete_confirmation_visible);
+        assert!(prepare_issue_delete(&mut app, KeyCode::Enter.into()).is_none());
+        assert!(prepare_issue_delete(&mut app, KeyCode::Esc.into()).is_none());
+        assert!(app.issue_delete_overlay.is_none());
     }
 
     fn compute_target(

@@ -41,6 +41,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
         route: app.route,
         tab: app.tab,
         blocked: app.input_overlay.is_some()
+            || app.issue_delete_overlay.is_some()
             || app.delete_overlay.is_some()
             || app.dispatch_overlay.is_some()
             || app.command_overlay
@@ -64,6 +65,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
         } else if app.command_overlay {
             draw_command_overlay(frame, content, app);
         }
+    }
+    app.issue_delete_confirmation_visible = false;
+    if app.issue_delete_overlay.is_some() {
+        crate::detail::draw_issue_delete_overlay(frame, content, app);
     }
     draw_footer(frame, area, snapshot, &app.host_metrics);
     app.mouse.scroll = app.scroll;
@@ -227,10 +232,11 @@ fn draw_agent_activity(
     snapshot: &RuntimeSnapshot,
 ) {
     let now = chrono::Utc::now();
-    let demo = std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY").is_some();
+    let demo_elapsed = app.demo_started.map(|start| start.elapsed());
+    let demo = demo_elapsed.is_some();
     let generated;
     let activity = if demo {
-        generated = crate::activity::demo_snapshot(app.tick, now);
+        generated = crate::activity::demo_snapshot(demo_elapsed.unwrap(), now);
         &generated
     } else {
         &snapshot.herdr_activity
@@ -246,6 +252,7 @@ fn draw_agent_activity(
         } else {
             app.activity_history_origin
         },
+        demo_elapsed,
     );
 }
 
@@ -256,6 +263,7 @@ fn draw_activity_panel(
     now: chrono::DateTime<chrono::Utc>,
     demo: bool,
     origin: Option<chrono::DateTime<chrono::Utc>>,
+    demo_elapsed: Option<std::time::Duration>,
 ) {
     use agent_launcher_core::ActivityCompleteness;
 
@@ -294,12 +302,23 @@ fn draw_activity_panel(
     } else {
         "unobserved".to_owned()
     };
-    let data = crate::activity::buckets(snapshot, usize::from(inner.width) * 2, now);
+    let data = if let Some(elapsed) = demo_elapsed {
+        crate::activity::demo_buckets(elapsed, usize::from(inner.width) * 2)
+    } else {
+        crate::activity::buckets(snapshot, usize::from(inner.width) * 2, now)
+    };
     let peak = data
         .iter()
         .filter_map(|bucket| bucket.working)
         .max()
         .unwrap_or(0);
+    // A stable demo scale avoids vertical pumping as peaks enter or leave the window.
+    // Fixed-point values are presentation-only; labels remain in agents.
+    let peak = if demo_elapsed.is_some() {
+        8
+    } else {
+        peak
+    };
     let counts = current
         .filter(|s| s.completeness != ActivityCompleteness::Missing)
         .and_then(|s| s.counts.as_ref());
@@ -389,13 +408,20 @@ fn draw_activity_panel(
         .collect::<Vec<_>>();
     frame.render_widget(
         BrailleSparkline::new(&samples)
-            .max(peak)
+            .max(if demo_elapsed.is_some() {
+                peak * crate::activity::DEMO_PRECISION
+            } else {
+                peak
+            })
             .style(Style::new().fg(theme::primary()).bg(theme::panel()))
             .variant(SparklineVariant::Line),
         graph,
     );
-    let leading =
-        crate::activity::unobserved_columns(snapshot, graph.width.into(), now, origin) as u16;
+    let leading = if let Some(elapsed) = demo_elapsed {
+        crate::activity::demo_unobserved_columns(elapsed, graph.width.into())
+    } else {
+        crate::activity::unobserved_columns(snapshot, graph.width.into(), now, origin)
+    } as u16;
     if leading > 0 && !graph.is_empty() {
         let full = graph.width >= 62 && graph.height >= 2;
         let lines = if full {
@@ -1283,7 +1309,7 @@ fn shortcut_line(width: u16) -> Line<'static> {
 
 fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let width = area.width.saturating_sub(2).min(64);
-    let height = area.height.saturating_sub(2).min(22);
+    let height = area.height.saturating_sub(2).min(24);
     if width == 0 || height == 0 {
         return;
     }
@@ -1352,7 +1378,8 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 "dispatch · open · stop"
             },
         ),
-        command_help_line("i · x · Esc", "input · delete · back"),
+        command_help_line("i · Esc", "input · back"),
+        command_help_line("x worktree · X issue", "detail only; confirm"),
         command_help_line("Ctrl+C", "quit from anywhere"),
     ];
     frame.render_widget(
@@ -2285,6 +2312,7 @@ mod tests {
             issues: vec![issue("7", "Repair runtime dispatch")],
             sources: vec![SourceStatus {
                 name: "github:github.com:acme/launcher".to_owned(),
+                supports_delete: false,
                 connected: true,
                 message: None,
             }],
@@ -4091,7 +4119,7 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
                 terminal
                     .draw(|frame| {
-                        draw_activity_panel(frame, frame.area(), &snapshot, now, false, None)
+                        draw_activity_panel(frame, frame.area(), &snapshot, now, false, None, None)
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
@@ -4125,7 +4153,9 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(454, 8)).unwrap();
         terminal
-            .draw(|frame| draw_activity_panel(frame, frame.area(), &snapshot, now, false, None))
+            .draw(|frame| {
+                draw_activity_panel(frame, frame.area(), &snapshot, now, false, None, None)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(451, 5)].symbol(), "\u{2840}");
@@ -4159,7 +4189,9 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(240, 8)).unwrap();
         terminal
-            .draw(|frame| draw_activity_panel(frame, frame.area(), &snapshot, now, false, None))
+            .draw(|frame| {
+                draw_activity_panel(frame, frame.area(), &snapshot, now, false, None, None)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text = (0..8)
@@ -4244,7 +4276,15 @@ mod tests {
                     let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
                     terminal
                         .draw(|frame| {
-                            draw_activity_panel(frame, frame.area(), &snapshot, now, false, None)
+                            draw_activity_panel(
+                                frame,
+                                frame.area(),
+                                &snapshot,
+                                now,
+                                false,
+                                None,
+                                None,
+                            )
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
@@ -4283,13 +4323,88 @@ mod tests {
     }
 
     #[test]
+    fn animated_demo_uses_shared_widget_styles_and_never_leaves_underlines() {
+        use std::time::Duration;
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for (width, height) in [(24, 4), (48, 6), (150, 8), (600, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let frames = (0..60).map(|frame| {
+                Duration::from_secs(18) + Duration::from_nanos(frame * (1_000_000_000 / 30))
+            });
+            for elapsed in [
+                Duration::ZERO,
+                Duration::from_secs(9),
+                Duration::from_secs(18) - Duration::from_nanos(1),
+                Duration::MAX,
+            ]
+            .into_iter()
+            .chain(frames)
+            {
+                let snapshot = crate::activity::demo_snapshot(elapsed, now);
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        frame
+                            .buffer_mut()
+                            .set_style(area, Style::new().add_modifier(Modifier::UNDERLINED));
+                        draw_activity_panel(frame, area, &snapshot, now, true, None, Some(elapsed));
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                for y in 2..height - 1 - u16::from(height >= 7) {
+                    for x in 2..width - 2 {
+                        let cell = &buffer[(x, y)];
+                        assert!(!cell.modifier.contains(Modifier::UNDERLINED));
+                        if cell
+                            .symbol()
+                            .chars()
+                            .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                        {
+                            assert_eq!(cell.fg, theme::primary());
+                            assert_eq!(cell.bg, theme::panel());
+                        }
+                    }
+                }
+                if height >= 7 && elapsed >= Duration::from_secs(18) {
+                    assert!(buffer.content.iter().any(|cell| {
+                        cell.modifier.contains(Modifier::DIM)
+                            && cell
+                                .symbol()
+                                .chars()
+                                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+                    }));
+                    let footer = (0..width)
+                        .map(|x| buffer[(x, height - 2)].symbol())
+                        .collect::<String>();
+                    assert!(footer.contains("peak 8 agents"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn demo_activity_scrolls_with_bounded_counts_and_real_sample_cadence() {
         let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        assert!(crate::activity::demo_snapshot(0, now).samples.is_empty());
-        assert_eq!(crate::activity::demo_snapshot(1, now).samples.len(), 2);
-        assert_eq!(crate::activity::demo_snapshot(224, now).samples.len(), 448);
-        let before = crate::activity::demo_snapshot(225, now);
-        let after = crate::activity::demo_snapshot(226, now);
+        use std::time::Duration;
+        assert!(
+            crate::activity::demo_snapshot(Duration::ZERO, now)
+                .samples
+                .is_empty()
+        );
+        assert_eq!(
+            crate::activity::demo_snapshot(Duration::from_millis(80), now)
+                .samples
+                .len(),
+            2
+        );
+        assert_eq!(
+            crate::activity::demo_snapshot(Duration::from_millis(17920), now)
+                .samples
+                .len(),
+            448
+        );
+        let before = crate::activity::demo_snapshot(Duration::from_secs(18), now);
+        let after = crate::activity::demo_snapshot(Duration::from_millis(18080), now);
         assert_eq!(before.samples.len(), 450);
         assert_eq!(after.samples.len(), 450);
         for (a, b) in before.samples[2..].iter().zip(&after.samples) {
@@ -4304,7 +4419,7 @@ mod tests {
                 .all(|s| s[1].sampled_at - s[0].sampled_at == chrono::Duration::seconds(2))
         );
         assert!(
-            crate::activity::demo_snapshot(u32::MAX, now)
+            crate::activity::demo_snapshot(Duration::from_secs(u64::from(u32::MAX)), now)
                 .samples
                 .iter()
                 .filter_map(|s| s.counts.as_ref())
@@ -4315,7 +4430,7 @@ mod tests {
     #[test]
     fn live_and_demo_share_compact_panel_geometry_glyphs_and_styles() {
         let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        let snapshot = crate::activity::demo_snapshot(225, now);
+        let snapshot = crate::activity::demo_snapshot(std::time::Duration::from_secs(18), now);
         for (width, height) in [(24, 8), (48, 8), (64, 8), (104, 8), (48, 6), (104, 6)] {
             let graph_bottom = if height == 8 {
                 6
@@ -4325,11 +4440,13 @@ mod tests {
             let mut live = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut demo = Terminal::new(TestBackend::new(width, height)).unwrap();
             live.draw(|frame| {
-                draw_activity_panel(frame, frame.area(), &snapshot, now, false, None)
+                draw_activity_panel(frame, frame.area(), &snapshot, now, false, None, None)
             })
             .unwrap();
-            demo.draw(|frame| draw_activity_panel(frame, frame.area(), &snapshot, now, true, None))
-                .unwrap();
+            demo.draw(|frame| {
+                draw_activity_panel(frame, frame.area(), &snapshot, now, true, None, None)
+            })
+            .unwrap();
             let live = live.backend().buffer();
             let demo = demo.backend().buffer();
             for y in 0..height {
@@ -4369,7 +4486,7 @@ mod tests {
                     .count();
                 assert!(graph_rows >= 3, "{width}: only {graph_rows} graph rows");
                 assert!((2..graph_bottom).any(|y| {
-                    (2..width - 2).any(|x| buffer[(x, y)].modifier.contains(Modifier::UNDERLINED))
+                    (2..width - 2).any(|x| buffer[(x, y)].modifier.contains(Modifier::DIM))
                 }));
                 assert!(
                     (2..width - 2)
@@ -4410,14 +4527,17 @@ mod tests {
         let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         for (width, height) in [(24, 4), (48, 6), (104, 8)] {
             for tick in [0, 112, 225] {
-                let snapshot = crate::activity::demo_snapshot(tick, now);
+                let snapshot = crate::activity::demo_snapshot(
+                    std::time::Duration::from_millis(tick * 80),
+                    now,
+                );
                 for demo in [false, true] {
                     let mut terminal =
                         Terminal::new(TestBackend::new(width + 4, height + 4)).unwrap();
                     let area = Rect::new(2, 2, width, height);
                     terminal
                         .draw(|frame| {
-                            draw_activity_panel(frame, area, &snapshot, now, demo, None);
+                            draw_activity_panel(frame, area, &snapshot, now, demo, None, None);
                         })
                         .unwrap();
                     for x in area.x..area.right() {
@@ -4454,7 +4574,7 @@ mod tests {
                 terminal
                     .draw(|frame| {
                         frame.render_widget(Paragraph::new("outside"), Rect::new(0, 0, 7, 1));
-                        draw_activity_panel(frame, area, snapshot, now, demo, origin);
+                        draw_activity_panel(frame, area, snapshot, now, demo, origin, None);
                     })
                     .unwrap();
                 terminal.backend().buffer().clone()
@@ -4480,7 +4600,9 @@ mod tests {
                 }
             }
             let mut snapshots = [0, 1, 112, 225, 226, 450]
-                .map(|tick| crate::activity::demo_snapshot(tick, now))
+                .map(|tick| {
+                    crate::activity::demo_snapshot(std::time::Duration::from_millis(tick * 80), now)
+                })
                 .to_vec();
             for completeness in [Complete, Missing] {
                 for age in [0, 450, 899, 960] {
@@ -4575,7 +4697,7 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
                 terminal
                     .draw(|frame| {
-                        draw_activity_panel(frame, frame.area(), &snapshot, now, false, None)
+                        draw_activity_panel(frame, frame.area(), &snapshot, now, false, None, None)
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
@@ -4656,7 +4778,10 @@ mod tests {
         assert!(text.contains("choose issue sorting"));
         assert!(text.contains("quit agent-launcher"));
         assert!(text.contains("d · o · s"));
-        assert!(text.contains("i · x · Esc"));
+        assert!(text.contains("i · Esc"));
+        assert!(text.contains("x worktree · X issue"));
+        assert!(text.contains("detail only; confirm"));
+        assert!(!text.contains("i · x · Esc"));
         assert!(text.contains("Ctrl+C"));
     }
 
@@ -5193,7 +5318,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_detail_is_flat_with_warm_headings_and_preserves_actions() {
+    fn normal_detail_has_square_panel_with_warm_headings_and_preserves_actions() {
         let snapshot = normal_snapshot();
         let mut app = AppState {
             layout: crate::LayoutMode::Fixed,
@@ -5209,12 +5334,29 @@ mod tests {
         assert!(text.contains("Detailed acceptance criteria"));
         assert!(text.contains("d dispatch"));
         assert!(text.contains("i send input"));
+        assert!(text.contains("x worktree"));
+        assert!(text.contains("X issue"));
         assert!(text.contains("Esc back"));
         assert!(!text.contains('┌'));
         let buffer = render_buffer(88, 24, &snapshot, &mut app);
+        assert_eq!(buffer[(4, 1)].fg, theme::primary());
+        assert!(
+            buffer[(4, 1)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
         for y in 0..23 {
             for x in 0..88 {
-                assert_eq!(buffer[(x, y)].bg, theme::bg());
+                let expected = if (2..86).contains(&x) && (1..22).contains(&y) {
+                    if y < 4 {
+                        theme::element()
+                    } else {
+                        theme::panel()
+                    }
+                } else {
+                    theme::bg()
+                };
+                assert_eq!(buffer[(x, y)].bg, expected, "at {x},{y}");
             }
         }
         let body = app.mouse.detail;
@@ -5248,6 +5390,94 @@ mod tests {
         assert!(text.contains("d dispatch"));
         assert!(text.contains("i input"));
         assert!(text.contains("Esc back"));
+    }
+
+    #[test]
+    fn detail_controls_keep_full_labels_when_they_fit() {
+        let snapshot = pr_snapshot();
+        for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
+            for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+                let mut app = AppState {
+                    layout,
+                    tab,
+                    ..Default::default()
+                };
+                assert!(app.open_detail(&snapshot));
+                for width in [42, 44, 56, 80, 88, 100, 107, 108, 160] {
+                    let text = render(width, 24, &snapshot, &mut app);
+                    for label in [
+                        "i send input",
+                        "x worktree",
+                        "X issue",
+                        "o open",
+                        "s stop",
+                        "Esc back",
+                    ] {
+                        assert!(
+                            text.contains(label),
+                            "{layout:?} {tab:?} width {width}: missing {label}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detail_surfaces_fill_header_body_and_controls_including_unicode_and_tiny_sizes() {
+        let mut snapshot = normal_snapshot();
+        snapshot.issues[0].title = "Unicode \u{754c} detail".into();
+        snapshot.issues[0].description = Some("Body \u{754c} content".into());
+        for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
+            let mut app = AppState {
+                layout,
+                ..Default::default()
+            };
+            assert!(app.open_detail(&snapshot));
+            app.status_message = Some("Status \u{754c}".into());
+            for (width, height) in [(18, 5), (24, 7), (40, 10), (88, 24), (160, 40)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let completed = terminal
+                    .draw(|frame| draw(frame, &snapshot, &mut app))
+                    .unwrap();
+                let available = Rect::new(0, 0, width, height - 1).inner(Margin::new(
+                    if width >= 56 {
+                        2
+                    } else {
+                        1
+                    },
+                    u16::from(height > 12),
+                ));
+                let panel_width = layout.content_width(available.width);
+                let panel = Rect::new(
+                    available.x + (available.width - panel_width) / 2,
+                    available.y,
+                    panel_width,
+                    available.height,
+                );
+                let header_height = if panel.width < 18 || panel.height < 4 {
+                    0
+                } else if panel.height >= 12 {
+                    3
+                } else {
+                    2
+                };
+                for y in panel.y..panel.bottom() {
+                    for x in panel.x..panel.right() {
+                        let expected = if y < panel.y + header_height {
+                            theme::element()
+                        } else {
+                            theme::panel()
+                        };
+                        assert_eq!(
+                            completed.buffer[(x, y)].bg,
+                            expected,
+                            "{layout:?} {width}x{height} at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5289,7 +5519,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_detail_resize_keeps_mouse_insets_and_reaches_end_of_wrapped_content() {
+    fn panel_detail_resize_keeps_mouse_insets_and_reaches_end_of_wrapped_content() {
         let mut snapshot = pr_snapshot();
         for issue in &mut snapshot.issues {
             issue.description =
@@ -5316,6 +5546,22 @@ mod tests {
                     }));
                     assert_eq!(app.detail_issue_key, key);
                     let body = app.mouse.detail;
+                    // TestBackend receives only emitted cells, not wide-glyph continuation
+                    // cells. Inspect the complete frame to assert every panel cell's style.
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    let completed = terminal
+                        .draw(|frame| draw(frame, &snapshot, &mut app))
+                        .unwrap();
+                    let buffer = completed.buffer;
+                    for y in body.y..body.bottom() {
+                        for x in body.x - 2..body.right() + 1 {
+                            assert_eq!(
+                                buffer[(x, y)].bg,
+                                theme::panel(),
+                                "{layout:?} {tab:?} width {width} at {x},{y}"
+                            );
+                        }
+                    }
                     for (x, y) in [
                         (body.x - 1, body.y),
                         (body.right(), body.y),

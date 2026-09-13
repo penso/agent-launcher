@@ -213,6 +213,16 @@ impl Store {
         Ok(())
     }
 
+    /// Removes exactly one cached issue, leaving runs, events and checkpoints intact.
+    pub async fn delete_issue(&self, source: &str, issue: &IssueKey) -> Result<()> {
+        sqlx::query("DELETE FROM issues WHERE source = ? AND canonical_key = ?")
+            .bind(source)
+            .bind(issue.canonical())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Loads all current issues in canonical-key order.
     pub async fn load_issues(&self) -> Result<Vec<Issue>> {
         let rows = sqlx::query(
@@ -1505,6 +1515,48 @@ mod tests {
             store.update_run(&missing).await,
             Err(StoreError::RunNotFound(id)) if id == "missing"
         ));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_issue_is_exact_and_preserves_runs_events_and_checkpoints() {
+        let store = Store::in_memory().await.unwrap();
+        let target = issue(IssueProvider::Beads, "app-1", "Target");
+        let mut other = target.clone();
+        other.key.repository = "other".into();
+        store
+            .replace_issues("beads", &[target.clone(), other.clone()])
+            .await
+            .unwrap();
+        store
+            .set_source_checkpoint("beads", &json!({"etag": "keep"}))
+            .await
+            .unwrap();
+        let mut run = run("history", timestamp(100));
+        run.issue_key = target.key.canonical();
+        store.insert_run(&run).await.unwrap();
+        let event = EventEnvelope {
+            run_id: run.id.clone(),
+            sequence: 0,
+            timestamp: run.updated_at,
+            payload: RunEvent::Output {
+                stream: OutputStream::Stdout,
+                text: "keep".into(),
+            },
+        };
+        store.append_event(&event).await.unwrap();
+        store
+            .delete_issue("wrong-source", &target.key)
+            .await
+            .unwrap();
+        assert_eq!(store.load_issues().await.unwrap().len(), 2);
+        store.delete_issue("beads", &target.key).await.unwrap();
+        assert_eq!(store.load_issues().await.unwrap(), vec![other]);
+        assert_eq!(store.load_runs().await.unwrap(), vec![run.clone()]);
+        assert_eq!(store.load_events(&run.id).await.unwrap(), vec![event]);
+        assert_eq!(
+            store.source_checkpoint("beads").await.unwrap(),
+            Some(json!({"etag": "keep"}))
+        );
     }
 
     #[tokio::test]

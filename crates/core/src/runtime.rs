@@ -79,6 +79,8 @@ impl ComputeTargetStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceStatus {
     pub name: String,
+    #[serde(default)]
+    pub supports_delete: bool,
     pub connected: bool,
     pub message: Option<String>,
 }
@@ -95,6 +97,9 @@ pub struct BackendStatus {
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
     Refresh,
+    DeleteIssue {
+        issue: IssueKey,
+    },
     Dispatch {
         issue: IssueKey,
         profile: Option<String>,

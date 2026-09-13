@@ -25,6 +25,9 @@ pub(crate) fn handle_mouse(
     snapshot: &RuntimeSnapshot,
     size: (u16, u16),
 ) -> bool {
+    if app.issue_delete_overlay.is_some() {
+        return false;
+    }
     let hit = &app.mouse;
     if app.debug_overlay {
         if (hit.screen.width, hit.screen.height) != size

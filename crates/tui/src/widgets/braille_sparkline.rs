@@ -12,7 +12,7 @@ use ratatui::{
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SparklineSample {
     pub value: Option<u64>,
-    /// A lower bound: never connected to neighbors, and marked by an underline.
+    /// A lower bound: never connected to neighbors, and dimmed.
     pub partial: bool,
 }
 
@@ -32,7 +32,8 @@ pub enum SparklineVariant {
 ///
 /// Each sample occupies one horizontal dot. At most `area.width * 2` samples are
 /// shown, without resampling or stretching. Missing and unused columns stay blank.
-/// Zero is a visible bottom dot. Partial dots underline their entire shared cell.
+/// Zero is a visible bottom dot. Partial dots dim their entire shared cell.
+/// Provide a textual legend/context when flat partial and complete traces coincide.
 ///
 /// ```
 /// use agent_launcher_tui::widgets::{BrailleSparkline, SparklineSample, SparklineVariant};
@@ -75,7 +76,8 @@ impl<'a> BrailleSparkline<'a> {
         self
     }
 
-    /// Style the entire area, including blank cells. Partial dots add UNDERLINED.
+    /// Style the entire area, including blank cells. Partial dots add DIM.
+    /// Underlines are always removed to avoid solid lines beneath Braille dots.
     pub fn style(mut self, style: impl Into<Style>) -> Self {
         self.style = style.into();
         self
@@ -97,8 +99,8 @@ impl Widget for BrailleSparkline<'_> {
             for x in clip.x..clip.right() {
                 buf[(x, y)]
                     .set_symbol(" ")
-                    .set_style(Style::new().remove_modifier(Modifier::UNDERLINED))
-                    .set_style(self.style);
+                    .set_style(Style::new().remove_modifier(Modifier::DIM))
+                    .set_style(self.style.remove_modifier(Modifier::UNDERLINED));
             }
         }
         let samples = &self.samples[..self.samples.len().min(usize::from(area.width) * 2)];
@@ -128,7 +130,7 @@ impl Widget for BrailleSparkline<'_> {
             let mask = [[1, 2, 4, 64], [8, 16, 32, 128]][x % 2][(y % 4) as usize];
             cell.set_char(char::from_u32(0x2800 + (bits | mask)).unwrap());
             if partial {
-                cell.set_style(Style::new().add_modifier(Modifier::UNDERLINED));
+                cell.set_style(Style::new().add_modifier(Modifier::DIM));
             }
         };
         let mut previous = None;
@@ -330,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_flat_trace_has_noncolor_marker_and_shared_cells_are_conservative() {
+    fn partial_flat_trace_is_dim_and_shared_cells_are_conservative() {
         for variant in VARIANTS {
             for count in [0, 1] {
                 let data = samples(&[
@@ -349,7 +351,13 @@ mod tests {
                     assert_eq!(buffer[(0, 0)].symbol(), buffer[(1, 0)].symbol());
                 }
                 assert!(!buffer[(0, 0)].modifier.contains(Modifier::UNDERLINED));
-                assert!(buffer[(1, 0)].modifier.contains(Modifier::UNDERLINED));
+                assert!(buffer[(1, 0)].modifier.contains(Modifier::DIM));
+                assert!(
+                    buffer
+                        .content
+                        .iter()
+                        .all(|c| !c.modifier.contains(Modifier::UNDERLINED))
+                );
                 assert_eq!(buffer[(2, 0)].symbol(), " ");
                 assert!(!buffer[(2, 0)].modifier.contains(Modifier::UNDERLINED));
             }
@@ -379,10 +387,13 @@ mod tests {
     fn rerender_clears_old_dots_and_partial_markers() {
         for variant in VARIANTS {
             let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+            buffer[(0, 0)].set_style(Style::new().add_modifier(Modifier::UNDERLINED));
             BrailleSparkline::new(&samples(&[(Some(1), true)]))
+                .style(Style::new().add_modifier(Modifier::UNDERLINED))
                 .variant(variant)
                 .render(buffer.area, &mut buffer);
-            assert!(buffer[(0, 0)].modifier.contains(Modifier::UNDERLINED));
+            assert!(buffer[(0, 0)].modifier.contains(Modifier::DIM));
+            assert!(!buffer[(0, 0)].modifier.contains(Modifier::UNDERLINED));
             BrailleSparkline::new(&[])
                 .variant(variant)
                 .render(buffer.area, &mut buffer);

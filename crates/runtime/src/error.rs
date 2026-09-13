@@ -4,6 +4,12 @@ use thiserror::Error;
 /// Errors produced while starting or controlling the runtime.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("issue deletion rejected: {0}")]
+    DeleteIssueRejected(&'static str),
+    #[error(
+        "issue was deleted at the source, but cache removal failed; reconciliation scheduled: {0}"
+    )]
+    DeleteIssueCache(#[source] agent_launcher_store::StoreError),
     #[error("store error: {0}")]
     Store(#[from] agent_launcher_store::StoreError),
 

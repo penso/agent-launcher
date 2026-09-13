@@ -5,6 +5,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("issue deletion is not supported by this source")]
+    DeleteUnsupported,
+    #[error("issue does not match this source or has an invalid native ID")]
+    InvalidDeleteTarget,
+    #[error("bd command timed out; mutation outcome may be uncertain")]
+    CommandTimeout,
     #[error("GitHub throttled; retry after {retry_at}")]
     Throttled {
         retry_at: chrono::DateTime<chrono::Utc>,

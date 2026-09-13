@@ -1,4 +1,4 @@
-use agent_launcher_core::{Issue, IssueProvider};
+use agent_launcher_core::{Issue, IssueKey, IssueProvider};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,15 @@ pub enum SyncMode {
 #[async_trait]
 pub trait IssueSource: Send + Sync {
     fn source_key(&self) -> &SourceKey;
+
+    fn supports_delete(&self) -> bool {
+        false
+    }
+
+    /// Permanently deletes one issue. Call only after explicit user confirmation.
+    async fn delete_issue(&self, _issue: &IssueKey) -> Result<(), Error> {
+        Err(Error::DeleteUnsupported)
+    }
 
     async fn sync(&self, checkpoint: Option<&SyncCheckpoint>) -> Result<SyncResult, Error>;
 

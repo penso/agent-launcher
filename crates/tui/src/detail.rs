@@ -46,6 +46,7 @@ pub(crate) fn draw_detail(
         content_width,
         available.height,
     );
+    frame.render_widget(Block::new().style(Style::new().bg(theme::panel())), content);
     if content.height < 4 || content.width < 18 {
         draw_tiny_detail(frame, content, issue, app.latest_run(snapshot, issue));
         if app.input_overlay.is_some() {
@@ -58,7 +59,7 @@ pub(crate) fn draw_detail(
     }
 
     let status = app.visible_status(snapshot);
-    let controls_height = if content.width >= 82 {
+    let controls_height = if content.width >= 104 {
         1
     } else {
         2
@@ -114,7 +115,7 @@ fn draw_tiny_detail(
             &format!("{} {}", issue.identifier, issue.title),
             area.width as usize,
         ),
-        Style::new().fg(theme::text()),
+        Style::new().fg(theme::primary()).bold(),
     )];
     if let Some(run) = latest_run {
         lines.push(Line::styled(
@@ -139,6 +140,7 @@ fn draw_detail_header(
     issue: &Issue,
     latest_run: Option<&RunSummary>,
 ) {
+    frame.render_widget(Block::new().style(Style::new().bg(theme::element())), area);
     let inner = Block::new().padding(Padding::new(2, 1, 0, 0)).inner(area);
     if inner.is_empty() {
         return;
@@ -149,7 +151,9 @@ fn draw_detail_header(
     );
     let mut lines = vec![Line::styled(
         title,
-        Style::new().fg(theme::text()).add_modifier(Modifier::BOLD),
+        Style::new()
+            .fg(theme::primary())
+            .add_modifier(Modifier::BOLD),
     )];
     if area.height > 1 {
         let source = format!(
@@ -199,7 +203,7 @@ fn draw_detail_body(
     app.mouse.detail = inner;
     let paragraph = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
-        .style(Style::new().fg(theme::text()).bg(theme::bg()));
+        .style(Style::new().fg(theme::text()).bg(theme::panel()));
     app.detail_scroll_max = paragraph
         .line_count(inner.width)
         .saturating_sub(inner.height as usize)
@@ -523,14 +527,14 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review
             control_line(&[(
                 "d",
                 if review {
-                    " review PR"
+                    " review PR Esc"
                 } else {
-                    " dispatch"
+                    " dispatch Esc"
                 },
             )]),
-            control_line(&[("o s i x ↑↓ Esc", "")]),
+            control_line(&[("x", " worktree  "), ("X", " issue")]),
         ]
-    } else if area.width >= 82 {
+    } else if area.width >= 104 {
         vec![control_line(&[
             (
                 "d",
@@ -543,7 +547,8 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review
             ("o", " open   "),
             ("s", " stop   "),
             ("i", " send input   "),
-            ("x", " delete   "),
+            ("x", " worktree   "),
+            ("X", " issue   "),
             ("↑/↓", " scroll   "),
             ("Esc", " back"),
         ])]
@@ -560,9 +565,16 @@ fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review
                 ),
                 ("o", " open  "),
                 ("s", " stop  "),
-                ("i", " input"),
+                (
+                    "i",
+                    if area.width >= 40 {
+                        " send input"
+                    } else {
+                        " input"
+                    },
+                ),
             ]),
-            control_line(&[("x", " delete  "), ("↑/↓", " scroll  "), ("Esc", " back")]),
+            control_line(&[("x", " worktree  "), ("X", " issue  "), ("Esc", " back")]),
         ]
     };
     let mut controls = controls;
@@ -675,6 +687,72 @@ fn draw_input_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         theme::bg(),
         frame.buffer_mut(),
     );
+}
+
+pub(crate) fn draw_issue_delete_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+    app.issue_delete_confirmation_visible = false;
+    let Some(overlay) = app.issue_delete_overlay.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2).min(100);
+    let height = area.height.saturating_sub(2);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::new().style(Style::new().bg(theme::element())), popup);
+    let inner = popup.inner(Margin::new(1, 1));
+    // Never truncate identity or warnings: confirmation is enabled only when all lines fit.
+    let lines = vec![
+        Line::styled(
+            "Permanently delete source issue?",
+            Style::new().fg(theme::error()).bold(),
+        ),
+        key_value("identifier", &format!("{:?}", overlay.identifier)),
+        key_value("title", &format!("{:?}", overlay.title)),
+        key_value("provider", overlay.issue_key.provider.as_str()),
+        key_value("host", &format!("{:?}", overlay.issue_key.host)),
+        key_value("repository", &format!("{:?}", overlay.issue_key.repository)),
+        key_value("exact key", &format!("{:?}", overlay.issue_key.canonical())),
+        Line::raw(""),
+        Line::styled(
+            "WARNING: Permanent source deletion. This cannot be undone.",
+            Style::new().fg(theme::error()).bold(),
+        ),
+        Line::styled(
+            "Removes dependency links, updates references, and orphans dependents.",
+            Style::new().fg(theme::error()),
+        ),
+        Line::raw("Worktrees and run history are NOT deleted."),
+        Line::raw("Active or resumable runs block deletion; resolve those runs first."),
+        Line::raw(""),
+        Line::raw(if overlay.pending {
+            "Deleting source issue... Please wait."
+        } else {
+            "Enter permanently delete issue | Esc cancel"
+        }),
+    ];
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .style(Style::new().fg(theme::text()).bg(theme::element()));
+    if inner.width >= 20 && paragraph.line_count(inner.width) <= usize::from(inner.height) {
+        frame.render_widget(paragraph, inner);
+        app.issue_delete_confirmation_visible = !overlay.pending;
+    } else {
+        frame.render_widget(
+            Paragraph::new(if overlay.pending {
+                "Deleting source issue... Please wait."
+            } else {
+                "Resize to review full target and permanent deletion warnings. Enter disabled. Esc cancel."
+            })
+            .wrap(Wrap { trim: false })
+            .style(Style::new().fg(theme::error()).bg(theme::element())),
+            popup,
+        );
+    }
 }
 
 fn draw_delete_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
