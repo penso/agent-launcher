@@ -24,7 +24,9 @@ checkout to dispatch work there, even when `--remote` points the inbox at anothe
 
 `--layout flexible` (the default) fills the available width and height with side
 padding. Taller terminals show more Issues/PR rows, with a compact activity panel
-above the normally sized, horizontally centered logo. Legends and command hints
+with the centered logo inside its uncollected history area. This reclaims the
+separate logo's three rows for Issues/PRs without enlarging the top panel. Smaller
+terminals without an activity panel retain the separate logo. Legends and command hints
 stay above the global footer at the bottom. Extra table width goes primarily to
 issue and PR titles; the activity panel and detail view also use the available width.
 Use `agent-launcher --layout fixed` for the original centered, 104-column-capped,
@@ -54,7 +56,9 @@ and [tab rename implementation](https://github.com/herdrdev/herdr/blob/v0.9.0/sr
 The live top graph shows the **number of Herdr-recognized working agents**, not a
 synthetic activity score. It includes agents launched outside launcher and is
 independent of the selected repository, issue, backend, or Herdr UI machine.
-Blocked, idle, unseen-done, and unknown agents have separate counters. Herdr's
+The compact header shows working agents, nonzero blocked agents when space permits,
+and coverage such as `1/1 sessions` or `1/2 partial`. Detailed state counters and
+configured/discovered scope are in Debug (`Ctrl+G`, then `g`). Herdr's
 `done` means an unseen result, not verified task success; `unknown` is a semantic
 state, not a disconnected host.
 
@@ -77,25 +81,87 @@ processes Herdr does not recognize are outside coverage.
 Inventories are polled every two seconds, with at most four concurrent requests,
 ten-second deadlines, and bounded retry backoff. Discovery refreshes every minute
 and on manual refresh. Observations expire after ten seconds; a recent observation
-can remain fresh while its next request has failed, and both conditions are shown.
+can remain fresh while its next request has failed, and Debug shows both conditions.
 Partial counts are lower bounds. Debug (`Ctrl+G`, then `g`) shows sanitized discovery,
-persistence, and per-endpoint failure reasons without terminal output.
+persistence, per-endpoint failure reasons, and latest-sample totals and coverage
+(including stale, failed, never-observed, and excluded sessions) without terminal output.
 
 The graph retains 15 minutes and shows the peak working count per display bucket,
 with a count scale rather than a 0-100 score. The Braille trace uses two buckets per
 character and four vertical dots per row. Adjacent complete buckets are connected;
 incomplete buckets are unconnected lower-bound dots with underlined cells (also
 distinct on flat traces), gaps are blank, and observed zero sits visibly on the
-bottom edge. Only aggregate counts and coverage are stored
-in the existing local SQLite database, with 30-minute retention. Restart restores
+bottom edge. A compact footer shows `-15m`, the peak agent count, and `now` when
+space permits; the graph keeps most of the panel's height. Only aggregate counts
+and coverage are stored in the existing local SQLite database, with 30-minute retention. Restart restores
 original sample times; downtime and missed transitions are not reconstructed.
+The muted AGENT LAUNCHER logo is centered inside the graph (short text below 62
+graph columns or two graph rows). As history fills from right to left, whole
+terminal columns of the logo disappear starting at the first sampled bucket.
+Zero counts, missing samples, and subsequent outage gaps all reserve their timeline;
+the logo never sits under recorded data. Full restored history hides it immediately.
+The earliest nonfuture sample time is remembered for this launch, so pruning or an
+empty snapshot cannot make the logo reappear in previously covered history.
 Clock rollback invalidates affected stored history once the reset commits.
 
 Polling is sampled observation, not a lossless transition log or work-throughput
 measurement. Collection runs only while launcher runs. Setting
 `AGENT_LAUNCHER_DEMO_ACTIVITY` to any value, including an empty value, explicitly
-selects the existing labeled demo and disables real collection and sample writes;
-failed telemetry never falls back to demo data.
+selects a labeled demo and disables real collection and sample writes. Renderer-only
+synthetic two-second samples use the same panel, count scale, colors, partial dots,
+and gaps as live activity. It starts empty at tick 0 and adds two samples per 80ms
+UI tick (four virtual seconds): tick 1 has two right-edge samples, and tick 225
+has the full 450-sample window after nominally 18 seconds. It then rolls continuously
+without restarting the logo reveal. Failed telemetry
+never falls back to demo data.
+
+### Reusable Braille Widgets
+
+`agent_launcher_tui::widgets` exports `BrailleSparkline`, `SparklineSample`, and
+`SparklineVariant`. The widget borrows a slice of domain-independent observations
+and implements Ratatui's `Widget`, without requiring a `Frame`, Herdr model, or theme.
+
+```rust
+use agent_launcher_tui::widgets::{BrailleSparkline, SparklineSample, SparklineVariant};
+use ratatui::style::{Color, Style};
+
+let samples = [
+    SparklineSample { value: Some(0), partial: false },
+    SparklineSample { value: Some(7), partial: false },
+    SparklineSample { value: None, partial: false },
+    SparklineSample { value: Some(4), partial: true },
+];
+let widget = BrailleSparkline::new(&samples)
+    .max(10) // Omit, or call .auto_max(), to scale to visible observations.
+    .style(Style::new().fg(Color::Cyan))
+    .variant(SparklineVariant::Line);
+// frame.render_widget(widget, area);
+```
+
+`Line` (default) connects only adjacent complete observations. `Dots` never
+interpolates. `Filled` draws independent vertical Braille columns, two per cell;
+partial observations remain isolated, underlined lower-bound dots in every variant.
+Gaps stay blank and real zero remains a bottom dot. An underline applies to the
+whole cell when a partial dot shares it with complete data.
+
+Each sample occupies one horizontal dot, with four vertical dots per character row.
+The first `area.width * 2` samples are displayed without stretching or resampling;
+callers choose their own bucketing or history window. Auto-scaling includes visible
+partial values, ignores gaps and offscreen samples, and uses one for empty/all-zero
+data. Explicit maxima clamp larger values; `.max(0)` also uses one. Integer `u128`
+scaling is safe through `u64::MAX`, and buffer clipping preserves the original geometry.
+Live and demo activity use this same widget with `Line` and the existing panel style.
+
+The original implementation is inspired by the builder/Widget API and Braille pixel
+approach in [penso/ratatui-braille-bar](https://github.com/penso/ratatui-braille-bar).
+No progress-bar dependency or upstream implementation code is included.
+
+Preview all three variants on the same animated simulated dataset (side by side,
+or stacked in narrow terminals; quit with `q`, `Esc`, or `Ctrl+C`):
+
+```sh
+cargo run -p agent-launcher-tui --example braille_sparklines
+```
 
 ## Dispatch
 

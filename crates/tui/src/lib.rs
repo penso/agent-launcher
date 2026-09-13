@@ -10,7 +10,7 @@ mod render;
 mod rows;
 mod status;
 mod theme;
-mod widgets;
+pub mod widgets;
 
 pub use error::Error;
 pub use event_loop::run;

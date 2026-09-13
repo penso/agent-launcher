@@ -94,6 +94,7 @@ pub(crate) struct AppState {
     pub status_message: Option<String>,
     pub host_metrics: HostMetrics,
     pub tick: u32,
+    pub activity_history_origin: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl AppState {

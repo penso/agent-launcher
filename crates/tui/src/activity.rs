@@ -11,6 +11,39 @@ pub(crate) struct ActivityBucket {
     pub partial: bool,
 }
 
+/// Retain chronology independently of counts and the runtime's bounded sample retention.
+pub(crate) fn history_origin(
+    snapshot: &HerdrActivitySnapshot,
+    now: DateTime<Utc>,
+    previous: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    snapshot
+        .samples
+        .iter()
+        .map(|sample| sample.sampled_at)
+        .chain(previous)
+        .filter(|at| *at <= now)
+        .min()
+}
+
+/// Whole cells strictly before the first observed two-dot bucket, including missing samples.
+pub(crate) fn unobserved_columns(
+    snapshot: &HerdrActivitySnapshot,
+    width: usize,
+    now: DateTime<Utc>,
+    origin: Option<DateTime<Utc>>,
+) -> usize {
+    let Some(first) = history_origin(snapshot, now, origin) else {
+        return width;
+    };
+    let age = now.signed_duration_since(first).num_milliseconds();
+    if age >= HISTORY_MS {
+        return 0;
+    }
+    let slot = ((HISTORY_MS - 1 - age) / SAMPLE_MS) as usize;
+    (slot * (width * 2) / (HISTORY_MS / SAMPLE_MS) as usize) / 2
+}
+
 /// Project persisted UTC observations, never launcher events or current-state backfill.
 pub(crate) fn buckets(
     snapshot: &HerdrActivitySnapshot,
@@ -22,6 +55,9 @@ pub(crate) fn buckets(
     }
     let mut slots = vec![ActivityBucket::default(); (HISTORY_MS / SAMPLE_MS) as usize];
     for sample in &snapshot.samples {
+        if sample.sampled_at > now {
+            continue;
+        }
         let age = now
             .signed_duration_since(sample.sampled_at)
             .num_milliseconds();
@@ -63,6 +99,60 @@ pub(crate) fn current_sample(
         .max_by_key(|sample| sample.sampled_at)
 }
 
+/// Renderer-only fixture: never passed to the collector or persisted history.
+pub(crate) fn demo_snapshot(tick: u32, now: DateTime<Utc>) -> HerdrActivitySnapshot {
+    let counts = [
+        0, 0, 1, 3, 4, 2, 1, 0, 0, 2, 6, 4, 5, 8, 5, 3, 1, 0, 1, 4, 3, 4, 6, 4, 2, 0, 2, 7, 4, 3,
+    ];
+    // Two virtual two-second samples per 80ms UI tick: full history after 18 seconds.
+    let total = u64::from(tick) * 2;
+    let start = total.saturating_sub(450);
+    HerdrActivitySnapshot {
+        enabled: true,
+        samples: (start..total)
+            .map(|index| {
+                let phase = (index % 450) as usize;
+                let missing = (150..180).contains(&phase);
+                let partial = (300..325).contains(&phase);
+                ActivitySample {
+                    sampled_at: now
+                        - chrono::Duration::milliseconds((total - 1 - index) as i64 * SAMPLE_MS),
+                    counts: (!missing).then_some(agent_launcher_core::ActivityCounts {
+                        working: counts[phase / 5 % counts.len()],
+                        blocked: u64::from(partial),
+                        ..Default::default()
+                    }),
+                    expected_endpoints: 2,
+                    fresh_endpoints: if missing {
+                        0
+                    } else if partial {
+                        1
+                    } else {
+                        2
+                    },
+                    stale_endpoints: if missing {
+                        2
+                    } else {
+                        usize::from(partial)
+                    },
+                    never_observed_endpoints: 0,
+                    failed_endpoints: 0,
+                    excluded_endpoints: 0,
+                    inventory_complete: true,
+                    completeness: if missing {
+                        ActivityCompleteness::Missing
+                    } else if partial {
+                        ActivityCompleteness::Partial
+                    } else {
+                        ActivityCompleteness::Complete
+                    },
+                }
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn sample(
     at: DateTime<Utc>,
@@ -93,6 +183,73 @@ mod tests {
     use ActivityCompleteness::{Complete, Missing, Partial};
 
     use super::*;
+
+    #[test]
+    fn leading_columns_follow_sample_slots_not_counts_or_input_order() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        for width in [0, 1, 24, 61, 62, 104, 225, 450, 1000] {
+            let mut snapshot = HerdrActivitySnapshot::default();
+            assert_eq!(unobserved_columns(&snapshot, width, now, None), width);
+            snapshot
+                .samples
+                .push(sample(now + chrono::Duration::nanoseconds(1), 99, Complete));
+            assert_eq!(unobserved_columns(&snapshot, width, now, None), width);
+            assert!(
+                buckets(&snapshot, width * 2, now)
+                    .iter()
+                    .all(|b| b.working.is_none())
+            );
+            for age in [0, 1999, 2000, 450_000, 899_999, 900_000, 960_000] {
+                for completeness in [Complete, Partial, Missing] {
+                    snapshot.samples.truncate(1);
+                    snapshot.samples.push(sample(now, 0, Complete));
+                    snapshot.samples.push(sample(
+                        now - chrono::Duration::milliseconds(age),
+                        0,
+                        completeness,
+                    ));
+                    let expected = if age >= HISTORY_MS {
+                        0
+                    } else {
+                        ((HISTORY_MS - 1 - age) / SAMPLE_MS) as usize * (width * 2) / 450 / 2
+                    };
+                    assert_eq!(unobserved_columns(&snapshot, width, now, None), expected);
+                    let data = buckets(&snapshot, width * 2, now);
+                    assert!(data[..expected * 2].iter().all(|b| b.working.is_none()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_origin_prevents_reveal_after_pruning_and_empty_snapshots() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut snapshot = HerdrActivitySnapshot {
+            samples: vec![sample(now - chrono::Duration::minutes(16), 0, Missing)],
+            ..Default::default()
+        };
+        let origin = history_origin(&snapshot, now, None);
+        snapshot.samples = vec![sample(now, 0, Missing)];
+        assert_eq!(history_origin(&snapshot, now, origin), origin);
+        snapshot.samples.clear();
+        assert_eq!(history_origin(&snapshot, now, origin), origin);
+        for width in [24, 104, 450, 1000] {
+            assert_eq!(unobserved_columns(&snapshot, width, now, origin), 0);
+            assert_eq!(
+                unobserved_columns(&demo_snapshot(0, now), width, now, None),
+                width
+            );
+            assert!(unobserved_columns(&demo_snapshot(1, now), width, now, None) < width);
+            let partial = unobserved_columns(&demo_snapshot(112, now), width, now, None);
+            assert!(partial > 0 && partial < width);
+            for tick in [225, 226, 450, 10_000, u32::MAX] {
+                assert_eq!(
+                    unobserved_columns(&demo_snapshot(tick, now), width, now, None),
+                    0
+                );
+            }
+        }
+    }
 
     #[test]
     fn counts_are_not_scores_or_capped() {
