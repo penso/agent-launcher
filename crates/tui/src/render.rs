@@ -10,8 +10,7 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
     widgets::{
-        Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Sparkline, Widget,
+        Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
     },
 };
 
@@ -1851,12 +1850,20 @@ fn draw_footer(
             Paragraph::new(cpu_label).style(Style::new().fg(load_color(metrics.cpu_percent))),
             Rect::new(metrics_x, footer.y, 13, 1),
         );
-        let spark_data = metrics.cpu_sparkline(spark_width as usize);
+        let spark_data = metrics
+            .cpu_sparkline(usize::from(spark_width) * 2)
+            .into_iter()
+            .map(|value| SparklineSample {
+                value: Some(value),
+                partial: false,
+            })
+            .collect::<Vec<_>>();
         frame.render_widget(
-            Sparkline::default()
-                .data(&spark_data)
-                .max(100)
-                .style(Style::new().fg(load_color(metrics.cpu_percent))),
+            BrailleSparkline::new(&spark_data).max(100).style(
+                Style::new()
+                    .fg(load_color(metrics.cpu_percent))
+                    .bg(theme::bg()),
+            ),
             Rect::new(metrics_x + 13, footer.y, spark_width, 1),
         );
         frame.render_widget(
@@ -5252,6 +5259,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cpu_sparkline_uses_braille_only_and_stays_in_footer_row() {
+        let snapshot = normal_snapshot();
+        let mut metrics = HostMetrics::default();
+        for cpu in [0, 12, 25, 50, 75, 100, 100, 25, 100] {
+            metrics.record(cpu, 64);
+        }
+        for width in [112, 160] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 5)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_footer(frame, Rect::new(0, 1, width, 3), &snapshot, &metrics);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut dots = 0;
+            for y in 0..5 {
+                for x in 0..width {
+                    let cell = &buffer[(x, y)];
+                    if y != 3 {
+                        assert_eq!(cell.symbol(), " ");
+                    }
+                    for ch in cell.symbol().chars() {
+                        assert!(!('\u{2580}'..='\u{259f}').contains(&ch));
+                        if ('\u{2801}'..='\u{28ff}').contains(&ch) {
+                            dots += 1;
+                            assert_eq!(y, 3);
+                            assert_eq!(cell.bg, theme::bg());
+                            assert_eq!(cell.fg, load_color(100));
+                            assert!(!cell.modifier.contains(Modifier::UNDERLINED));
+                        }
+                    }
+                }
+            }
+            assert!(dots > 0);
         }
     }
 
