@@ -28,6 +28,9 @@ use crate::{
     prompts,
 };
 
+#[path = "away.rs"]
+mod away;
+
 const COMMAND_CAPACITY: usize = 64;
 const RUN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -352,6 +355,7 @@ impl RuntimeHandle {
 
 /// Owns all mutable runtime state and serializes state changes through one loop.
 pub struct RuntimeService {
+    away: away::Scheduler,
     diagnostics: Diagnostics,
     repository: Repository,
     sources: Vec<Arc<dyn IssueSource>>,
@@ -453,6 +457,7 @@ impl RuntimeService {
         };
         (
             Self {
+                away: away::Scheduler::default(),
                 diagnostics,
                 repository,
                 sources: sources.into_iter().map(Arc::from).collect(),
@@ -501,6 +506,21 @@ impl RuntimeService {
         config: AppConfig,
     ) -> RuntimeHandle {
         let (service, handle) = Self::new(repository, sources, store, runner, config);
+        handle.attach(tokio::spawn(service.run()));
+        handle
+    }
+
+    /// CLI entry point: ownership must precede registry loading and recovery.
+    pub fn start_owned(
+        repository: Repository,
+        sources: Vec<Box<dyn IssueSource>>,
+        store: Store,
+        runner: Arc<Runner>,
+        config: AppConfig,
+        ownership: crate::RuntimeOwnership,
+    ) -> RuntimeHandle {
+        let (mut service, handle) = Self::new(repository, sources, store, runner, config);
+        service.away.lock = Some(ownership);
         handle.attach(tokio::spawn(service.run()));
         handle
     }
@@ -608,6 +628,9 @@ impl RuntimeService {
                 Some(result) = self.security_work.join_next_with_id(), if !self.security_work.is_empty() => {
                     self.handle_security_completion(result).await;
                 }
+                Some(result) = self.away.work.join_next(), if !self.away.work.is_empty() => {
+                    self.handle_away_result(result).await;
+                }
                 Some(result) = self.notifications.join_next(), if !self.notifications.is_empty() => {
                     if let Err(error) = result
                         && !error.is_cancelled()
@@ -616,8 +639,10 @@ impl RuntimeService {
                     }
                 }
             }
+            self.reconcile_away().await;
         }
 
+        self.shutdown_away().await;
         drop(activity_rx);
         for job in self.security_in_flight.values() {
             job.cancelled.send_replace(true);
@@ -647,6 +672,12 @@ impl RuntimeService {
     }
 
     async fn initialize(&mut self) {
+        self.initialize_away().await;
+        if self.away.owner_error.is_some() {
+            self.snapshot.initialized = true;
+            self.publish();
+            return;
+        }
         let active_sources = self
             .sources
             .iter()
@@ -709,6 +740,7 @@ impl RuntimeService {
             },
             Err(error) => self.set_error_without_publish("store:runs", error.to_string()),
         }
+        self.away.record_existing_failures(&self.snapshot.runs);
         for mut run in self.runner.confidential_runs().await {
             run.message =
                 Some("Private security run restored; open the selected harness for details".into());
@@ -774,17 +806,53 @@ impl RuntimeService {
                 return false;
             },
         };
+        if let Some(error) = &self.away.owner_error
+            && matches!(
+                &command,
+                RuntimeCommand::SendInput { .. }
+                    | RuntimeCommand::Stop { .. }
+                    | RuntimeCommand::DeleteWorktree { .. }
+                    | RuntimeCommand::DeleteIssue { .. }
+            )
+        {
+            let _ = acknowledge.send(Err(RunnerError::InvalidRequest(error.clone()).into()));
+            return false;
+        }
         if let RuntimeCommand::DispatchSecurity {
             issue,
             options,
             consent,
         } = command
         {
+            if let Err(error) = self.check_away_admission(Some(&issue)) {
+                let _ = acknowledge.send(Err(error));
+                return false;
+            }
             self.launch_security(issue, options, consent, acknowledge);
+            return false;
+        }
+        if matches!(
+            command,
+            RuntimeCommand::StartAway { .. }
+                | RuntimeCommand::PauseAway
+                | RuntimeCommand::ResumeAway
+                | RuntimeCommand::SetManual
+                | RuntimeCommand::SetAwayConcurrency { .. }
+                | RuntimeCommand::ReprioritizeAway { .. }
+        ) {
+            let result = self.away_command(command).await;
+            self.record_command_result("away", &result);
+            let _ = acknowledge.send(result);
             return false;
         }
         // Only operation labels, backend enums and opaque identity hashes reach the log.
         let (operation, identity, backend) = match &command {
+            RuntimeCommand::StartAway { .. }
+            | RuntimeCommand::PauseAway
+            | RuntimeCommand::ResumeAway
+            | RuntimeCommand::SetManual
+            | RuntimeCommand::SetAwayConcurrency { .. }
+            | RuntimeCommand::ReprioritizeAway { .. } => unreachable!(),
             RuntimeCommand::DispatchSecurity { .. } => unreachable!(),
             RuntimeCommand::DeleteIssue { issue } => {
                 ("delete-issue", Some(issue.canonical()), None)
@@ -858,6 +926,12 @@ impl RuntimeService {
             return false;
         }
         let (name, result, shutdown) = match command {
+            RuntimeCommand::StartAway { .. }
+            | RuntimeCommand::PauseAway
+            | RuntimeCommand::ResumeAway
+            | RuntimeCommand::SetManual
+            | RuntimeCommand::SetAwayConcurrency { .. }
+            | RuntimeCommand::ReprioritizeAway { .. } => unreachable!(),
             RuntimeCommand::DispatchSecurity { .. } => unreachable!(),
             RuntimeCommand::Refresh => unreachable!("refresh handled above"),
             RuntimeCommand::DeleteIssue { issue } => {
@@ -1433,6 +1507,7 @@ impl RuntimeService {
         target: Option<&str>,
         options: &agent_launcher_core::DispatchOptions,
     ) -> Result<()> {
+        self.check_away_admission(Some(key))?;
         if matches!(action, DispatchAction::Review) && !options.additional_instructions.is_empty() {
             return Err(RunnerError::InvalidRequest(
                 "additional instructions are not supported for pull request review".into(),
@@ -1672,6 +1747,7 @@ impl RuntimeService {
                 .delete_worktree(backend, run_id, force, Some(&inspection))
                 .await?;
         }
+        self.resolve_deleted_away_run(run_id).await?;
         if let Err(error) = self.store.delete_run(run_id).await
             && !matches!(error, StoreError::RunNotFound(_))
         {
@@ -1692,6 +1768,19 @@ impl RuntimeService {
     }
 
     async fn delete_issue(&mut self, key: &IssueKey) -> Result<()> {
+        if self.snapshot.away.entries.iter().any(|entry| {
+            entry.issue == *key
+                && entry.run_id.is_some()
+                && !matches!(
+                    entry.state,
+                    agent_launcher_core::AwayEntryState::Finished
+                        | agent_launcher_core::AwayEntryState::Skipped
+                )
+        }) {
+            return Err(Error::DeleteIssueRejected(
+                "an Away attempt owns this issue; resolve its worker before deletion",
+            ));
+        }
         if key.provider != IssueProvider::Beads {
             return Err(Error::DeleteIssueRejected(
                 "only Beads supports issue deletion",
@@ -1766,6 +1855,9 @@ impl RuntimeService {
     }
 
     fn launch_due_sources(&mut self, force: bool, security_only: bool) {
+        if self.away.owner_error.is_some() {
+            return;
+        }
         let mut launched = false;
         for source in &self.sources {
             let source_name = source.cache_key();
@@ -1860,9 +1952,33 @@ impl RuntimeService {
         for run_id in run_ids {
             self.launch_run_refresh(&run_id);
         }
+        // A crash may leave a durable reservation absent from SQLite; ask the
+        // backend by its reserved ID rather than creating another worker.
+        let missing = self
+            .snapshot
+            .away
+            .entries
+            .iter()
+            .filter(|entry| {
+                !matches!(
+                    entry.state,
+                    agent_launcher_core::AwayEntryState::Finished
+                        | agent_launcher_core::AwayEntryState::Skipped
+                )
+            })
+            .filter_map(|entry| entry.run_id.as_ref())
+            .filter(|id| !self.snapshot.runs.iter().any(|run| &run.id == *id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for run_id in missing {
+            self.launch_run_refresh(&run_id);
+        }
     }
 
     fn launch_run_refresh(&mut self, run_id: &str) {
+        if self.away.launching.contains(run_id) || self.away.owner_error.is_some() {
+            return;
+        }
         if self.run_refresh_unsupported.contains(run_id) {
             return;
         }
@@ -1873,8 +1989,13 @@ impl RuntimeService {
         self.run_in_flight.insert(run_id.to_owned(), generation);
         let runner = Arc::clone(&self.runner);
         let run_id = run_id.to_owned();
+        let away = self.snapshot.away.owns_run(&run_id);
         self.work.spawn(async move {
-            let result = runner.refresh(&run_id).await;
+            let result = if away {
+                runner.refresh_away(&run_id).await
+            } else {
+                runner.refresh(&run_id).await
+            };
             WorkResult::Run {
                 run_id,
                 generation,
@@ -2308,6 +2429,28 @@ impl RuntimeService {
                             ),
                         },
                         Err(error @ agent_launcher_runner::Error::RunNotFound(_)) => {
+                            if self.snapshot.away.entries.iter().any(|entry| {
+                                entry.run_id.as_deref() == Some(&run_id)
+                                    && entry.state == agent_launcher_core::AwayEntryState::Launching
+                            }) && !self.away.launching.contains(&run_id)
+                            {
+                                // Herdr must persist its record before submission. A
+                                // recovered intent without that record never launched.
+                                if let Err(error) = self
+                                    .record_unstarted_away(
+                                        &run_id,
+                                        "interrupted before backend reservation",
+                                    )
+                                    .await
+                                {
+                                    self.set_error_without_publish(
+                                        format!("run:{run_id}"),
+                                        error.to_string(),
+                                    );
+                                }
+                                self.publish();
+                                return;
+                            }
                             let message = error.to_string();
                             match self.persist_disconnected(&run_id, message.clone()).await {
                                 Ok(()) => {},

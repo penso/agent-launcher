@@ -19,6 +19,7 @@ pub enum Capability {
     Open,
     DeleteWorktree,
     Remote,
+    Away,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -113,6 +114,8 @@ pub struct OpenResult {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("Away worker was not started: {0}")]
+    AwayNotStarted(String),
     #[error("private security checkout safety check failed")]
     PrivateSecurity,
     #[error("I/O error: {0}")]
@@ -213,6 +216,24 @@ pub trait Backend: Send + Sync {
         Err(Error::PrivateSecurity)
     }
     async fn dispatch(&self, request: DispatchRequest) -> Result<DispatchResult>;
+    /// Dispatch a finite worker using the caller's persisted reservation UUID.
+    async fn dispatch_away(
+        &self,
+        _request: DispatchRequest,
+        _run_id: &str,
+    ) -> Result<DispatchResult> {
+        Err(Error::UnsupportedCapability {
+            backend: self.kind(),
+            capability: Capability::Away,
+        })
+    }
+    /// Refresh using process-exit evidence, not interactive harness idle state.
+    async fn refresh_away(&self, _run_id: &str) -> Result<StatusResult> {
+        Err(Error::UnsupportedCapability {
+            backend: self.kind(),
+            capability: Capability::Away,
+        })
+    }
     async fn refresh(&self, run_id: &str) -> Result<StatusResult>;
     async fn send_input(&self, run_id: &str, text: &str) -> Result<()>;
     async fn stop(&self, run_id: &str) -> Result<()>;
@@ -344,6 +365,40 @@ impl Runner {
     pub async fn refresh(&self, run_id: &str) -> Result<StatusResult> {
         let backend = self.backend_for_run(run_id).await?;
         backend.refresh(run_id).await
+    }
+
+    pub async fn dispatch_away(
+        &self,
+        backend: BackendKind,
+        request: DispatchRequest,
+        run_id: &str,
+    ) -> Result<DispatchResult> {
+        request
+            .validate()
+            .map_err(|error| Error::AwayNotStarted(error.to_string()))?;
+        if request.private_fork.is_some() || request.issue.security_advisory.is_some() {
+            return Err(Error::AwayNotStarted(Error::PrivateSecurity.to_string()));
+        }
+        if request.target.is_some() {
+            return Err(Error::AwayNotStarted(
+                "Away does not support compute targets".into(),
+            ));
+        }
+        self.backend(backend)
+            .map_err(|error| Error::AwayNotStarted(error.to_string()))?
+            .dispatch_away(request, run_id)
+            .await
+            .map_err(|error| match error {
+                Error::UnsupportedCapability { .. } => Error::AwayNotStarted(error.to_string()),
+                _ => error,
+            })
+    }
+
+    pub async fn refresh_away(&self, run_id: &str) -> Result<StatusResult> {
+        self.backend_for_run(run_id)
+            .await?
+            .refresh_away(run_id)
+            .await
     }
 
     pub async fn send_input(&self, run_id: &str, text: &str) -> Result<()> {

@@ -1,6 +1,7 @@
 //! Shared domain types for agent-launcher.
 
 mod activity;
+mod away;
 mod config;
 mod event;
 mod issue;
@@ -10,6 +11,7 @@ mod security;
 mod workspace;
 
 pub use activity::*;
+pub use away::*;
 pub use config::*;
 pub use event::*;
 pub use issue::*;

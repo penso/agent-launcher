@@ -40,6 +40,10 @@ const POP_TITLE: Print<&str> = Print("\x1b[23;0t");
 const LAUNCHER_TITLE: SetTitle<&str> = SetTitle("launcher");
 
 enum UiActionResult {
+    Away {
+        request_id: u64,
+        result: agent_launcher_runtime::Result<()>,
+    },
     Security {
         request_id: u64,
         result: agent_launcher_runtime::Result<()>,
@@ -137,6 +141,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                         {
                             app.issue_delete_confirmation_visible = false;
                             app.security_confirmation_visible = false;
+                            app.away_quit_visible = false;
                         }
                         let should_quit = handle_key(
                             &mut app,
@@ -167,6 +172,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                     },
                     Some(Ok(Event::Resize(_, _))) => {
                         app.mouse = Default::default();
+                        app.away_quit_visible = false;
                         app.issue_delete_confirmation_visible = false;
                         app.security_confirmation_visible = false;
                         needs_draw = true;
@@ -273,8 +279,34 @@ fn handle_key(
     runtime: &RuntimeHandle,
     actions: &UiActionSender,
 ) -> bool {
+    if app.away_quit {
+        match key.code {
+            KeyCode::Esc => app.away_quit = false,
+            KeyCode::Char('q') if app.away_quit_visible && key.kind == KeyEventKind::Press => {
+                return true;
+            },
+            KeyCode::Char('m') if app.away_pending.is_none() => {
+                app.away_quit = false;
+                crate::away::open(app, snapshot);
+                send_away(
+                    app,
+                    agent_launcher_core::RuntimeCommand::SetManual,
+                    runtime,
+                    actions,
+                );
+            },
+            _ => {},
+        }
+        return false;
+    }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return true;
+        return request_quit(app, snapshot);
+    }
+    if app.away_overlay.is_some() {
+        if let Some(command) = crate::away::prepare_command(app, key, snapshot) {
+            send_away(app, command, runtime, actions);
+        }
+        return false;
     }
     if app.issue_delete_overlay.is_some() {
         if let Some(issue_key) = prepare_issue_delete(app, key) {
@@ -313,8 +345,13 @@ fn handle_key(
         return handle_inbox_command_key(app, key, snapshot, runtime, actions);
     }
 
+    if key.code == KeyCode::F(2) {
+        crate::away::open(app, snapshot);
+        return false;
+    }
+
     if app.route == Route::Inbox {
-        return handle_list_key(app, key, snapshot);
+        return handle_list_key(app, key, snapshot) && request_quit(app, snapshot);
     }
     if handle_issue_delete_shortcut(app, key, snapshot) {
         return false;
@@ -403,6 +440,37 @@ fn handle_list_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot
     false
 }
 
+fn request_quit(app: &mut AppState, snapshot: &RuntimeSnapshot) -> bool {
+    if crate::away::needs_quit_warning(snapshot) || app.away_pending.is_some() {
+        app.away_quit = true;
+        app.away_quit_visible = false;
+        false
+    } else {
+        true
+    }
+}
+
+fn send_away(
+    app: &mut AppState,
+    command: agent_launcher_core::RuntimeCommand,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) {
+    if app.away_pending.is_some() {
+        return;
+    }
+    app.next_request_id = app.next_request_id.wrapping_add(1);
+    let request_id = app.next_request_id;
+    app.away_pending = Some(request_id);
+    app.status_message = Some("applying mode request...".into());
+    let runtime = runtime.clone();
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let result = runtime.send(command).await;
+        let _ = actions.send(UiActionResult::Away { request_id, result });
+    });
+}
+
 fn handle_debug_key(app: &mut AppState, key: KeyEvent) -> bool {
     if app.debug_overlay {
         let step = match key.code {
@@ -434,10 +502,11 @@ fn handle_debug_key(app: &mut AppState, key: KeyEvent) -> bool {
         app.debug_page_size = 0;
         return true;
     }
-    if app.route == Route::Inbox
-        && key.code == KeyCode::Char('g')
+    if key.code == KeyCode::Char('g')
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && app.dispatch_overlay.is_none()
+        && app.input_overlay.is_none()
+        && app.delete_overlay.is_none()
     {
         app.sort_overlay = false;
         app.command_overlay = !app.command_overlay;
@@ -455,6 +524,7 @@ fn handle_inbox_command_key(
 ) -> bool {
     match key.code {
         KeyCode::Char('?') => return false,
+        KeyCode::Char('m') | KeyCode::F(2) => crate::away::open(app, snapshot),
         KeyCode::Char('d') => {
             app.command_overlay = false;
             dispatch_selected(app, snapshot, runtime, actions);
@@ -482,7 +552,7 @@ fn handle_inbox_command_key(
             app.scroll = 0;
             app.status_message = Some("search cleared".to_owned());
         },
-        KeyCode::Char('q') => return true,
+        KeyCode::Char('q') => return request_quit(app, snapshot),
         KeyCode::Esc => app.command_overlay = false,
         _ => {
             app.command_overlay = false;
@@ -683,6 +753,19 @@ fn ensure_prompt_preview(app: &mut AppState, runtime: &RuntimeHandle, actions: &
 }
 
 fn handle_paste(app: &mut AppState, text: &str) -> bool {
+    if app.away_quit {
+        return false;
+    }
+    if let Some(overlay) = app.away_overlay.as_mut() {
+        if app.away_pending.is_none()
+            && text.trim().bytes().all(|c| c.is_ascii_digit())
+            && text.trim().len() <= 3
+        {
+            overlay.limit = text.trim().into();
+            return true;
+        }
+        return false;
+    }
     if let Some(editor) = app
         .dispatch_overlay
         .as_mut()
@@ -1722,6 +1805,16 @@ fn spawn_runtime_action(
 
 fn apply_ui_action_result(app: &mut AppState, result: UiActionResult) {
     match result {
+        UiActionResult::Away { request_id, result } => {
+            if app.away_pending == Some(request_id) {
+                app.away_pending = None;
+                set_result(
+                    app,
+                    result,
+                    "mode request applied; keep this TUI open for worker finalization",
+                );
+            }
+        },
         UiActionResult::Security { request_id, result } => {
             if app.security_launch_pending != Some(request_id) {
                 return;
@@ -1925,6 +2018,56 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
+
+    #[test]
+    fn away_pending_results_paste_and_search_are_isolated() {
+        let snapshot = RuntimeSnapshot::default();
+        let mut app = AppState::default();
+        handle_list_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert_eq!(app.search_query, "m");
+        crate::away::open(&mut app, &snapshot);
+        assert!(handle_paste(&mut app, "64"));
+        assert_eq!(app.away_overlay.as_ref().unwrap().limit, "64");
+        app.away_pending = Some(2);
+        assert!(!handle_paste(&mut app, "1"));
+        apply_ui_action_result(&mut app, UiActionResult::Away {
+            request_id: 1,
+            result: Ok(()),
+        });
+        assert_eq!(app.away_pending, Some(2));
+        assert!(!request_quit(&mut app, &snapshot));
+        assert!(app.away_quit);
+        assert!(!app.away_quit_visible);
+        apply_ui_action_result(&mut app, UiActionResult::Away {
+            request_id: 2,
+            result: Ok(()),
+        });
+        assert!(app.away_pending.is_none());
+        assert_eq!(app.search_query, "m");
+    }
+
+    #[test]
+    fn commands_available_in_detail_but_not_input_modal() {
+        let mut app = AppState {
+            route: Route::Detail,
+            ..Default::default()
+        };
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(handle_debug_key(&mut app, key));
+        assert!(app.command_overlay);
+        app.command_overlay = false;
+        app.input_overlay = Some(InputOverlay {
+            run_id: "run".into(),
+            prompt: "Input".into(),
+            text: String::new(),
+        });
+        assert!(!handle_debug_key(&mut app, key));
+        assert!(!app.command_overlay);
+    }
 
     #[test]
     fn terminal_title_commands_save_set_and_restore_only_the_local_title() {

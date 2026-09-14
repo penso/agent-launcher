@@ -18,6 +18,9 @@ use crate::{
     sanitize_branch, sanitize_workspace_name,
 };
 
+#[path = "away.rs"]
+mod away;
+
 const MINIMUM_HERDR_VERSION: &str = "0.8.2";
 const AGENT_START_ATTEMPTS: usize = 20;
 const AGENT_START_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -55,7 +58,10 @@ impl HerdrBackend {
 
     async fn record(&self, run_id: &str) -> Result<RunRecord> {
         let record = self.registry.get(run_id).await?;
-        if !matches!(record.session, BackendSession::Herdr { .. }) {
+        if !matches!(
+            record.session,
+            BackendSession::Herdr { .. } | BackendSession::HerdrAway { .. }
+        ) {
             return Err(Error::RunNotFound(run_id.to_string()));
         }
         Ok(record)
@@ -326,14 +332,17 @@ impl Backend for HerdrBackend {
             Capability::Stop,
             Capability::Open,
             Capability::DeleteWorktree,
+            Capability::Away,
         ])
     }
 
     async fn owns_run(&self, run_id: &str) -> bool {
-        self.registry
-            .get(run_id)
-            .await
-            .is_ok_and(|record| matches!(record.session, BackendSession::Herdr { .. }))
+        self.registry.get(run_id).await.is_ok_and(|record| {
+            matches!(
+                record.session,
+                BackendSession::Herdr { .. } | BackendSession::HerdrAway { .. }
+            )
+        })
     }
 
     async fn confidential_runs(&self) -> Vec<RunSummary> {
@@ -541,8 +550,23 @@ impl Backend for HerdrBackend {
         })
     }
 
+    async fn dispatch_away(
+        &self,
+        request: DispatchRequest,
+        run_id: &str,
+    ) -> Result<DispatchResult> {
+        self.away_dispatch(request, run_id).await
+    }
+
+    async fn refresh_away(&self, run_id: &str) -> Result<StatusResult> {
+        self.away_refresh(run_id).await
+    }
+
     async fn refresh(&self, run_id: &str) -> Result<StatusResult> {
         let record = self.record(run_id).await?;
+        if matches!(record.session, BackendSession::HerdrAway { .. }) {
+            return self.away_refresh(run_id).await;
+        }
         let private = record.summary.confidential;
         crate::private::redact_errors(private, async {
             let BackendSession::Herdr { agent_name, .. } = &record.session else {
@@ -599,6 +623,12 @@ impl Backend for HerdrBackend {
             return Err(Error::InvalidRequest("input cannot be empty".into()));
         }
         let record = self.record(run_id).await?;
+        if matches!(record.session, BackendSession::HerdrAway { .. }) {
+            return Err(Error::UnsupportedCapability {
+                backend: self.kind(),
+                capability: Capability::SendInput,
+            });
+        }
         crate::private::redact_errors(record.summary.confidential, async {
             let BackendSession::Herdr { agent_name, .. } = record.session else {
                 unreachable!()
@@ -619,6 +649,9 @@ impl Backend for HerdrBackend {
 
     async fn stop(&self, run_id: &str) -> Result<()> {
         let record = self.record(run_id).await?;
+        if matches!(record.session, BackendSession::HerdrAway { .. }) {
+            return self.away_stop(run_id).await;
+        }
         crate::private::redact_errors(record.summary.confidential, async {
             if record.summary.state == RunState::Cancelled {
                 return Ok(());
@@ -669,6 +702,19 @@ impl Backend for HerdrBackend {
 
     async fn open(&self, run_id: &str) -> Result<OpenResult> {
         let record = self.record(run_id).await?;
+        if let BackendSession::HerdrAway { workspace_id, .. } = &record.session {
+            let workspace = workspace_id.as_ref().ok_or_else(|| {
+                Error::Disconnected("Away workspace creation is unconfirmed".into())
+            })?;
+            self.command(vec!["workspace".into(), "focus".into(), workspace.into()])
+                .await?;
+            let mut uri = Url::parse("herdr://workspace/").unwrap();
+            uri.path_segments_mut().unwrap().push(workspace);
+            return Ok(OpenResult {
+                uri,
+                launched: true,
+            });
+        }
         crate::private::redact_errors(record.summary.confidential, async {
             let BackendSession::Herdr { agent_name, .. } = record.session else {
                 unreachable!()
@@ -696,8 +742,28 @@ impl Backend for HerdrBackend {
         _expected: Option<&WorktreeInspection>,
     ) -> Result<()> {
         let record = self.record(run_id).await?;
-        let BackendSession::Herdr { workspace_id, .. } = record.session else {
-            unreachable!()
+        let workspace_id = match record.session {
+            BackendSession::Herdr { workspace_id, .. } => workspace_id,
+            BackendSession::HerdrAway {
+                workspace_id,
+                pane_id,
+                ..
+            } => {
+                let status = self.away_refresh(run_id).await?;
+                if !away::terminal(status.run.state) {
+                    return Err(Error::Disconnected(
+                        "Cannot delete Away worktree before confirmed process exit".into(),
+                    ));
+                }
+                let workspace = workspace_id.ok_or_else(|| {
+                    Error::Disconnected("Away workspace creation is unconfirmed".into())
+                })?;
+                let pane = pane_id
+                    .ok_or_else(|| Error::Disconnected("Away root pane is unconfirmed".into()))?;
+                self.away_verify_idle_workspace(&workspace, &pane).await?;
+                workspace
+            },
+            _ => unreachable!(),
         };
         self.registry.begin_deletion(run_id, force, None).await?;
         if record.summary.confidential {

@@ -1,3 +1,26 @@
+# Away Execution
+
+Away workers invoke `opencode run --format json --agent build`, regardless of
+OpenCode's `default_agent`. User/project configuration can still restrict or
+disable `build`; selecting it does not bypass permissions or enable auto-approval.
+Publishing and additional-agent prohibitions are prompt instructions, not an OS sandbox.
+
+`Error::AwayNotStarted(String)` identifies validation/preflight/persistence failures
+before a worker could be submitted. Once registered, preparation failures return a
+failed `DispatchResult` retaining known workspace metadata. The unshipped
+`HerdrAway` registry format requires `submitted: bool`: false during preparation,
+true durably before attempting `pane run`. True means possible submission, not an
+acknowledgement. Ambiguous submissions are never retried or inferred to have exited.
+Restart refresh can fail false-stage preparations; the caller must separately
+enforce cross-process ownership and avoid racing another dispatch instance.
+
+Historical attempt completion is not proof that the retained workspace is idle.
+Deletion independently lists its current panes and requires verified foreground
+shell-idle process information for every pane, including the original root pane.
+Active/resumed or unconfirmed panes block deletion without rewriting attempt history.
+Herdr does not offer an atomic occupancy-check-and-delete operation; these are
+current process snapshots, not protection against concurrent external pane changes.
+
 # Private Advisory Dispatch
 
 The runner exports:

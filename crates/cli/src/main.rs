@@ -121,6 +121,7 @@ async fn run(
     // This UUID leaf belongs to this app; shared data/config ancestors retain their modes.
     let data_dir =
         SessionRegistry::prepare_app_data_dir(&repository_data_dir(&repository.git_dir)?)?;
+    let ownership = agent_launcher_runtime::RuntimeOwnership::acquire(&data_dir)?;
     let diagnostics = agent_launcher_runtime::Diagnostics::new(data_dir.join("diagnostics.log"));
     diagnostics.record("startup", None, None, "started");
     let result = async {
@@ -216,6 +217,13 @@ async fn run(
                 continue;
             }
         }
+        if let Some(mut away) = store.load_away().await?
+            && let Some(entry) = away.entries.iter_mut().find(|entry| entry.run_id.as_deref() == Some(&deletion.run_id))
+        {
+            entry.state = agent_launcher_core::AwayEntryState::Skipped;
+            entry.error = Some("Worktree removed; attempt retained in history.".into());
+            store.save_away(&away).await?;
+        }
         if let Err(error) = store.delete_run(&deletion.run_id).await
             && !matches!(error, StoreError::RunNotFound(_))
         {
@@ -224,7 +232,7 @@ async fn run(
         registry.finalize_deletion(&deletion.run_id).await?;
     }
     import_public_runs(&store, &registry).await?;
-    let runtime = RuntimeService::start(repository, sources, store, runner, config);
+    let runtime = RuntimeService::start_owned(repository, sources, store, runner, config, ownership);
     diagnostics.record("startup", None, None, "succeeded");
     let tui_result = agent_launcher_tui::run(runtime.clone(), layout).await;
     let shutdown_result = runtime.shutdown().await;

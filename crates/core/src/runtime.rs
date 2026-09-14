@@ -32,6 +32,8 @@ pub enum ModelSelection {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RuntimeSnapshot {
     #[serde(default)]
+    pub away: crate::AwayState,
+    #[serde(default)]
     pub herdr_activity: crate::HerdrActivitySnapshot,
     #[serde(default)]
     pub initialized: bool,
@@ -120,6 +122,20 @@ pub struct BackendStatus {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
+    StartAway {
+        max_agents: usize,
+        profile: Option<String>,
+        ranking: crate::AwayRanking,
+    },
+    PauseAway,
+    ResumeAway,
+    SetManual,
+    SetAwayConcurrency {
+        max_agents: usize,
+    },
+    ReprioritizeAway {
+        ranking: crate::AwayRanking,
+    },
     DispatchSecurity {
         issue: IssueKey,
         options: DispatchOptions,

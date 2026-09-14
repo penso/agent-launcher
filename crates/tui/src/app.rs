@@ -180,6 +180,10 @@ pub(crate) enum DispatchStage {
 
 #[derive(Default)]
 pub(crate) struct AppState {
+    pub away_overlay: Option<crate::away::AwayOverlay>,
+    pub away_pending: Option<u64>,
+    pub away_quit: bool,
+    pub away_quit_visible: bool,
     pub layout: crate::LayoutMode,
     pub mouse: crate::mouse::MouseGeometry,
     pub route: Route,

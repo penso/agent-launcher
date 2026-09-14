@@ -52,6 +52,13 @@ pub(crate) enum BackendSession {
         pane_id: String,
         agent_name: String,
     },
+    HerdrAway {
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+        directory: PathBuf,
+        // Write-ahead submission intent, not acknowledgement. Unshipped format.
+        submitted: bool,
+    },
     Conductor {
         workspace_id: String,
         session_id: String,
@@ -108,6 +115,14 @@ pub struct SessionRegistry {
 }
 
 impl SessionRegistry {
+    pub(crate) fn away_root(&self) -> Result<PathBuf> {
+        Ok(self
+            .path
+            .parent()
+            .ok_or_else(|| Error::InvalidRequest("registry path has no parent".into()))?
+            .join("away"))
+    }
+
     /// Secure only an application-owned data leaf, never shared ancestors.
     /// Callers must supply their derived app-data path, not a user-selected directory.
     pub fn prepare_app_data_dir(path: &std::path::Path) -> Result<PathBuf> {

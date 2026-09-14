@@ -47,36 +47,116 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
             || app.dispatch_overlay.is_some()
             || app.command_overlay
             || app.debug_overlay
-            || app.sort_overlay,
+            || app.sort_overlay
+            || app.away_overlay.is_some()
+            || app.away_quit,
         ..Default::default()
     };
     app.visible_rows = 0;
     let content = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let overlay_area = content;
     match app.route {
         Route::Inbox => draw_inbox(frame, content, snapshot, app),
         Route::Detail => draw_detail(frame, content, snapshot, app),
     }
     if app.debug_overlay {
-        draw_debug_overlay(frame, content, snapshot, app);
+        draw_debug_overlay(frame, overlay_area, snapshot, app);
     } else if app.dispatch_overlay.is_some() {
-        draw_dispatch_overlay(frame, content, snapshot, app);
-    } else if app.route == Route::Inbox {
-        if app.sort_overlay {
-            draw_sort_overlay(frame, content, app);
-        } else if app.command_overlay {
-            draw_command_overlay(frame, content, app);
-        }
+        draw_dispatch_overlay(frame, overlay_area, snapshot, app);
+    } else if app.sort_overlay {
+        draw_sort_overlay(frame, overlay_area, app);
+    } else if app.command_overlay {
+        draw_command_overlay(frame, overlay_area, app);
     }
     app.issue_delete_confirmation_visible = false;
-    if app.issue_delete_overlay.is_some() {
-        crate::detail::draw_issue_delete_overlay(frame, content, app);
+    if app.input_overlay.is_some() {
+        crate::detail::draw_input_overlay(frame, overlay_area, app);
     }
-    draw_footer(frame, area, snapshot, &app.host_metrics, app.tab);
+    if app.delete_overlay.is_some() {
+        crate::detail::draw_delete_overlay(frame, overlay_area, app);
+    }
+    if app.issue_delete_overlay.is_some() {
+        crate::detail::draw_issue_delete_overlay(frame, overlay_area, app);
+    }
+    if area.height > 0 {
+        let mut footer_area = area;
+        if app.mouse.mode.is_empty() {
+            let button_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            app.mouse.mode = draw_mode_button(frame, button_area, snapshot);
+            footer_area.width = app.mouse.mode.x.saturating_sub(area.x + 1);
+        }
+        draw_footer(frame, footer_area, snapshot, &app.host_metrics, app.tab);
+    }
+    app.away_quit_visible = false;
+    if app.away_overlay.is_some() || app.away_quit {
+        crate::away::draw(frame, overlay_area, snapshot, app);
+    }
     app.mouse.scroll = app.scroll;
 }
 
+fn draw_mode_button(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) -> Rect {
+    use agent_launcher_core::{AppMode, AwayPhase};
+
+    let away = &snapshot.away;
+    let active = away.mode == AppMode::Away;
+    let mode = if active {
+        "Away"
+    } else {
+        "Manual"
+    };
+    let count = format!(
+        "{}/{}",
+        away.occupied_slots(&snapshot.runs),
+        away.max_agents
+    );
+    let phase = match away.phase {
+        AwayPhase::Inactive => "Inactive",
+        AwayPhase::Refreshing => "Refreshing",
+        AwayPhase::Prioritizing => "Prioritizing",
+        AwayPhase::Running => "Running",
+        AwayPhase::Paused => "Paused",
+        AwayPhase::Draining => "Draining",
+        AwayPhase::QueueEmpty => "Queue empty",
+        AwayPhase::Attention => "Attention",
+    };
+    let mut labels = Vec::new();
+    if active || away.phase == AwayPhase::Draining {
+        labels.push(format!(" {mode} {count} {phase} F2 "));
+        if matches!(
+            away.phase,
+            AwayPhase::Paused | AwayPhase::Attention | AwayPhase::Draining
+        ) {
+            labels.push(format!(" {mode} {phase} F2 "));
+        }
+        labels.push(format!(" {mode} {count} F2 "));
+    }
+    labels.extend([format!(" {mode} F2 "), format!("{mode} F2"), "F2".into()]);
+    let Some(label) = labels
+        .into_iter()
+        .find(|label| label.len() <= usize::from(area.width))
+    else {
+        return Rect::default();
+    };
+    if area.height == 0 {
+        return Rect::default();
+    }
+    let button = Rect::new(
+        area.right() - label.len() as u16,
+        area.y,
+        label.len() as u16,
+        1,
+    );
+    let style = if active {
+        Style::new().fg(theme::bg()).bg(theme::primary()).bold()
+    } else {
+        Style::new().fg(theme::text()).bg(theme::element())
+    };
+    frame.render_widget(Paragraph::new(label).style(style), button);
+    button
+}
+
 fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &mut AppState) {
-    if area.width < 24 || area.height < 8 {
+    if area.width < 24 || area.height < 7 {
         draw_tiny_inbox(frame, area, snapshot, app);
         return;
     }
@@ -570,8 +650,28 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
             },
         ));
     }
+    // Keep complete tabs plus a compact mode label; otherwise use the footer.
+    let minimum = if snapshot.away.mode == agent_launcher_core::AppMode::Away {
+        format!(
+            " Away {}/{} F2 ",
+            snapshot.away.occupied_slots(&snapshot.runs),
+            snapshot.away.max_agents
+        )
+        .len()
+    } else {
+        " Manual F2 ".len()
+    };
+    let available = inner.right().saturating_sub(x + 1);
+    if usize::from(available) >= minimum {
+        app.mouse.mode = draw_mode_button(frame, Rect::new(x + 1, inner.y, available, 1), snapshot);
+    }
+    let tabs_right = if app.mouse.mode.is_empty() {
+        inner.right()
+    } else {
+        app.mouse.mode.x - 1
+    };
     tabs.push(Span::styled(
-        if inner.width >= 62 {
+        if inner.width >= 62 && usize::from(tabs_right.saturating_sub(x)) >= metadata.len() + 2 {
             format!("  {metadata}")
         } else {
             String::new()
@@ -580,7 +680,7 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
     ));
     frame.render_widget(
         Paragraph::new(Line::from(tabs)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
+        Rect::new(inner.x, inner.y, tabs_right.saturating_sub(inner.x), 1),
     );
 
     let roomy = inner.height >= 10;
@@ -1435,7 +1535,7 @@ fn shortcut_line(width: u16) -> Line<'static> {
 
 fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let width = area.width.saturating_sub(2).min(64);
-    let height = area.height.saturating_sub(2).min(24);
+    let height = area.height.saturating_sub(2).min(26);
     if width == 0 || height == 0 {
         return;
     }
@@ -1449,7 +1549,7 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if width < 48 || height < 12 {
         frame.render_widget(
             Paragraph::new(
-                "g debug\nd dispatch/review\nr refresh\ns sort\nc clear search\nq quit\nEsc cancel",
+                "m mode (F2)\ng debug\nd dispatch/review\nr refresh\ns sort\nc clear search\nq quit\nEsc cancel",
             )
             .style(Style::new().bg(theme::element()).fg(theme::primary())),
             popup,
@@ -1474,7 +1574,6 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             "Press a command key · Esc cancels",
             Style::new().fg(theme::muted()),
         ),
-        Line::raw(""),
         command_help_line(
             "d",
             if app.tab == InboxTab::Security {
@@ -1486,12 +1585,12 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             },
         ),
         command_help_line("r", "refresh issue sources"),
+        command_help_line("m / F2", "Manual / Away mode and ranked queue"),
         command_help_line("s", "choose issue sorting"),
         command_help_line("g", "debug runtime status"),
         command_help_line("c", "clear search"),
         command_help_line("q", "quit agent-launcher"),
         command_help_line("Tab / BackTab", "next / previous: Issues / PRs / Security"),
-        Line::raw(""),
         Line::styled("Inbox", Style::new().fg(theme::primary()).bold()),
         command_help_line("↑/↓ · PgUp/PgDn · Home/End", "navigate; wheel scrolls"),
         command_help_line("Enter / click row", "open issue or PR details"),
@@ -3301,6 +3400,199 @@ mod tests {
     }
 
     #[test]
+    fn mode_button_shares_tabs_or_footer_without_overlap_and_preserves_geometry() {
+        use agent_launcher_core::{AppMode, AwayPhase};
+
+        let mut snapshot = mouse_snapshot();
+        for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
+            for (width, height) in [(1, 1), (8, 3), (24, 7), (40, 24), (80, 24), (160, 60)] {
+                for route in [Route::Inbox, Route::Detail] {
+                    let mut app = AppState {
+                        layout,
+                        ..Default::default()
+                    };
+                    if route == Route::Detail {
+                        assert!(app.open_detail(&snapshot));
+                    }
+                    let mut geometry = None;
+                    for phase in [
+                        AwayPhase::Inactive,
+                        AwayPhase::Running,
+                        AwayPhase::Paused,
+                        AwayPhase::Attention,
+                    ] {
+                        snapshot.away.mode = if phase == AwayPhase::Inactive {
+                            AppMode::Manual
+                        } else {
+                            AppMode::Away
+                        };
+                        snapshot.away.phase = phase;
+                        app.host_metrics.record(20, 55);
+                        let buffer = render_buffer(width, height, &snapshot, &mut app);
+                        let current = (app.mouse.list, app.mouse.detail, app.visible_rows);
+                        if let Some(previous) = geometry {
+                            assert_eq!(current, previous);
+                        }
+                        geometry = Some(current);
+                        let button = app.mouse.mode;
+                        if width < 2 {
+                            assert!(button.is_empty());
+                            continue;
+                        }
+                        assert_eq!(button.height, 1);
+                        let label: String = (button.x..button.right())
+                            .map(|x| buffer[(x, button.y)].symbol())
+                            .collect();
+                        assert!(label.contains("F2"));
+                        assert!(!render(width, height, &snapshot, &mut app).contains("MODE:"));
+                        if route == Route::Inbox && width >= 80 {
+                            assert_eq!(button.y, app.mouse.tabs[0].0.y);
+                            assert_eq!(button.right(), app.mouse.list.right());
+                            assert!(label.contains(if phase == AwayPhase::Inactive {
+                                "Manual"
+                            } else {
+                                "Away"
+                            }));
+                            if phase != AwayPhase::Inactive {
+                                assert!(label.contains("0/5"));
+                            }
+                            if phase == AwayPhase::Paused {
+                                assert!(label.contains("Paused"));
+                            }
+                            if phase == AwayPhase::Attention {
+                                assert!(label.contains("Attention"));
+                            }
+                        } else {
+                            assert_eq!(button.y, height - 1);
+                            assert_eq!(button.right(), width);
+                        }
+                        for (tab, _) in &app.mouse.tabs {
+                            assert!(!button.intersects(*tab));
+                        }
+                        assert!(!button.intersects(app.mouse.detail));
+                        assert_eq!(
+                            buffer[(button.x, button.y)].bg,
+                            if phase == AwayPhase::Inactive {
+                                theme::element()
+                            } else {
+                                theme::primary()
+                            }
+                        );
+                        assert_eq!(
+                            buffer[(button.x, button.y)].fg,
+                            if phase == AwayPhase::Inactive {
+                                theme::text()
+                            } else {
+                                theme::bg()
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode_button_clicks_reject_stale_and_overlay_geometry() {
+        let snapshot = mouse_snapshot();
+        for (width, route) in [(80, Route::Inbox), (40, Route::Inbox), (80, Route::Detail)] {
+            let mut app = AppState::default();
+            if route == Route::Detail {
+                assert!(app.open_detail(&snapshot));
+            }
+            render_buffer(width, 24, &snapshot, &mut app);
+            let button = app.mouse.mode;
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width + 1, 24)
+            ));
+            app.command_overlay = true;
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width, 24)
+            ));
+            render_buffer(width, 24, &snapshot, &mut app);
+            app.command_overlay = false;
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width, 24)
+            ));
+            render_buffer(width, 24, &snapshot, &mut app);
+            app.route = if route == Route::Inbox {
+                Route::Detail
+            } else {
+                Route::Inbox
+            };
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width, 24)
+            ));
+            app.route = route;
+            assert!(crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width, 24)
+            ));
+            assert!(app.away_overlay.is_some());
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width, 24)
+            ));
+            app.away_overlay = None;
+            render_buffer(1, 1, &snapshot, &mut app);
+            assert!(app.mouse.mode.is_empty());
+            assert!(!crate::mouse::handle_mouse(
+                &mut app,
+                click,
+                &snapshot,
+                (width, 24)
+            ));
+        }
+    }
+
+    #[test]
+    fn mode_button_uses_snapshot_slots_and_prioritizes_urgent_phases() {
+        use agent_launcher_core::{AppMode, AwayPhase};
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.away.mode = AppMode::Away;
+        snapshot.away.prioritizing = true;
+        for (phase, width, expected) in [
+            (AwayPhase::Running, 13, " Away 1/5 F2 "),
+            (AwayPhase::Paused, 17, " Away Paused F2 "),
+            (AwayPhase::Attention, 20, " Away Attention F2 "),
+            (AwayPhase::Attention, 30, " Away 1/5 Attention F2 "),
+        ] {
+            snapshot.away.phase = phase;
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            let mut button = Rect::default();
+            terminal
+                .draw(|frame| button = draw_mode_button(frame, frame.area(), &snapshot))
+                .unwrap();
+            let label: String = (button.x..button.right())
+                .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                .collect();
+            assert_eq!(label, expected);
+        }
+    }
+
+    #[test]
     fn flexible_layout_gives_extra_width_to_titles_and_activity_not_metadata_or_logo() {
         let mut snapshot = pr_snapshot();
         for issue in &mut snapshot.issues {
@@ -3326,7 +3618,7 @@ mod tests {
                 };
                 assert_eq!(flexible.layout, crate::LayoutMode::Flexible);
                 let buffer = render_buffer(width, 60, &snapshot, &mut flexible);
-                // The fixed content is cell-for-cell identical, merely centered on a wider screen.
+                // All content, including the mode button, stays within the centered panel.
                 for y in 0..59 {
                     for x in 0..108 {
                         assert_eq!(baseline[(x, y)], fixed_buffer[(x + (width - 108) / 2, y)]);
@@ -6669,7 +6961,7 @@ mod tests {
                     } else {
                         1
                     },
-                    u16::from(height > 12),
+                    u16::from(height >= 14),
                 ));
                 let panel_width = layout.content_width(available.width);
                 let panel = Rect::new(
@@ -7055,6 +7347,40 @@ mod tests {
         assert!(compact.contains("Resize to review"));
         assert!(!compact.contains("Enter confirm"));
         assert!(!app.delete_confirmation_visible);
+    }
+
+    #[test]
+    fn completed_opencode_resume_is_not_a_herdr_agent_id() {
+        let mut snapshot = normal_snapshot();
+        snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: None,
+            id: "away-run".into(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: Some(WorkspaceRef {
+                backend: BackendKind::Herdr,
+                id: "workspace".into(),
+                host: None,
+                path: Some(PathBuf::from("/work/away tree")),
+                branch: "away/fix".into(),
+            }),
+            agent: "opencode".into(),
+            state: RunState::Completed,
+            message: Some("Implemented the fix.\nTests passed.".into()),
+            session_id: Some("ses_real123".into()),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let mut app = AppState::default();
+        assert!(app.open_detail(&snapshot));
+        let text = render(120, 60, &snapshot, &mut app);
+        assert!(text.contains(" Manual F2 "));
+        assert!(text.contains("Implemented the fix."));
+        assert!(text.contains("Tests passed."));
+        assert!(text.contains("cd -- '/work/away tree' && opencode -s ses_real123"));
+        snapshot.runs[0].session_id = Some("herdr-agent-123".into());
+        let text = render(120, 60, &snapshot, &mut app);
+        assert!(!text.contains("opencode -s"));
     }
 
     #[test]

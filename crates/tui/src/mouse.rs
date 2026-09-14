@@ -17,6 +17,7 @@ pub(crate) struct MouseGeometry {
     pub detail: Rect,
     pub debug: Rect,
     pub blocked: bool,
+    pub mode: Rect,
 }
 
 pub(crate) fn handle_mouse(
@@ -25,7 +26,7 @@ pub(crate) fn handle_mouse(
     snapshot: &RuntimeSnapshot,
     size: (u16, u16),
 ) -> bool {
-    if app.issue_delete_overlay.is_some() {
+    if app.issue_delete_overlay.is_some() || app.away_overlay.is_some() || app.away_quit {
         return false;
     }
     let hit = &app.mouse;
@@ -60,6 +61,10 @@ pub(crate) fn handle_mouse(
         return false;
     }
     let position = Position::new(event.column, event.row);
+    if event.kind == MouseEventKind::Down(MouseButton::Left) && hit.mode.contains(position) {
+        crate::away::open(app, snapshot);
+        return true;
+    }
     match event.kind {
         MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
             if app.route == Route::Inbox =>

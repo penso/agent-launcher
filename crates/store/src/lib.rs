@@ -3,7 +3,7 @@
 use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
 use agent_launcher_core::{
-    ActivitySample, EventEnvelope, Issue, IssueKey, IssueProvider, RunEvent, RunSummary,
+    ActivitySample, AwayState, EventEnvelope, Issue, IssueKey, IssueProvider, RunEvent, RunSummary,
     WorkspaceRef,
 };
 use chrono::{DateTime, Utc};
@@ -15,6 +15,11 @@ use sqlx::{
 use thiserror::Error;
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS away_state (
+    id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+    state_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS issues (
     canonical_key TEXT PRIMARY KEY NOT NULL,
     source TEXT NOT NULL,
@@ -579,6 +584,38 @@ impl Store {
         })
     }
 
+    /// Loads the durable Away intent and ledger, or `None` before the first save.
+    /// Invalid JSON and advisory entries are errors, not an absent state.
+    pub async fn load_away(&self) -> Result<Option<AwayState>> {
+        let json =
+            sqlx::query_scalar::<_, String>("SELECT state_json FROM away_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        json.map(|json| {
+            let state: AwayState = serde_json::from_str(&json)?;
+            validate_away(&state)?;
+            Ok(state)
+        })
+        .transpose()
+    }
+
+    /// Atomically replaces the durable Away intent and ledger.
+    /// Advisory entries are rejected before any write; success requires commit.
+    pub async fn save_away(&self, state: &AwayState) -> Result<()> {
+        validate_away(state)?;
+        let json = serde_json::to_string(state)?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO away_state (id, state_json) VALUES (1, ?) \
+             ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json",
+        )
+        .bind(json)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Atomically replaces the issues belonging to `source`.
     ///
     /// Existing issues from other sources are left untouched. Supplied issues
@@ -1008,6 +1045,18 @@ impl Store {
     }
 }
 
+fn validate_away(state: &AwayState) -> Result<()> {
+    // Away entries carry only IssueKey, not Issue's security metadata or source.
+    if state
+        .entries
+        .iter()
+        .any(|entry| entry.issue.native_id.starts_with("advisory/"))
+    {
+        return Err(StoreError::ConfidentialRecord);
+    }
+    Ok(())
+}
+
 async fn upsert_issue(
     transaction: &mut Transaction<'_, Sqlite>,
     source: &str,
@@ -1204,6 +1253,153 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn away_state() -> AwayState {
+        use agent_launcher_core::{AppMode, AwayEntry, AwayEntryState, AwayPhase, AwayRanking};
+        AwayState {
+            prioritizing: false,
+            mode: AppMode::Away,
+            phase: AwayPhase::Running,
+            max_agents: 3,
+            profile: Some("work".into()),
+            model: Some("model".into()),
+            effort: Some("high".into()),
+            ranking: AwayRanking::SourcePriority,
+            entries: vec![AwayEntry {
+                issue: IssueKey {
+                    provider: IssueProvider::Github,
+                    host: "github.com".into(),
+                    repository: "owner/repo".into(),
+                    native_id: "42".into(),
+                },
+                identifier: "#42".into(),
+                title: "Fix bug".into(),
+                reason: "High priority".into(),
+                state: AwayEntryState::Attention,
+                run_id: Some("run-42".into()),
+                error: Some("Needs review".into()),
+            }],
+            error: Some("Paused for review".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn away_migrates_and_round_trips_updates_across_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-away-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap(),
+        ));
+        let store = Store::open(&path).await.unwrap();
+        store
+            .set_source_checkpoint("github:example", &json!({"cursor": 42}))
+            .await
+            .unwrap();
+        // Simulate an existing database from before Away persistence.
+        sqlx::query("DROP TABLE away_state")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.pool.close().await;
+
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(store.load_away().await.unwrap(), None);
+        let state = away_state();
+        store.save_away(&state).await.unwrap();
+        store.pool.close().await;
+
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(store.load_away().await.unwrap(), Some(state));
+        let replacement = AwayState::default();
+        store.save_away(&replacement).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM away_state")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            sqlx::query("INSERT INTO away_state VALUES (2, '{}')")
+                .execute(&store.pool)
+                .await
+                .is_err()
+        );
+        store.pool.close().await;
+
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(store.load_away().await.unwrap(), Some(replacement));
+        assert_eq!(
+            store.source_checkpoint("github:example").await.unwrap(),
+            Some(json!({"cursor": 42}))
+        );
+        store.pool.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn away_rejects_confidential_entries_without_writing() {
+        let store = Store::in_memory().await.unwrap();
+        let mut invalid = away_state();
+        invalid.entries[0].issue.native_id = "advisory/GHSA-abcd-1234-5678".into();
+        assert!(matches!(
+            store.save_away(&invalid).await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        assert_eq!(store.load_away().await.unwrap(), None);
+        let original = away_state();
+        store.save_away(&original).await.unwrap();
+        assert!(matches!(
+            store.save_away(&invalid).await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        assert_eq!(store.load_away().await.unwrap(), Some(original));
+    }
+
+    #[tokio::test]
+    async fn away_rejects_invalid_and_confidential_stored_json() {
+        let store = Store::in_memory().await.unwrap();
+        sqlx::query("INSERT INTO away_state VALUES (1, 'not JSON')")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(store.load_away().await, Err(StoreError::Json(_))));
+        let mut invalid = away_state();
+        invalid.entries[0].issue.native_id = "advisory/GHSA-abcd-1234-5678".into();
+        sqlx::query("UPDATE away_state SET state_json = ?")
+            .bind(serde_json::to_string(&invalid).unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_away().await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+    }
+
+    #[tokio::test]
+    async fn away_commit_failure_preserves_previous_state() {
+        let store = Store::in_memory().await.unwrap();
+        let original = away_state();
+        store.save_away(&original).await.unwrap();
+        // The write succeeds, but a deferred constraint makes COMMIT fail.
+        sqlx::raw_sql(
+            "CREATE TABLE away_commit_failure (id INTEGER REFERENCES away_state(id) DEFERRABLE INITIALLY DEFERRED); \
+             CREATE TRIGGER fail_away_commit AFTER UPDATE ON away_state BEGIN \
+             INSERT INTO away_commit_failure VALUES (2); END;",
+        ).execute(&store.pool).await.unwrap();
+        assert!(matches!(
+            store.save_away(&AwayState::default()).await,
+            Err(StoreError::Database(_))
+        ));
+        assert_eq!(store.load_away().await.unwrap(), Some(original));
+        sqlx::query("DROP TRIGGER fail_away_commit")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.save_away(&AwayState::default()).await.unwrap();
+        assert_eq!(store.load_away().await.unwrap(), Some(AwayState::default()));
+    }
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).single().unwrap()

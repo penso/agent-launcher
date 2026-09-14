@@ -49,12 +49,6 @@ pub(crate) fn draw_detail(
     frame.render_widget(Block::new().style(Style::new().bg(theme::panel())), content);
     if content.height < 4 || content.width < 18 {
         draw_tiny_detail(frame, content, issue, app.latest_run(snapshot, issue));
-        if app.input_overlay.is_some() {
-            draw_input_overlay(frame, area, app);
-        }
-        if app.delete_overlay.is_some() {
-            draw_delete_overlay(frame, area, app);
-        }
         return;
     }
 
@@ -97,12 +91,6 @@ pub(crate) fn draw_detail(
         issue.pull_request.is_some(),
         issue.security_advisory.is_some(),
     );
-    if app.input_overlay.is_some() {
-        draw_input_overlay(frame, area, app);
-    }
-    if app.delete_overlay.is_some() {
-        draw_delete_overlay(frame, area, app);
-    }
 }
 
 fn draw_tiny_detail(
@@ -124,7 +112,7 @@ fn draw_tiny_detail(
             Style::new().fg(run_color(run.state)).bold(),
         ));
     }
-    let controls_height = area.height.min(2);
+    let controls_height = area.height.saturating_sub(1).min(2);
     let body = Rect::new(area.x, area.y, area.width, area.height - controls_height);
     frame.render_widget(Paragraph::new(lines), body);
     draw_controls(
@@ -369,17 +357,47 @@ fn detail_lines(
         lines.push(key_value("updated", &timestamp_label(run.updated_at)));
         if let Some(session_id) = run.session_id.as_deref() {
             lines.push(key_value("session", session_id));
+            // Normal Herdr sessions are agent IDs, not resumable OpenCode sessions.
+            if run.agent == "opencode"
+                && run.state == agent_launcher_core::RunState::Completed
+                && session_id.starts_with("ses_")
+                && session_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            {
+                let command = format!("opencode -s {session_id}");
+                if let Some(path) = run
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.path.as_ref())
+                {
+                    let quoted_path = path.to_string_lossy().replace('\'', "'\\''");
+                    lines.push(key_value(
+                        "resume",
+                        &format!("cd -- '{quoted_path}' && {command}"),
+                    ));
+                } else {
+                    lines.push(key_value("resume", &command));
+                }
+                lines.push(Line::raw("Resume in the run's worktree, on its host if remote; not the launcher repository."));
+            }
         }
         if let Some(message) = run.message.as_deref() {
-            lines.push(key_value_styled(
-                "message",
-                &one_line(message),
-                if run.state.needs_attention() {
-                    theme::error()
-                } else {
-                    theme::text()
-                },
-            ));
+            for (index, line) in message.lines().enumerate() {
+                lines.push(key_value_styled(
+                    if index == 0 {
+                        "message"
+                    } else {
+                        ""
+                    },
+                    line,
+                    if run.state.needs_attention() {
+                        theme::error()
+                    } else {
+                        theme::text()
+                    },
+                ));
+            }
         }
         if let Some(workspace) = &run.workspace {
             lines.push(key_value("workspace", &workspace.id));
@@ -582,17 +600,17 @@ fn draw_controls(
                 control_line(&[("i", " input  "), ("Esc", " back (private clone retained)")]),
             ]
         }
-    } else if area.height == 1 && area.width < 38 {
+    } else if area.height == 1 && area.width < 104 {
         vec![control_line(&[
-            ("Esc", " back"),
             (
-                " d",
+                "d",
                 if review {
-                    " review"
+                    " review PR"
                 } else {
                     " dispatch"
                 },
             ),
+            (" Esc", ""),
         ])]
     } else if area.width < 38 {
         vec![
@@ -680,7 +698,7 @@ fn control_line(controls: &[(&'static str, &'static str)]) -> Line<'static> {
     )
 }
 
-fn draw_input_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+pub(crate) fn draw_input_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let Some(overlay) = app.input_overlay.as_ref() else {
         return;
     };
@@ -827,7 +845,7 @@ pub(crate) fn draw_issue_delete_overlay(frame: &mut Frame<'_>, area: Rect, app: 
     }
 }
 
-fn draw_delete_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+pub(crate) fn draw_delete_overlay(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let width = area.width.saturating_sub(2).min(80);
     let height = area.height.saturating_sub(2).min(14);
     app.delete_confirmation_visible = width >= 28 && height >= 7;
