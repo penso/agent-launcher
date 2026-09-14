@@ -1632,7 +1632,10 @@ fn draw_dispatch_overlay(
         } else {
             86
         });
-    let wanted_height = if overlay.stage == DispatchStage::Prompt {
+    let wanted_height = if overlay.stage == DispatchStage::Prompt
+        || (matches!(overlay.stage, DispatchStage::Settings { .. })
+            && overlay.settings.instructions_editor.is_some())
+    {
         area.height.saturating_sub(2)
     } else {
         item_count.saturating_add(6) as u16
@@ -1735,8 +1738,13 @@ fn draw_dispatch_overlay(
             ));
         }
         let editing = settings.model_editor.is_some();
+        let instructions = settings.instructions_editor.is_some() && !editing;
         let footer = if editing {
             "Enter confirm field (does not launch)\nEsc cancel field / PgUp/PgDn scroll"
+        } else if instructions && settings.instructions_focused {
+            "Enter newline | Tab settings | Ctrl+S done | Esc settings"
+        } else if instructions {
+            "Enter launch | Tab instructions | Esc back | PgUp/PgDn summary"
         } else if settings.security {
             "Enter review privacy warning (does not launch) / Esc cancel / PgUp/PgDn scroll"
         } else {
@@ -1748,10 +1756,15 @@ fn draw_dispatch_overlay(
         let footer_height = footer
             .line_count(inner.width)
             .min(usize::from(inner.height)) as u16;
-        let body_height = inner
+        let available_height = inner
             .height
             .saturating_sub(footer_height + u16::from(editing));
         let body = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        let body_height = if instructions {
+            (body.line_count(inner.width).min(u16::MAX as usize) as u16).min(available_height / 2)
+        } else {
+            available_height
+        };
         settings.scroll_max = body
             .line_count(inner.width)
             .saturating_sub(usize::from(body_height))
@@ -1770,6 +1783,42 @@ fn draw_dispatch_overlay(
                 footer_height,
             ),
         );
+        if instructions && let Some(editor) = &settings.instructions_editor {
+            let field = Rect::new(
+                inner.x,
+                inner.y + body_height,
+                inner.width,
+                available_height.saturating_sub(body_height),
+            );
+            let block = Block::bordered()
+                .title("Additional instructions (this dispatch only)")
+                .title_bottom("Appended after prompt; profile unchanged")
+                .border_style(Style::new().fg(if settings.instructions_focused {
+                    theme::primary()
+                } else {
+                    theme::muted()
+                }));
+            let body = block.inner(field);
+            frame.render_widget(block, field);
+            let (row, _) = editor.position();
+            let top = row.saturating_sub(usize::from(body.height.saturating_sub(1)));
+            let before = &editor.text[..editor.cursor];
+            let column = Line::raw(before.rsplit('\n').next().unwrap_or("")).width();
+            let left = column.saturating_sub(usize::from(body.width.saturating_sub(1)));
+            frame.render_widget(
+                Paragraph::new(editor.text.as_str()).scroll((
+                    top.min(u16::MAX as usize) as u16,
+                    left.min(u16::MAX as usize) as u16,
+                )),
+                body,
+            );
+            if settings.instructions_focused && !body.is_empty() {
+                frame.set_cursor_position((
+                    body.x + (column - left) as u16,
+                    body.y + (row - top) as u16,
+                ));
+            }
+        }
         if let Some(editor) = &settings.model_editor
             && body_height + footer_height < inner.height
         {
@@ -5889,6 +5938,86 @@ mod tests {
                 assert!(text.contains('é'));
             }
         }
+    }
+
+    #[test]
+    fn issue_instructions_render_focus_footer_and_scroll_unicode_without_reformatting() {
+        let snapshot = normal_snapshot();
+        let draft = "界é\n```rust\n  keep_indent();\n```";
+        let mut app = AppState {
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                settings: crate::app::LaunchSettings {
+                    backend: Some(BackendKind::Herdr),
+                    default_harness: "claude".into(),
+                    instructions_editor: Some(crate::widgets::editor::Editor {
+                        text: draft.into(),
+                        cursor: draft.len(),
+                    }),
+                    instructions_focused: true,
+                    ..Default::default()
+                },
+                issue_key: snapshot.issues[0].key.clone(),
+                cursor: 0,
+                prompt: Default::default(),
+                stage: DispatchStage::Settings {
+                    profile: Some("reviewer".into()),
+                    target: None,
+                },
+            }),
+            ..Default::default()
+        };
+        let text = render(120, 40, &snapshot, &mut app);
+        for expected in [
+            "Profile: reviewer",
+            "Configured default (claude)",
+            "Additional instructions (this dispatch only)",
+            "profile unchanged",
+            "Enter newline",
+            "Tab settings",
+            "Ctrl+S done",
+            "界",
+            "é",
+            "  keep_indent();",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert!(!text.contains("Enter launch"));
+        for (width, height) in [(60, 24), (30, 12), (10, 6), (1, 1)] {
+            render(width, height, &snapshot, &mut app);
+        }
+        assert!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .instructions_focused
+        );
+        app.dispatch_overlay
+            .as_mut()
+            .unwrap()
+            .settings
+            .instructions_focused = false;
+        let text = render(120, 40, &snapshot, &mut app);
+        assert!(text.contains("Tab instructions"));
+        assert!(text.contains("Enter launch"));
+        assert!(
+            !app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .instructions_focused
+        );
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .instructions_editor
+                .as_ref()
+                .unwrap()
+                .text,
+            draft
+        );
     }
 
     #[test]

@@ -1052,6 +1052,11 @@ impl RuntimeService {
         acknowledge: oneshot::Sender<Result<()>>,
     ) {
         let validated = (|| {
+            if !options.additional_instructions.is_empty() {
+                return Err(Error::SecurityRejected(
+                    "additional instructions are not supported for security dispatch",
+                ));
+            }
             if !consent {
                 return Err(Error::SecurityRejected(
                     "confirmation must disclose private content to the selected model provider and full host access; isolation is not guaranteed",
@@ -1428,6 +1433,28 @@ impl RuntimeService {
         target: Option<&str>,
         options: &agent_launcher_core::DispatchOptions,
     ) -> Result<()> {
+        if matches!(action, DispatchAction::Review) && !options.additional_instructions.is_empty() {
+            return Err(RunnerError::InvalidRequest(
+                "additional instructions are not supported for pull request review".into(),
+            )
+            .into());
+        }
+        if options.additional_instructions.len() > 16 * 1024 {
+            return Err(RunnerError::InvalidRequest(
+                "additional instructions exceed the 16 KiB limit".into(),
+            )
+            .into());
+        }
+        if options
+            .additional_instructions
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t'))
+        {
+            return Err(RunnerError::InvalidRequest(
+                "additional instructions contain forbidden control characters".into(),
+            )
+            .into());
+        }
         if key.native_id.starts_with("advisory/")
             || self
                 .snapshot
@@ -1485,7 +1512,7 @@ impl RuntimeService {
         let backend = self.snapshot.selected_backend.ok_or_else(|| {
             Error::BackendUnavailable(backend_config_name(&self.config.backend).to_owned())
         })?;
-        let prompt = match action {
+        let mut prompt = match action {
             DispatchAction::Review => review_prompt(
                 &self.repository,
                 &issue,
@@ -1504,6 +1531,10 @@ impl RuntimeService {
             },
             DispatchAction::Implement { profile: None } => issue_prompt(&issue),
         };
+        if !options.additional_instructions.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&options.additional_instructions);
+        }
         let (agent, model, effort) =
             resolve_dispatch_options(&self.config.agent, backend, options)?;
         let request = DispatchRequest {
@@ -4740,6 +4771,29 @@ mod tests {
             ));
         }
         service.snapshot.selected_backend = Some(BackendKind::Native);
+        for text in ["private extra instructions", " \r\n\t"] {
+            let (ack, response) = oneshot::channel();
+            service.launch_security(
+                issue.key.clone(),
+                DispatchOptions {
+                    expected_backend: Some(BackendKind::Native),
+                    additional_instructions: text.into(),
+                    ..Default::default()
+                },
+                true,
+                ack,
+            );
+            assert!(matches!(
+                response.await.unwrap(),
+                Err(Error::SecurityRejected(
+                    "additional instructions are not supported for security dispatch"
+                ))
+            ));
+            assert!(service.security_work.is_empty());
+            assert!(service.security_in_flight.is_empty());
+            assert_eq!(prepares.load(Ordering::SeqCst), 0);
+            assert_eq!(backend.dispatches.load(Ordering::SeqCst), 0);
+        }
         service.config.compute = Some(Default::default());
         let (ack, response) = oneshot::channel();
         service.launch_security(
@@ -6210,6 +6264,7 @@ mod tests {
                     expected_backend: None,
                     harness: harness.map(str::to_owned),
                     model: model.clone(),
+                    additional_instructions: String::new(),
                 };
                 let (agent, resolved, effort) =
                     resolve_dispatch_options(&configured, BackendKind::Herdr, &options).unwrap();
@@ -6266,6 +6321,157 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn additional_instructions_append_literally_without_mutating_sources() {
+        use agent_launcher_core::DispatchOptions;
+        assert!(
+            DispatchOptions::default()
+                .additional_instructions
+                .is_empty()
+        );
+        let path =
+            std::env::temp_dir().join(format!("additional-instructions-{}", uuid::Uuid::new_v4()));
+        let source = "Implement {{ issue_title }}:\n{{ issue_text }}";
+        tokio::fs::write(&path, source).await.unwrap();
+        let backend = MockBackend::new(BackendKind::Native, true);
+        let mut settings = config();
+        settings.prompt_profiles = vec![PromptProfile {
+            name: "saved".into(),
+            path: path.clone(),
+        }];
+        let (mut service, _) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![],
+            Store::in_memory().await.unwrap(),
+            runner(std::slice::from_ref(&backend)),
+            settings,
+            Arc::new(NoopNotifier),
+        );
+        service.snapshot.selected_backend = Some(BackendKind::Native);
+        for profile in [None, Some("saved")] {
+            for text in [
+                String::new(),
+                " \t\r\n".into(),
+                "  First line\r\n\t{{ issue_text }}\nLast line\r  ".into(),
+                "x".repeat(16 * 1024),
+                "\u{e9}".repeat(8 * 1024),
+            ] {
+                let mut selected = issue(&uuid::Uuid::new_v4().to_string(), "Title", "open");
+                selected.description = Some("Original {{ issue_title }}\nDescription".into());
+                let original = selected.clone();
+                let base = if profile.is_some() {
+                    render_prompt_source("saved", source, &selected).unwrap()
+                } else {
+                    issue_prompt(&selected)
+                };
+                service.snapshot.issues = vec![selected.clone()];
+                service
+                    .dispatch_issue_with_options(
+                        &selected.key,
+                        DispatchAction::Implement { profile },
+                        None,
+                        &DispatchOptions {
+                            additional_instructions: text.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let requests = backend.requests.lock().unwrap();
+                let request = requests.last().unwrap();
+                assert_eq!(
+                    request.prompt,
+                    if text.trim().is_empty() {
+                        base
+                    } else {
+                        format!("{base}\n\n{text}")
+                    }
+                );
+                assert_eq!(request.issue, original);
+                assert_eq!(service.snapshot.issues[0], original);
+            }
+        }
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), source);
+        assert_eq!(service.config.prompt_profiles[0].path, path);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_additional_instructions_and_review_reject_before_runner() {
+        use agent_launcher_core::DispatchOptions;
+        let backend = MockBackend::new(BackendKind::Native, true);
+        let store = Store::in_memory().await.unwrap();
+        let (mut service, _) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![],
+            store.clone(),
+            runner(std::slice::from_ref(&backend)),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let selected = issue("extra", "Title", "open");
+        service.snapshot.issues = vec![selected.clone()];
+        service.snapshot.selected_backend = Some(BackendKind::Native);
+        let invalid = (0..=0x9f)
+            .filter_map(char::from_u32)
+            .filter(|ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t'))
+            .map(|ch| format!("sensitive{ch}text"))
+            .chain([
+                "x".repeat(16 * 1024 + 1),
+                "\u{e9}".repeat(8 * 1024 + 1),
+                " ".repeat(16 * 1024 + 1),
+            ]);
+        for text in invalid {
+            let result = service
+                .dispatch_issue_with_options(
+                    &selected.key,
+                    DispatchAction::Implement {
+                        profile: Some("missing"),
+                    },
+                    None,
+                    &DispatchOptions {
+                        additional_instructions: text,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(Error::Runner(RunnerError::InvalidRequest(_)))
+            ));
+        }
+        service.snapshot.issues[0].pull_request = Some(PullRequestMetadata {
+            number: 92,
+            additions: None,
+            deletions: None,
+            base_ref: "main".into(),
+            head_ref: "feature".into(),
+            base_sha: "a".repeat(40),
+            head_sha: "b".repeat(40),
+            head_repository: None,
+        });
+        for text in ["review instructions", " \r\n\t"] {
+            let result = service
+                .dispatch_issue_with_options(
+                    &selected.key,
+                    DispatchAction::Review,
+                    None,
+                    &DispatchOptions {
+                        additional_instructions: text.into(),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(result, Err(Error::Runner(RunnerError::InvalidRequest(message)))
+                if message == "additional instructions are not supported for pull request review")
+            );
+        }
+        assert_eq!(backend.dispatches.load(Ordering::SeqCst), 0);
+        assert!(backend.requests.lock().unwrap().is_empty());
+        assert!(store.load_runs().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6431,7 +6637,8 @@ mod tests {
                     .dispatch_with_options(regular.key.clone(), None, None, DispatchOptions {
                         expected_backend: None,
                         harness: None,
-                        model: ModelSelection::Explicit(invalid.into())
+                        model: ModelSelection::Explicit(invalid.into()),
+                        additional_instructions: String::new(),
                     })
                     .await
                     .is_err()
@@ -6443,6 +6650,7 @@ mod tests {
                 expected_backend: None,
                 harness: Some("claude".into()),
                 model: ModelSelection::Explicit("sonnet".into()),
+                additional_instructions: String::new(),
             })
             .await
             .unwrap();
@@ -6451,6 +6659,7 @@ mod tests {
                 expected_backend: None,
                 harness: Some("pi".into()),
                 model: ModelSelection::Explicit("openai/gpt-5.4".into()),
+                additional_instructions: String::new(),
             })
             .await
             .unwrap();

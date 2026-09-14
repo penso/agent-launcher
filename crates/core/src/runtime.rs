@@ -13,6 +13,9 @@ pub struct DispatchOptions {
     pub expected_backend: Option<BackendKind>,
     pub harness: Option<String>,
     pub model: ModelSelection,
+    /// Per-issue literal text appended after rendering; not supported for review or security.
+    /// At most 16 KiB; controls other than CR, LF, and tab are forbidden.
+    pub additional_instructions: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

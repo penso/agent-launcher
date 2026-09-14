@@ -293,6 +293,15 @@ model before an explicit Enter launches. Esc goes back without losing per-dispat
 (or closes the first stage); PgUp/PgDn scroll the settings summary on smaller terminals.
 Selecting a target never launches immediately.
 
+For ordinary issues, **Additional instructions (this dispatch only)** is automatically focused
+on first entering settings. Type or paste multiline text (including Unicode and code blocks);
+it is appended after the rendered agent prompt, without editing the shared profile. Enter
+inserts a newline; arrows, Home/End, Backspace and Delete edit the text. Tab, Esc, Ctrl+S or
+Ctrl+Enter leave the field without launching and preserve its draft. From settings controls,
+Tab returns to instructions and an explicit Enter launches. Harness/model shortcuts only
+apply outside the field. Back navigation and refresh retain the draft; a new dispatch starts
+empty. PR reviews and private security dispatches do not offer this field.
+
 Press `h` to cycle the configured default and supported harness kinds: Herdr offers
 `opencode`, `claude`, and `pi`; Native offers only `opencode`; Conductor offers `claude`,
 `codex`, `cursor`, and `acp`; Superset keeps its configured preset only. The configured

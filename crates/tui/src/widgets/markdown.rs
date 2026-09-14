@@ -63,7 +63,9 @@ impl MarkdownCache {
 }
 
 fn safe(text: &str) -> String {
-    text.chars()
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect::<String>()
         .replace('\t', "    ")
@@ -280,6 +282,15 @@ struct Renderer {
 }
 
 impl Renderer {
+    fn block_gap(&mut self) {
+        self.flush();
+        if self.lines.len() < self.limit
+            && self.lines.last().is_some_and(|line| !line.spans.is_empty())
+        {
+            self.lines.push(Line::default());
+        }
+    }
+
     fn append(&mut self, text: &str, style: Style) {
         let end = text.floor_char_boundary(text.len().min(self.remaining));
         push(&mut self.line, &text[..end], style);
@@ -354,14 +365,14 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                 styles.push(style);
                 match tag {
                     Tag::Heading { .. } => {
-                        r.flush();
+                        r.block_gap();
                         style = style.patch(theme.heading);
                     },
                     Tag::Strong => style = style.bold(),
                     Tag::Emphasis => style = style.italic(),
                     Tag::Strikethrough => style = style.crossed_out(),
                     Tag::CodeBlock(kind) => {
-                        r.flush();
+                        r.block_gap();
                         r.code = true;
                         style = style.patch(theme.code);
                         if let CodeBlockKind::Fenced(language) = kind
@@ -372,7 +383,7 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                         }
                     },
                     Tag::BlockQuote(kind) => {
-                        r.flush();
+                        r.block_gap();
                         r.quote += 1;
                         if let Some(kind) = kind {
                             push(&mut r.line, &format!("{kind:?}"), theme.heading);
@@ -380,7 +391,11 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                         }
                     },
                     Tag::List(start) => {
-                        r.flush();
+                        if r.lists.is_empty() {
+                            r.block_gap();
+                        } else {
+                            r.flush();
+                        }
                         r.lists.push(start);
                     },
                     Tag::Item => {
@@ -401,7 +416,7 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                     },
                     Tag::Image { .. } => push(&mut r.line, "[image: ", theme.muted),
                     Tag::Table(align) => {
-                        r.flush();
+                        r.block_gap();
                         table = Some(Table {
                             align,
                             rows: Vec::new(),
@@ -420,18 +435,26 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
             },
             Event::End(tag) => {
                 match tag {
+                    TagEnd::Paragraph | TagEnd::Heading(_) if r.lists.is_empty() => r.block_gap(),
                     TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => r.flush(),
                     TagEnd::CodeBlock => {
                         r.flush();
                         r.code = false;
+                        r.block_gap();
                     },
                     TagEnd::BlockQuote(_) => {
                         r.flush();
                         r.quote = r.quote.saturating_sub(1);
+                        if r.quote == 0 && r.lists.is_empty() {
+                            r.block_gap();
+                        }
                     },
                     TagEnd::List(_) => {
                         r.flush();
                         r.lists.pop();
+                        if r.lists.is_empty() {
+                            r.block_gap();
+                        }
                     },
                     TagEnd::Link => {
                         if let Some(url) = links.pop() {
@@ -451,6 +474,7 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                                 theme,
                                 r.limit.saturating_sub(r.lines.len()),
                             ));
+                            r.block_gap();
                         }
                     },
                     _ => {},
@@ -461,8 +485,7 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                 r.append(&safe(&text), style)
             },
             Event::Code(text) => r.append(&safe(&text), style.patch(theme.code)),
-            Event::SoftBreak => push(&mut r.line, " ", style),
-            Event::HardBreak => push(&mut r.line, "\n", style),
+            Event::SoftBreak | Event::HardBreak => push(&mut r.line, "\n", style),
             Event::TaskListMarker(checked) => push(
                 &mut r.line,
                 if checked {
@@ -473,13 +496,17 @@ pub fn render(source: &str, width: u16, theme: MarkdownTheme) -> Text<'static> {
                 style,
             ),
             Event::Rule => {
-                r.flush();
+                r.block_gap();
                 r.lines.push(Line::styled("-".repeat(r.width), theme.muted));
+                r.block_gap();
             },
             _ => {},
         }
     }
     r.flush();
+    while r.lines.last().is_some_and(|line| line.spans.is_empty()) {
+        r.lines.pop();
+    }
     if limited || r.lines.len() >= r.limit || r.remaining == 0 {
         r.lines.extend(wrap(
             Line::styled("[Description display limit reached]", theme.muted),
@@ -513,6 +540,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_source_breaks_and_paragraph_spacing() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let source = "## Summary\n\n**Product:** example\n**Version:** 1.0\n**Severity:** high\n\nFirst paragraph.\n\nSecond paragraph."
+                .replace('\n', newline);
+            assert_eq!(
+                plain(&markdown(&source, 80)),
+                "Summary\n\nProduct: example\nVersion: 1.0\nSeverity: high\n\nFirst paragraph.\n\nSecond paragraph."
+            );
+        }
+        assert_eq!(
+            plain(&markdown("first  \nsecond\nthird", 80)),
+            "first\nsecond\nthird"
+        );
+        assert_eq!(
+            plain(&markdown("Before\n\n- one\n- two\n\nAfter", 80)),
+            "Before\n\n- one\n- two\n\nAfter"
+        );
+    }
+
+    #[test]
     fn nested_styles_restore_and_literals_remain_literal() {
         let text = markdown(
             "### Heading\n\n**bold *both* bold** normal ~~gone~~\n\n`**literal**` \\*escaped\\* \"quoted\"",
@@ -520,9 +567,9 @@ mod tests {
         );
         assert_eq!(
             plain(&text),
-            "Heading\nbold both bold normal gone\n**literal** *escaped* \"quoted\""
+            "Heading\n\nbold both bold normal gone\n\n**literal** *escaped* \"quoted\""
         );
-        let spans = &text.lines[1].spans;
+        let spans = &text.lines[2].spans;
         assert!(spans.iter().any(|s| {
             s.content == "both"
                 && s.style
@@ -540,7 +587,7 @@ mod tests {
             )
         );
         assert_eq!(
-            text.lines[2].spans[0].style.bg,
+            text.lines[4].spans[0].style.bg,
             MarkdownTheme::default().code.bg
         );
     }

@@ -95,6 +95,8 @@ pub(crate) struct LaunchSettings {
     pub default_model: Option<String>,
     pub options: DispatchOptions,
     pub model_editor: Option<crate::widgets::editor::Editor>,
+    pub instructions_editor: Option<crate::widgets::editor::Editor>,
+    pub instructions_focused: bool,
     pub target_cursor: usize,
     // Map the previous cursor to a stable target ID when refreshes reorder hosts.
     pub target_choices: Vec<String>,

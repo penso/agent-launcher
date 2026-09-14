@@ -691,6 +691,14 @@ fn handle_paste(app: &mut AppState, text: &str) -> bool {
         editor.insert(&text.chars().filter(|c| !c.is_control()).collect::<String>());
         return true;
     }
+    if let Some(overlay) = app.dispatch_overlay.as_mut()
+        && matches!(overlay.stage, DispatchStage::Settings { .. })
+        && overlay.settings.instructions_focused
+        && let Some(editor) = &mut overlay.settings.instructions_editor
+    {
+        editor.insert(text);
+        return true;
+    }
     if let Some(editor) = app
         .dispatch_overlay
         .as_mut()
@@ -934,6 +942,8 @@ fn staged_dispatch_overlay(
             had_targets: has_target_stage(snapshot),
             review,
             security,
+            instructions_editor: (!review && !security).then(Default::default),
+            instructions_focused: !review && !security,
             ..Default::default()
         },
         prompt: crate::app::PromptView {
@@ -1154,6 +1164,22 @@ fn settings_key(app: &mut AppState, key: KeyEvent) -> DispatchEffect {
         }
         return DispatchEffect::None;
     }
+    if settings.instructions_focused
+        && let Some(editor) = &mut settings.instructions_editor
+    {
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => {
+                settings.instructions_focused = false;
+            },
+            KeyCode::Enter | KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                settings.instructions_focused = false;
+            },
+            _ => editor.key(key),
+        }
+        return DispatchEffect::None;
+    }
     match key.code {
         KeyCode::PageUp => settings.scroll = settings.scroll.saturating_sub(8),
         KeyCode::PageDown => {
@@ -1183,7 +1209,12 @@ fn settings_key(app: &mut AppState, key: KeyEvent) -> DispatchEffect {
             let cursor = text.len();
             settings.model_editor = Some(crate::widgets::editor::Editor { text, cursor });
         },
-        KeyCode::Enter if key.kind == KeyEventKind::Press => return DispatchEffect::Select(0),
+        KeyCode::Tab | KeyCode::BackTab if settings.instructions_editor.is_some() => {
+            settings.instructions_focused = true;
+        },
+        KeyCode::Enter if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            return DispatchEffect::Select(0);
+        },
         KeyCode::Esc => {
             if let DispatchStage::Settings { profile, .. } = &overlay.stage {
                 if settings.had_targets {
@@ -1250,7 +1281,7 @@ fn select_dispatch(
         },
         DispatchStage::Settings { profile, target } => {
             let overlay = app.dispatch_overlay.as_ref()?;
-            if overlay.settings.model_editor.is_some() {
+            if overlay.settings.model_editor.is_some() || overlay.settings.instructions_focused {
                 return None;
             }
             if snapshot.selected_backend != overlay.settings.backend
@@ -1290,6 +1321,9 @@ fn select_dispatch(
             }
             let mut overlay = app.dispatch_overlay.take()?;
             overlay.settings.options.expected_backend = overlay.settings.backend;
+            if let Some(editor) = &overlay.settings.instructions_editor {
+                overlay.settings.options.additional_instructions = editor.text.clone();
+            }
             Some(launch_action(
                 overlay.settings.review,
                 overlay.issue_key,
@@ -2372,6 +2406,9 @@ mod tests {
         assert!(prepare_dispatch(&mut app, &snapshot).is_none());
         let overlay = app.dispatch_overlay.as_ref().unwrap();
         assert!(overlay.settings.security);
+        assert!(overlay.settings.instructions_editor.is_none());
+        assert!(!overlay.settings.instructions_focused);
+        assert!(overlay.settings.options.additional_instructions.is_empty());
         assert!(matches!(overlay.stage, DispatchStage::Settings {
             profile: None,
             target: None
@@ -2757,6 +2794,7 @@ mod tests {
         assert_eq!(
             {
                 assert!(select_dispatch(&mut app, &snapshot, 1).is_none());
+                dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
                 select_dispatch(&mut app, &snapshot, 0)
             },
             Some(LaunchAction::Dispatch {
@@ -2827,6 +2865,7 @@ mod tests {
         assert_eq!(
             {
                 assert!(select_dispatch(&mut app, &snapshot, 1).is_none());
+                dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
                 select_dispatch(&mut app, &snapshot, 0)
             },
             Some(LaunchAction::Dispatch {
@@ -3202,6 +3241,7 @@ mod tests {
             assert_eq!(
                 {
                     assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+                    dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
                     select_dispatch(&mut app, &snapshot, 0)
                 },
                 Some(LaunchAction::Dispatch {
@@ -3727,6 +3767,7 @@ mod tests {
             if !review {
                 app.dispatch_overlay.as_mut().unwrap().prompt.preview = Some(Ok("source".into()));
                 assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+                dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
             }
             dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
             assert_eq!(
@@ -3778,6 +3819,7 @@ mod tests {
                 expected_backend: Some(BackendKind::Native),
                 harness: Some("opencode".into()),
                 model: ModelSelection::Inherit,
+                ..Default::default()
             };
             let expected = if review {
                 LaunchAction::Review {
@@ -3798,6 +3840,141 @@ mod tests {
     }
 
     #[test]
+    fn issue_instructions_focus_editing_guards_and_captured_launch_options() {
+        let snapshot = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::zero()), issue("2", Duration::zero())],
+            selected_backend: Some(BackendKind::Herdr),
+            selected_agent: "claude".into(),
+            selected_model: Some("sonnet".into()),
+            prompt_profiles: vec!["reviewer".into()],
+            ..Default::default()
+        };
+        let mut app = AppState {
+            dispatch_overlay: staged_dispatch_overlay(snapshot.issues[0].key.clone(), &snapshot),
+            ..Default::default()
+        };
+        app.dispatch_overlay.as_mut().unwrap().prompt.preview = Some(Ok("source".into()));
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::Select(0)
+        );
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .instructions_focused
+        );
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        for c in "hma123".chars() {
+            assert_eq!(
+                dispatch_key(&mut app, KeyCode::Char(c).into(), &snapshot),
+                DispatchEffect::None
+            );
+        }
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert!(handle_paste(&mut app, "é界\r\n```rust\ncode\n```\u{1b}"));
+        for key in [
+            KeyCode::Up,
+            KeyCode::Home,
+            KeyCode::Delete,
+            KeyCode::End,
+            KeyCode::Backspace,
+            KeyCode::Char('é'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Down,
+        ] {
+            dispatch_key(&mut app, key.into(), &snapshot);
+        }
+        let draft = "hma123\né界\n```rust\nodé\n```";
+        let settings = &app.dispatch_overlay.as_ref().unwrap().settings;
+        assert_eq!(settings.instructions_editor.as_ref().unwrap().text, draft);
+        assert_eq!(settings.options, DispatchOptions::default());
+        assert!(settings.model_editor.is_none());
+        for done in [
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyCode::Esc.into(),
+        ] {
+            assert_eq!(
+                dispatch_key(&mut app, done, &snapshot),
+                DispatchEffect::None
+            );
+            assert!(
+                !app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .instructions_focused
+            );
+            assert_eq!(
+                dispatch_key(&mut app, done, &snapshot),
+                DispatchEffect::None
+            );
+            // Esc from controls goes back, without discarding instructions.
+            if done.code == KeyCode::Esc {
+                assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+            }
+            dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
+        }
+        dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
+        dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+        dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+        assert!(handle_paste(&mut app, "openai/gpt-5.4\n"));
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        let mut changed = snapshot.clone();
+        changed.selected_model = None;
+        assert!(select_dispatch(&mut app, &changed, 0).is_none());
+        app.reconcile_dispatch(&snapshot);
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .instructions_editor
+                .as_ref()
+                .unwrap()
+                .text,
+            draft
+        );
+        assert!(!handle_paste(&mut app, "not focused"));
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::Select(0)
+        );
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 0),
+            Some(LaunchAction::Dispatch {
+                issue: snapshot.issues[0].key.clone(),
+                profile: Some("reviewer".into()),
+                target: None,
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Herdr),
+                    harness: Some("opencode".into()),
+                    model: ModelSelection::Explicit("openai/gpt-5.4".into()),
+                    additional_instructions: draft.into(),
+                },
+            })
+        );
+        let fresh = staged_dispatch_overlay(snapshot.issues[1].key.clone(), &snapshot).unwrap();
+        assert!(fresh.settings.instructions_editor.unwrap().text.is_empty());
+        assert_eq!(fresh.settings.options, DispatchOptions::default());
+    }
+
+    #[test]
     fn model_drafts_confirm_cancel_and_launch_independently_for_pr_reviews() {
         let snapshot = RuntimeSnapshot {
             issues: vec![pull_request("42")],
@@ -3812,6 +3989,14 @@ mod tests {
         };
         for harness in ["opencode", "claude", "pi"] {
             assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+            assert!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .instructions_editor
+                    .is_none()
+            );
             assert_eq!(
                 app.dispatch_overlay.as_ref().unwrap().settings.options,
                 DispatchOptions::default()
@@ -3928,6 +4113,11 @@ mod tests {
         assert!(!app.reconcile_dispatch(&snapshot));
         assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 2);
         assert!(select_dispatch(&mut app, &snapshot, 2).is_none());
+        assert!(handle_paste(
+            &mut app,
+            "Keep this draft\n```rust\n// unchanged\n```"
+        ));
+        dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
         dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
         handle_paste(&mut app, "openai/gpt-5.4");
         dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot);
@@ -3958,7 +4148,8 @@ mod tests {
                 options: DispatchOptions {
                     expected_backend: Some(BackendKind::Native),
                     harness: None,
-                    model: ModelSelection::Explicit("openai/gpt-5.4".into())
+                    model: ModelSelection::Explicit("openai/gpt-5.4".into()),
+                    additional_instructions: "Keep this draft\n```rust\n// unchanged\n```".into(),
                 },
             })
         );
