@@ -26,8 +26,8 @@ const MAX_PR_DETAILS_PER_SYNC: usize = 10;
 /// contain both open issues and open/draft PRs; deltas include closed transitions.
 pub struct GitHubSource {
     key: SourceKey,
-    client: Client,
-    endpoint: Url,
+    pub(super) client: Client,
+    pub(super) endpoint: Url,
     backoff: Mutex<Backoff>,
 }
 
@@ -100,6 +100,15 @@ impl GitHubSource {
     }
 
     pub fn new(host: String, repository: String, token: Option<&str>) -> Result<Self, Error> {
+        Self::new_with_redirect(host, repository, token, redirect_policy(token.is_some()))
+    }
+
+    pub(super) fn new_with_redirect(
+        host: String,
+        repository: String,
+        token: Option<&str>,
+        policy: redirect::Policy,
+    ) -> Result<Self, Error> {
         let endpoint = github_endpoint(&host, &repository)?;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -114,7 +123,7 @@ impl GitHubSource {
         let client = Client::builder()
             .user_agent("agent-launcher")
             .default_headers(headers)
-            .redirect(redirect_policy(token.is_some()))
+            .redirect(policy)
             .build()
             .map_err(Error::HttpClient)?;
         Ok(Self {
@@ -382,7 +391,7 @@ fn is_public_github_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("github.com")
 }
 
-fn resolve_token(
+pub(super) fn resolve_token(
     host: &str,
     mut lookup: impl FnMut(&str) -> Option<String>,
     mut run: impl FnMut(&mut Command) -> std::io::Result<Output>,
@@ -573,6 +582,7 @@ impl GitHubIssue {
 
     fn into_issue(self, source: &SourceKey) -> Issue {
         Issue {
+            security_advisory: None,
             pull_request: None,
             activity: Some(agent_launcher_core::ItemActivity {
                 comments: self.comments,

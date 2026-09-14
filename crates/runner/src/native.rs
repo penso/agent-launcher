@@ -390,10 +390,22 @@ impl NativeBackend {
         Ok(())
     }
 
-    async fn launch_local_server(&self, workspace_path: &Path) -> Result<(Url, Child)> {
+    async fn launch_local_server(
+        &self,
+        workspace_path: &Path,
+        password: Option<&str>,
+    ) -> Result<(Url, Child)> {
         let local_port = available_port()?;
         let mut command = Command::new(&self.config.opencode_executable);
+        if let Some(password) = password {
+            crate::private::clean_environment(&mut command);
+            command.env("OPENCODE_SERVER_PASSWORD", password);
+            command.env("OPENCODE_SERVER_USERNAME", "opencode");
+            #[cfg(unix)]
+            command.process_group(0);
+        }
         command
+            .kill_on_drop(password.is_some())
             .arg("serve")
             .arg("--hostname")
             .arg("127.0.0.1")
@@ -409,12 +421,14 @@ impl NativeBackend {
         let mut child = command
             .spawn()
             .map_err(|error| map_executable_error(&self.config.opencode_executable, error))?;
+        let mut provisional = PrivateProcessGroup::new(password.is_some(), child.id());
         let base_url = Url::parse(&format!("http://127.0.0.1:{local_port}/"))
             .map_err(|error| Error::InvalidResponse(error.to_string()))?;
-        if let Err(error) = self.wait_for_health(&base_url, &mut child, None).await {
+        if let Err(error) = self.wait_for_health(&base_url, &mut child, password).await {
             let _ = child.kill().await;
             return Err(error);
         }
+        provisional.0 = None;
         Ok((base_url, child))
     }
 
@@ -542,8 +556,17 @@ impl NativeBackend {
         remote: bool,
         _password: Option<&str>,
     ) -> Result<bool> {
+        let private = self
+            .registry
+            .get(run_id)
+            .await
+            .is_ok_and(|record| record.summary.confidential);
         if let Some(mut managed_child) = self.registry.children.lock().await.remove(run_id) {
             if managed_child.child.try_wait()?.is_none() {
+                drop(PrivateProcessGroup::new(
+                    private && !remote,
+                    managed_child.child.id(),
+                ));
                 managed_child.child.kill().await?;
                 return Ok(true);
             }
@@ -769,7 +792,10 @@ impl NativeBackend {
                 };
                 *initial_prompt = None;
                 record.summary.state = RunState::Failed;
-                record.summary.message = Some(format!("Initial prompt failed: {error}"));
+                record.summary.message = Some(format!(
+                    "Initial prompt failed: {}",
+                    error.for_private(record.summary.confidential)
+                ));
                 record.summary.updated_at = Utc::now();
                 self.registry.update(record.clone()).await?;
                 return Ok(record);
@@ -1240,6 +1266,32 @@ impl NativeBackend {
     }
 }
 
+// Until registry ownership, dropping dispatch kills the private server group,
+// including ordinary descendants. This is not containment of a malicious agent.
+struct PrivateProcessGroup(Option<u32>);
+
+impl PrivateProcessGroup {
+    fn new(private: bool, pid: Option<u32>) -> Self {
+        Self(if private {
+            pid
+        } else {
+            None
+        })
+    }
+}
+
+impl Drop for PrivateProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self
+            .0
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
 struct PendingPermission {
     id: String,
     permission: Option<String>,
@@ -1311,6 +1363,17 @@ impl Backend for NativeBackend {
             .is_ok_and(|record| matches!(record.session, BackendSession::Native { .. }))
     }
 
+    async fn confidential_runs(&self) -> Vec<RunSummary> {
+        let mut runs = Vec::new();
+        for mut run in self.registry.summaries().await {
+            if run.confidential && self.owns_run(&run.id).await {
+                run.message = None;
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
     async fn detect(&self, _repository: &Repository) -> Result<BackendDetection> {
         if !self.config.ssh_targets.is_empty() {
             let compute_targets = join_all(
@@ -1361,9 +1424,32 @@ impl Backend for NativeBackend {
         })
     }
 
-    async fn dispatch(&self, request: DispatchRequest) -> Result<DispatchResult> {
+    fn verify_private_storage(&self) -> Result<()> {
+        self.registry.verify_private_storage()
+    }
+
+    async fn dispatch(&self, mut request: DispatchRequest) -> Result<DispatchResult> {
+        let private = request.private_fork.is_some() || request.issue.security_advisory.is_some();
+        let result = async {
         request.validate()?;
+        if private {
+            self.registry.verify_private_storage()?;
+        }
+        if request.private_fork.is_some() && !self.config.ssh_targets.is_empty() {
+            return Err(Error::PrivateSecurity);
+        }
+        crate::private::guard_dispatch(&request, self.kind()).await?;
+        if request
+            .model
+            .as_deref()
+            .is_some_and(|model| parse_model(model).is_none())
+        {
+            return Err(Error::InvalidRequest(
+                "Native OpenCode models require provider/model".into(),
+            ));
+        }
         let _provision_guard = self.registry.provision_lock.lock().await;
+        crate::private::private_branch(&mut request).await?;
         let ssh = if self.config.ssh_targets.is_empty() {
             if let Some(target) = &request.target {
                 return Err(Error::ComputeTargetNotFound(target.clone()));
@@ -1427,6 +1513,8 @@ impl Backend for NativeBackend {
                     Some(server.start),
                     Some(server.password),
                 )
+            } else if request.private_fork.is_some() {
+                (request.repository.root.clone(), None, None, None, Some(Uuid::new_v4().simple().to_string()))
             } else {
                 let path = self
                     .local_workspace_root()?
@@ -1457,18 +1545,22 @@ impl Backend for NativeBackend {
                 },
             }
         } else {
-            self.launch_local_server(&workspace_path).await?
+            if let Some(fork) = &request.private_fork {
+                crate::verify_private_checkout(&request.repository, fork).await?;
+            }
+            self.launch_local_server(&workspace_path, server_password.as_deref())
+                .await?
         };
         let process_id = child.id();
+        let mut provisional = PrivateProcessGroup::new(private, process_id);
 
         let session_url = endpoint(&base_url, &["session"])?;
         let session = match self
             .request_json(
-                self.authenticated(
-                    self.client.post(session_url),
-                    server_password.as_deref(),
-                )
-                    .json(&json!({"title": format!("{}: {}", request.issue.identifier, request.issue.title)}))
+                self.authenticated(self.client.post(session_url), server_password.as_deref())
+                    .json(&json!({"title": if request.private_fork.is_some() {
+                        crate::private::TITLE.to_owned()
+                    } else { format!("{}: {}", request.issue.identifier, request.issue.title) }}))
                     .send()
                     .await,
             )
@@ -1488,7 +1580,7 @@ impl Backend for NativeBackend {
                 )
                 .await;
                 return Err(error);
-            }
+            },
         };
         let session_id = match find_string(&session, &["id", "sessionID", "sessionId"]) {
             Some(session_id) => session_id,
@@ -1517,6 +1609,7 @@ impl Backend for NativeBackend {
         );
         let now = Utc::now();
         let starting = RunSummary {
+            confidential: request.private_fork.is_some(),
             id: run_id.clone(),
             issue_key: request.issue.key.canonical(),
             workspace: Some(WorkspaceRef {
@@ -1527,6 +1620,7 @@ impl Backend for NativeBackend {
                 branch,
             }),
             agent: request.agent,
+            model: request.model,
             state: RunState::Starting,
             message: None,
             session_id: Some(session_id.clone()),
@@ -1574,6 +1668,7 @@ impl Backend for NativeBackend {
             .lock()
             .await
             .insert(run_id.clone(), ManagedChild { child });
+        provisional.0 = None;
 
         let summary = match self
             .request_empty(
@@ -1595,7 +1690,9 @@ impl Backend for NativeBackend {
                     );
                     summary
                 }),
-            Err(error) if initial_prompt_definitively_rejected(&error) => self
+            Err(error) if initial_prompt_definitively_rejected(&error) => {
+                let error = error.for_private(private);
+                self
                 .complete_initial_prompt(
                     &run_id,
                     RunState::Failed,
@@ -1607,8 +1704,10 @@ impl Backend for NativeBackend {
                     summary.state = RunState::Failed;
                     summary.message = Some(format!("Initial prompt failed: {error}"));
                     summary
-                }),
+                })
+            },
             Err(error) => {
+                let error = error.for_private(private);
                 let mut summary = starting;
                 summary.message = Some(format!(
                     "Initial prompt delivery is unconfirmed and will be reconciled on refresh: {error}"
@@ -1620,10 +1719,20 @@ impl Backend for NativeBackend {
             run: summary,
             capabilities: self.capabilities(),
         })
+        }.await;
+        result.map_err(|error| {
+            if private {
+                Error::PrivateSecurity
+            } else {
+                error
+            }
+        })
     }
 
     async fn refresh(&self, run_id: &str) -> Result<StatusResult> {
         let existing = self.record(run_id).await?;
+        let private = existing.summary.confidential;
+        crate::private::redact_errors(private, async {
         if existing.summary.state == RunState::Cancelled {
             return Ok(StatusResult {
                 run: existing.summary,
@@ -1633,6 +1742,7 @@ impl Backend for NativeBackend {
         let (record, base_url) = match self.connected_record(run_id).await {
             Ok(connected) => connected,
             Err(error) => {
+                let error = error.for_private(private);
                 let summary = self
                     .registry
                     .set_state(
@@ -1649,7 +1759,9 @@ impl Backend for NativeBackend {
                 });
             },
         };
-        let record = self.recover_initial_prompt(record, &base_url).await?;
+        // Private status polling must not download transcripts or replay an
+        // ambiguously delivered confidential prompt. Reconciliation is explicit.
+        let record = if private { record } else { self.recover_initial_prompt(record, &base_url).await? };
         if record.summary.state == RunState::Failed {
             return Ok(StatusResult {
                 run: record.summary,
@@ -1679,6 +1791,7 @@ impl Backend for NativeBackend {
             .unwrap_or_else(|| "idle".into());
         let mut state = match status_type.as_str() {
             "busy" | "running" | "retry" => RunState::Running,
+            "idle" if private && record.summary.state == RunState::Starting => RunState::Starting,
             "idle" => RunState::Idle,
             "error" | "failed" => RunState::Failed,
             _ => RunState::Running,
@@ -1691,8 +1804,9 @@ impl Backend for NativeBackend {
             state = RunState::NeedsInput;
         }
 
+        let latest_message = if private { None } else {
         let messages_url = endpoint(&base_url, &["session", session_id, "message"])?;
-        let latest_message = match self
+        match self
             .authenticated(self.client.get(messages_url), password)
             .query(&[("limit", "1")])
             .send()
@@ -1704,6 +1818,7 @@ impl Backend for NativeBackend {
                 .ok()
                 .and_then(|value| latest_message(&value)),
             _ => None,
+        }
         };
         let mut record = record;
         let BackendSession::Native {
@@ -1726,9 +1841,9 @@ impl Backend for NativeBackend {
         *pending_question_count = pending_question
             .as_ref()
             .map_or(0, |question| question.count);
-        *pending_question_prompt = pending_question
+        *pending_question_prompt = if private { None } else { pending_question
             .as_ref()
-            .map(|question| question.prompt.clone());
+            .map(|question| question.prompt.clone()) };
         let output = latest_message.and_then(|(id, text)| {
             if last_message_id.as_deref() == Some(id.as_str()) {
                 None
@@ -1754,6 +1869,13 @@ impl Backend for NativeBackend {
         if summary.message.is_none() {
             summary.message = status.and_then(|status| find_string(status, &["message"]));
         }
+        if private {
+            summary.message = match summary.state {
+                RunState::Starting => Some("Private initial prompt delivery is unconfirmed".into()),
+                RunState::NeedsInput => Some("Private agent requires input".into()),
+                _ => None,
+            };
+        }
         summary.updated_at = Utc::now();
         let summary = summary.clone();
         self.registry.update(record).await?;
@@ -1761,201 +1883,216 @@ impl Backend for NativeBackend {
             run: summary,
             output,
         })
+        }).await
     }
 
     async fn send_input(&self, run_id: &str, text: &str) -> Result<()> {
-        if text.is_empty() {
-            return Err(Error::InvalidRequest("input cannot be empty".into()));
-        }
-        if self.record(run_id).await?.summary.state == RunState::Cancelled {
-            return Err(Error::InvalidRequest(format!(
-                "run {run_id} is cancelled and cannot accept input"
-            )));
-        }
-        let (record, base_url) = self.connected_record(run_id).await?;
-        let BackendSession::Native {
-            pending_permission_id,
-            pending_question_id,
-            pending_question_count,
-            server_password,
-            ..
-        } = &record.session
-        else {
-            unreachable!()
-        };
-        let password = server_password.as_deref();
-        if let Some(permission_id) = pending_permission_id {
-            let reply = permission_reply(text)?;
-            let url = endpoint(&base_url, &["permission", permission_id, "reply"])?;
-            self.request_json(
-                self.authenticated(self.client.post(url), password)
-                    .json(&json!({"reply": reply}))
-                    .send()
-                    .await,
-            )
-            .await?;
-            let mut record = record;
+        let private = self.record(run_id).await?.summary.confidential;
+        crate::private::redact_errors(private, async {
+            if text.is_empty() {
+                return Err(Error::InvalidRequest("input cannot be empty".into()));
+            }
+            if self.record(run_id).await?.summary.state == RunState::Cancelled {
+                return Err(Error::InvalidRequest(format!(
+                    "run {run_id} is cancelled and cannot accept input"
+                )));
+            }
+            let (record, base_url) = self.connected_record(run_id).await?;
             let BackendSession::Native {
                 pending_permission_id,
                 pending_question_id,
-                pending_question_prompt,
-                ..
-            } = &mut record.session
-            else {
-                unreachable!()
-            };
-            *pending_permission_id = None;
-            record.summary.state = if pending_question_id.is_some() {
-                RunState::NeedsInput
-            } else {
-                RunState::Running
-            };
-            record.summary.message = pending_question_prompt.clone();
-            record.summary.updated_at = Utc::now();
-            self.registry.update(record).await?;
-            return Ok(());
-        }
-        if let Some(question_id) = pending_question_id {
-            let action = question_action(text, *pending_question_count);
-            let url = match &action {
-                QuestionAction::Reply(_) => {
-                    endpoint(&base_url, &["question", question_id, "reply"])?
-                },
-                QuestionAction::Reject => {
-                    endpoint(&base_url, &["question", question_id, "reject"])?
-                },
-            };
-            let request = self.authenticated(self.client.post(url), password);
-            let response = match action {
-                QuestionAction::Reply(answers) => {
-                    request.json(&json!({"answers": answers})).send().await
-                },
-                QuestionAction::Reject => request.send().await,
-            };
-            self.request_json(response).await?;
-            let mut record = record;
-            let BackendSession::Native {
-                pending_question_id,
                 pending_question_count,
-                pending_question_prompt,
+                server_password,
                 ..
-            } = &mut record.session
+            } = &record.session
             else {
                 unreachable!()
             };
-            *pending_question_id = None;
-            *pending_question_count = 0;
-            *pending_question_prompt = None;
-            record.summary.state = RunState::Running;
-            record.summary.message = None;
-            record.summary.updated_at = Utc::now();
-            self.registry.update(record).await?;
-            return Ok(());
-        }
-        let session_id = record
-            .summary
-            .session_id
-            .as_deref()
-            .ok_or_else(|| Error::InvalidResponse("run has no session id".into()))?;
-        let url = endpoint(&base_url, &["session", session_id, "prompt_async"])?;
-        self.request_empty(
-            self.authenticated(self.client.post(url), password)
-                .json(&prompt_body(&record.summary.agent, text, None, None))
-                .send()
-                .await,
-        )
-        .await?;
-        self.registry
-            .set_state(run_id, RunState::Running, None)
-            .await?;
-        Ok(())
-    }
-
-    async fn stop(&self, run_id: &str) -> Result<()> {
-        let initial = self.record(run_id).await?;
-        let remote = matches!(&initial.session, BackendSession::Native {
-            remote: true,
-            ..
-        });
-        let (record, base_url) = if remote {
-            self.connected_record(run_id).await?
-        } else {
-            let BackendSession::Native { base_url, .. } = &initial.session else {
-                unreachable!()
-            };
-            let base_url =
-                Url::parse(base_url).map_err(|error| Error::InvalidResponse(error.to_string()))?;
-            (initial, base_url)
-        };
-        let BackendSession::Native {
-            process_id,
-            server_password,
-            remote_port,
-            ..
-        } = &record.session
-        else {
-            unreachable!()
-        };
-        let process_id = *process_id;
-        let password = server_password.as_deref();
-        let abort_error = if self.health(&base_url, password).await {
+            let password = server_password.as_deref();
+            if let Some(permission_id) = pending_permission_id {
+                let reply = permission_reply(text)?;
+                let url = endpoint(&base_url, &["permission", permission_id, "reply"])?;
+                self.request_json(
+                    self.authenticated(self.client.post(url), password)
+                        .json(&json!({"reply": reply}))
+                        .send()
+                        .await,
+                )
+                .await?;
+                let mut record = record;
+                let BackendSession::Native {
+                    pending_permission_id,
+                    pending_question_id,
+                    pending_question_prompt,
+                    ..
+                } = &mut record.session
+                else {
+                    unreachable!()
+                };
+                *pending_permission_id = None;
+                record.summary.state = if pending_question_id.is_some() {
+                    RunState::NeedsInput
+                } else {
+                    RunState::Running
+                };
+                record.summary.message = pending_question_prompt.clone();
+                record.summary.updated_at = Utc::now();
+                self.registry.update(record).await?;
+                return Ok(());
+            }
+            if let Some(question_id) = pending_question_id {
+                let action = question_action(text, *pending_question_count);
+                let url = match &action {
+                    QuestionAction::Reply(_) => {
+                        endpoint(&base_url, &["question", question_id, "reply"])?
+                    },
+                    QuestionAction::Reject => {
+                        endpoint(&base_url, &["question", question_id, "reject"])?
+                    },
+                };
+                let request = self.authenticated(self.client.post(url), password);
+                let response = match action {
+                    QuestionAction::Reply(answers) => {
+                        request.json(&json!({"answers": answers})).send().await
+                    },
+                    QuestionAction::Reject => request.send().await,
+                };
+                self.request_json(response).await?;
+                let mut record = record;
+                let BackendSession::Native {
+                    pending_question_id,
+                    pending_question_count,
+                    pending_question_prompt,
+                    ..
+                } = &mut record.session
+                else {
+                    unreachable!()
+                };
+                *pending_question_id = None;
+                *pending_question_count = 0;
+                *pending_question_prompt = None;
+                record.summary.state = RunState::Running;
+                record.summary.message = None;
+                record.summary.updated_at = Utc::now();
+                self.registry.update(record).await?;
+                return Ok(());
+            }
             let session_id = record
                 .summary
                 .session_id
                 .as_deref()
                 .ok_or_else(|| Error::InvalidResponse("run has no session id".into()))?;
-            let url = endpoint(&base_url, &["session", session_id, "abort"])?;
+            let url = endpoint(&base_url, &["session", session_id, "prompt_async"])?;
             self.request_empty(
                 self.authenticated(self.client.post(url), password)
+                    .json(&prompt_body(
+                        &record.summary.agent,
+                        text,
+                        record.summary.model.as_deref(),
+                        None,
+                    ))
                     .send()
                     .await,
             )
-            .await
-            .err()
-        } else {
-            Some(Error::Disconnected(run_id.into()))
-        };
-        let abort_failed = abort_error.is_some();
-        let terminated = self
-            .terminate_managed_process(run_id, process_id, &base_url, remote, password)
             .await?;
-        if remote {
-            let ssh = self.target_for_record(&record)?;
-            let workspace_id = record
-                .summary
-                .workspace
-                .as_ref()
-                .map(|workspace| workspace.id.as_str())
-                .ok_or_else(|| Error::InvalidRequest("run has no workspace".into()))?;
-            self.ensure_ssh_ready(ssh).await?;
-            self.stop_remote_server(
-                ssh,
-                workspace_id,
-                remote_port.unwrap_or_else(|| remote_port_for(run_id)),
-            )
-            .await?;
-        }
-        if !terminated && let Some(error) = abort_error {
-            return Err(error);
-        }
-        let message = if terminated && abort_failed {
-            "managed OpenCode process or SSH tunnel terminated; session abort was unavailable"
-        } else if terminated {
-            if remote {
-                "OpenCode session aborted; SSH tunnel and remote server stopped"
+            self.registry
+                .set_state(run_id, RunState::Running, None)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn stop(&self, run_id: &str) -> Result<()> {
+        let initial = self.record(run_id).await?;
+        crate::private::redact_errors(initial.summary.confidential, async {
+            let remote = matches!(&initial.session, BackendSession::Native {
+                remote: true,
+                ..
+            });
+            let (record, base_url) = if remote {
+                self.connected_record(run_id).await?
             } else {
-                "OpenCode session aborted and managed server terminated"
+                let BackendSession::Native { base_url, .. } = &initial.session else {
+                    unreachable!()
+                };
+                let base_url = Url::parse(base_url)
+                    .map_err(|error| Error::InvalidResponse(error.to_string()))?;
+                (initial, base_url)
+            };
+            let BackendSession::Native {
+                process_id,
+                server_password,
+                remote_port,
+                ..
+            } = &record.session
+            else {
+                unreachable!()
+            };
+            let process_id = *process_id;
+            let password = server_password.as_deref();
+            let abort_error = if self.health(&base_url, password).await {
+                let session_id = record
+                    .summary
+                    .session_id
+                    .as_deref()
+                    .ok_or_else(|| Error::InvalidResponse("run has no session id".into()))?;
+                let url = endpoint(&base_url, &["session", session_id, "abort"])?;
+                self.request_empty(
+                    self.authenticated(self.client.post(url), password)
+                        .send()
+                        .await,
+                )
+                .await
+                .err()
+            } else {
+                Some(Error::Disconnected(run_id.into()))
+            };
+            let abort_failed = abort_error.is_some();
+            let terminated = self
+                .terminate_managed_process(run_id, process_id, &base_url, remote, password)
+                .await?;
+            if remote {
+                let ssh = self.target_for_record(&record)?;
+                let workspace_id = record
+                    .summary
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.id.as_str())
+                    .ok_or_else(|| Error::InvalidRequest("run has no workspace".into()))?;
+                self.ensure_ssh_ready(ssh).await?;
+                self.stop_remote_server(
+                    ssh,
+                    workspace_id,
+                    remote_port.unwrap_or_else(|| remote_port_for(run_id)),
+                )
+                .await?;
             }
-        } else {
-            "OpenCode session aborted; persisted local process was already unavailable"
-        };
-        self.registry
-            .set_state(run_id, RunState::Cancelled, Some(message.into()))
-            .await?;
-        Ok(())
+            if !terminated && let Some(error) = abort_error {
+                return Err(error);
+            }
+            let message = if terminated && abort_failed {
+                "managed OpenCode process or SSH tunnel terminated; session abort was unavailable"
+            } else if terminated {
+                if remote {
+                    "OpenCode session aborted; SSH tunnel and remote server stopped"
+                } else {
+                    "OpenCode session aborted and managed server terminated"
+                }
+            } else {
+                "OpenCode session aborted; persisted local process was already unavailable"
+            };
+            self.registry
+                .set_state(run_id, RunState::Cancelled, Some(message.into()))
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn open(&self, run_id: &str) -> Result<OpenResult> {
+        let private = self.record(run_id).await?.summary.confidential;
+        crate::private::redact_errors(private, async {
         let (record, uri) = self.connected_record(run_id).await?;
         if native_server_password(&record.session).is_some() {
             return Err(Error::InvalidRequest(
@@ -1968,10 +2105,14 @@ impl Backend for NativeBackend {
             uri,
             launched: true,
         })
+        }).await
     }
 
     async fn inspect_worktree(&self, run_id: &str) -> Result<WorktreeInspection> {
         let record = self.record(run_id).await?;
+        if record.summary.confidential {
+            return Err(Error::PrivateSecurity);
+        }
         let workspace = record
             .summary
             .workspace
@@ -2001,6 +2142,12 @@ impl Backend for NativeBackend {
         expected: Option<&WorktreeInspection>,
     ) -> Result<()> {
         let record = self.record(run_id).await?;
+        if record.summary.confidential {
+            return Err(Error::UnsupportedCapability {
+                backend: self.kind(),
+                capability: Capability::DeleteWorktree,
+            });
+        }
         let workspace = record
             .summary
             .workspace
@@ -2198,7 +2345,11 @@ fn native_server_password(session: &BackendSession) -> Option<&str> {
 
 fn parse_model(model: &str) -> Option<(&str, &str)> {
     let (provider, model) = model.split_once('/')?;
-    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+    (!provider.trim().is_empty()
+        && !model.trim().is_empty()
+        && !provider.chars().any(char::is_whitespace)
+        && !model.chars().any(char::is_whitespace))
+    .then_some((provider, model))
 }
 
 fn prompt_body(agent: &str, text: &str, model: Option<&str>, message_id: Option<&str>) -> Value {
@@ -2761,6 +2912,168 @@ fn map_executable_error(executable: &Path, error: std::io::Error) -> Error {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_private_startup_kills_provisional_server() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("native-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let fake = root.join("server");
+        std::fs::write(&fake, "#!/bin/sh\nprintf '%s' $$ > pid\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = SessionRegistry::load(Some(root.join("registry.json")))
+            .await
+            .unwrap();
+        let backend = NativeBackend::new(
+            NativeConfig {
+                opencode_executable: fake,
+                ..Default::default()
+            },
+            registry,
+        );
+        let work = root.clone();
+        let task = tokio::spawn(async move {
+            backend
+                .launch_local_server(&work, Some("fixture-password"))
+                .await
+        });
+        for _ in 0..200 {
+            if root.join("pid").exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let pid = std::fs::read_to_string(root.join("pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        for _ in 0..200 {
+            if rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap())
+                .is_err()
+            {
+                std::fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("provisional server survived cancellation");
+    }
+
+    #[tokio::test]
+    async fn followup_uses_persisted_model_and_legacy_runs_omit_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for model in [Some("openai/gpt-5.4"), None] {
+            let root = std::env::temp_dir().join(format!("launcher-followup-{}", Uuid::new_v4()));
+            let path = root.join("registry.json");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut record = test_remote_record("followup", None, "unused");
+            record.summary.model = model.map(str::to_owned);
+            let BackendSession::Native {
+                base_url,
+                remote,
+                process_id,
+                ..
+            } = &mut record.session
+            else {
+                unreachable!()
+            };
+            *base_url = format!("http://{}/", listener.local_addr().unwrap());
+            *remote = false;
+            *process_id = child.id();
+            let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+            registry.insert(record).await.unwrap();
+            drop(registry);
+            let registry = SessionRegistry::load(Some(path)).await.unwrap();
+            // Use an inert child for ownership checks, never a real harness process.
+            registry
+                .children
+                .lock()
+                .await
+                .insert("followup".into(), ManagedChild { child });
+            let server = tokio::spawn(async move {
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0; 4096];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(count, 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break end + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                    let is_prompt =
+                        headers.starts_with("POST /session/session-followup/prompt_async ");
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0; 4096];
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert_ne!(count, 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                    if is_prompt {
+                        return serde_json::from_slice::<Value>(
+                            &bytes[header_end..header_end + length],
+                        )
+                        .unwrap();
+                    }
+                }
+                panic!("follow-up prompt was not sent");
+            });
+            let backend = NativeBackend::new(NativeConfig::default(), registry.clone());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                backend.send_input("followup", "continue"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let body = server.await.unwrap();
+            if model.is_some() {
+                assert_eq!(
+                    body["model"],
+                    json!({"providerID": "openai", "modelID": "gpt-5.4"})
+                );
+            } else {
+                assert!(body.get("model").is_none());
+            }
+            child = registry
+                .children
+                .lock()
+                .await
+                .remove("followup")
+                .unwrap()
+                .child;
+            child.kill().await.unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn test_ssh_target(
         id: &str,
         destination: &str,
@@ -2780,6 +3093,7 @@ mod tests {
         let now = Utc::now();
         RunRecord {
             summary: RunSummary {
+                confidential: false,
                 id: id.into(),
                 issue_key: format!("issue-{id}"),
                 workspace: Some(WorkspaceRef {
@@ -2790,6 +3104,7 @@ mod tests {
                     branch: format!("agent/{id}"),
                 }),
                 agent: "opencode".into(),
+                model: None,
                 state: RunState::Running,
                 message: None,
                 session_id: Some(format!("session-{id}")),

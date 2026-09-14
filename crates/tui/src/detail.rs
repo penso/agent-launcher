@@ -59,7 +59,7 @@ pub(crate) fn draw_detail(
     }
 
     let status = app.visible_status(snapshot);
-    let controls_height = if content.width >= 104 {
+    let controls_height = if content.width >= 104 && issue.security_advisory.is_none() {
         1
     } else {
         2
@@ -95,6 +95,7 @@ pub(crate) fn draw_detail(
         controls,
         status.as_deref(),
         issue.pull_request.is_some(),
+        issue.security_advisory.is_some(),
     );
     if app.input_overlay.is_some() {
         draw_input_overlay(frame, area, app);
@@ -131,6 +132,7 @@ fn draw_tiny_detail(
         Rect::new(area.x, body.bottom(), area.width, controls_height),
         None,
         issue.pull_request.is_some(),
+        issue.security_advisory.is_some(),
     );
 }
 
@@ -157,8 +159,15 @@ fn draw_detail_header(
     )];
     if area.height > 1 {
         let source = format!(
-            "{} · {} · {}",
-            issue.key.provider, issue.key.repository, issue.state
+            "{}{} · {} · {}",
+            if issue.security_advisory.is_some() {
+                "PRIVATE · "
+            } else {
+                ""
+            },
+            issue.key.provider,
+            issue.key.repository,
+            issue.state
         );
         lines.push(Line::styled(source, Style::new().fg(theme::muted())));
     }
@@ -199,8 +208,16 @@ fn draw_detail_body(
     if inner.is_empty() {
         return;
     }
-    let lines = detail_lines(snapshot, issue, latest_run);
+    let lines = detail_lines(
+        snapshot,
+        issue,
+        latest_run,
+        inner.width,
+        &mut app.markdown_cache,
+    );
     app.mouse.detail = inner;
+    // Markdown already fits this width, including table borders. Only metadata/output
+    // still need Paragraph wrapping; its line count covers both paths for scrolling.
     let paragraph = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
         .style(Style::new().fg(theme::text()).bg(theme::panel()));
@@ -217,12 +234,41 @@ fn detail_lines(
     snapshot: &RuntimeSnapshot,
     issue: &Issue,
     latest_run: Option<&RunSummary>,
+    width: u16,
+    markdown_cache: &mut crate::widgets::markdown::MarkdownCache,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![section(if issue.pull_request.is_some() {
+    let mut lines = vec![section(if issue.security_advisory.is_some() {
+        "PRIVATE Security Advisory"
+    } else if issue.pull_request.is_some() {
         "Pull Request"
     } else {
         "Issue"
     })];
+    if let Some(advisory) = &issue.security_advisory {
+        lines.push(key_value("GHSA", &advisory.ghsa_id));
+        lines.push(key_value(
+            "CVE",
+            advisory.cve_id.as_deref().unwrap_or("not assigned"),
+        ));
+        lines.push(key_value(
+            "severity",
+            advisory.severity.as_deref().unwrap_or("unknown"),
+        ));
+        lines.push(key_value(
+            "privacy",
+            "PRIVATE - local UI only; explicit consent required to dispatch",
+        ));
+        lines.push(key_value(
+            "cleanup",
+            "Private clone retained; separate cleanup unavailable",
+        ));
+        if issue.state != "draft" {
+            lines.push(key_value(
+                "dispatch",
+                "Read-only: accept triage reports on GitHub manually; only drafts can launch",
+            ));
+        }
+    }
     if let Some(pr) = &issue.pull_request {
         lines.push(key_value("number", &format!("#{}", pr.number)));
         lines.push(key_value(
@@ -293,20 +339,25 @@ fn detail_lines(
         .as_deref()
         .filter(|text| !text.trim().is_empty())
     {
-        Some(description) => lines.extend(
-            description
-                .lines()
-                .map(|line| Line::styled(line.to_owned(), Style::new().fg(theme::text()))),
-        ),
-        None => lines.push(Line::styled(
-            "No description.",
-            Style::new().fg(theme::muted()),
-        )),
+        Some(description) => lines.extend(markdown_cache.render(description, width).lines),
+        None => {
+            *markdown_cache = Default::default();
+            lines.push(Line::styled(
+                "No description.",
+                Style::new().fg(theme::muted()),
+            ));
+        },
     }
 
     lines.push(Line::raw(""));
     lines.push(section("Latest run"));
     if let Some(run) = latest_run {
+        if run.confidential {
+            lines.push(key_value(
+                "privacy",
+                "PRIVATE run; launcher output is not persisted",
+            ));
+        }
         lines.push(key_value_styled(
             "state",
             run_label(run.state),
@@ -343,6 +394,10 @@ fn detail_lines(
         }
 
         lines.push(Line::raw(""));
+        if run.confidential || issue.security_advisory.is_some() {
+            lines.push(Line::raw("Private run output is not persisted by launcher. Open the harness to review its session; it may retain its own history."));
+            return lines;
+        }
         lines.push(section("Recent persisted events / output"));
         let events = snapshot
             .run_events
@@ -361,7 +416,9 @@ fn detail_lines(
         }
     } else {
         lines.push(Line::styled(
-            if issue.pull_request.is_some() {
+            if issue.security_advisory.is_some() {
+                "Not reviewed. Press d for settings, then explicit privacy consent."
+            } else if issue.pull_request.is_some() {
                 "Not reviewed. Press d to start a PR review."
             } else {
                 "Not dispatched. Press d to start an agent."
@@ -506,11 +563,26 @@ fn key_value_styled(
     ])
 }
 
-fn draw_controls(frame: &mut Frame<'_>, area: Rect, status: Option<&str>, review: bool) {
+fn draw_controls(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    status: Option<&str>,
+    review: bool,
+    security: bool,
+) {
     if area.is_empty() {
         return;
     }
-    let controls = if area.height == 1 && area.width < 38 {
+    let controls = if security {
+        if area.width < 38 {
+            vec![control_line(&[("d", " private review"), (" Esc", " back")])]
+        } else {
+            vec![
+                control_line(&[("d", " private review  "), ("o", " open  "), ("s", " stop")]),
+                control_line(&[("i", " input  "), ("Esc", " back (private clone retained)")]),
+            ]
+        }
+    } else if area.height == 1 && area.width < 38 {
         vec![control_line(&[
             ("Esc", " back"),
             (

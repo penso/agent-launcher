@@ -55,6 +55,10 @@ impl HostMetrics {
     pub fn has_samples(&self) -> bool {
         !self.cpu_history.is_empty()
     }
+
+    pub fn has_cpu_history(&self) -> bool {
+        self.cpu_history.len() >= 3
+    }
 }
 
 pub(crate) struct HostMetricsSampler {

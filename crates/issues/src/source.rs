@@ -1,4 +1,4 @@
-use agent_launcher_core::{Issue, IssueKey, IssueProvider};
+use agent_launcher_core::{Issue, IssueKey, IssueProvider, SecurityPreparation};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,10 @@ fn canonical_component(value: &str) -> String {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SyncCheckpoint {
     pub updated_at: Option<DateTime<Utc>>,
+    /// Source-owned opaque validators. Security inventories encode a versioned page manifest.
     pub etag: Option<String>,
+    /// For security sources, UTC completion of the last fully validated live inventory.
+    /// A local freshness-cache hit preserves this timestamp unchanged.
     pub last_full_at: Option<DateTime<Utc>>,
     /// GitHub detail revision markers; records themselves remain in the issue cache.
     #[serde(default)]
@@ -59,6 +62,23 @@ pub enum SyncMode {
 pub trait IssueSource: Send + Sync {
     fn source_key(&self) -> &SourceKey;
 
+    fn is_confidential(&self) -> bool {
+        false
+    }
+
+    fn cache_key(&self) -> String {
+        self.source_key().canonical()
+    }
+
+    /// Refetch and verify a private dispatch target, only after explicit confirmation.
+    async fn prepare_security(
+        &self,
+        _key: &IssueKey,
+        _create_fork: bool,
+    ) -> Result<SecurityPreparation, Error> {
+        Err(Error::SecurityUnsupported)
+    }
+
     fn supports_delete(&self) -> bool {
         false
     }
@@ -71,6 +91,10 @@ pub trait IssueSource: Send + Sync {
     async fn sync(&self, checkpoint: Option<&SyncCheckpoint>) -> Result<SyncResult, Error>;
 
     /// The runtime supplies this source's persisted records, including closed items.
+    /// Confidential sources require a private cache, atomically paired with its checkpoint.
+    /// Security sources return Full even on local reuse; unchanged last_full_at means
+    /// no live observation. Local reuse may defer even manual refresh for five minutes.
+    /// Call sync(None) to force live validation, but never bypass retry_at().
     async fn sync_with_cache(
         &self,
         checkpoint: Option<&SyncCheckpoint>,

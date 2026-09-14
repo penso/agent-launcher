@@ -5,6 +5,17 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("security preparation is not supported by this source")]
+    SecurityUnsupported,
+    /// Static reasons only: never include advisory payloads, request URLs or API errors.
+    #[error("GitHub security advisories: {0}")]
+    Security(&'static str),
+    #[error("GitHub security advisories: authentication required or advisory access unavailable")]
+    SecurityAccessDenied,
+    #[error("GitHub security advisories rate limited; retry after {retry_at}")]
+    SecurityRateLimited {
+        retry_at: chrono::DateTime<chrono::Utc>,
+    },
     #[error("issue deletion is not supported by this source")]
     DeleteUnsupported,
     #[error("issue does not match this source or has an invalid native ID")]

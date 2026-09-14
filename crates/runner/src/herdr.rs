@@ -72,8 +72,14 @@ impl HerdrBackend {
         Ok(serde_json::from_value(value)?)
     }
 
-    async fn start_agent(&self, name: &str, kind: &str, pane: &str) -> Result<()> {
-        let args = agent_start_args(name, kind, pane);
+    async fn start_agent(
+        &self,
+        name: &str,
+        kind: &str,
+        pane: &str,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let args = agent_start_args(name, kind, pane, model);
         let mut last_error = None;
         for attempt in 1..=AGENT_START_ATTEMPTS {
             match self.command(args.clone()).await {
@@ -119,6 +125,190 @@ impl HerdrBackend {
             "Herdr initial prompt did not run".to_owned(),
         ))
     }
+
+    async fn private_prompt(&self, name: &str, text: &str) -> Result<()> {
+        let path = private_socket_path()?;
+        let response = private_ipc(
+            &path,
+            "agent.prompt",
+            serde_json::json!({
+                "target": name, "text": text
+            }),
+        )
+        .await?;
+        if response["result"]["type"] != "agent_prompted" {
+            return Err(Error::PrivateSecurity);
+        }
+        // The API acknowledgement is submission, not completion of an agent turn.
+        // Keep CLI readiness polling separate, with only a generic target in argv.
+        self.command(vec![
+            "agent".into(),
+            "wait".into(),
+            name.into(),
+            "--until".into(),
+            "working".into(),
+            "--until".into(),
+            "blocked".into(),
+            "--until".into(),
+            "done".into(),
+            "--until".into(),
+            "idle".into(),
+            "--timeout".into(),
+            INITIAL_PROMPT_TIMEOUT_MS.into(),
+        ])
+        .await
+        .map_err(|_| Error::PrivateSecurity)?;
+        Ok(())
+    }
+}
+
+// Wire contracts pinned to herdrdev/herdr:
+// 0.8.2: 9eb521456ac0d19d3ab3d9d7cea3cca10baa8a4c
+// 0.9.0: b99002ac99b09e00b4ca692436cb15a6b0d676f1
+// src/{session.rs,config/io.rs,api/client.rs,api/schema{.rs,/agents.rs,/response.rs}}.
+// No --session CLI option is supplied by this adapter, so the socket override wins.
+fn private_socket_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("HERDR_SOCKET_PATH") {
+        return Ok(path.into());
+    }
+    let mut root = if let Ok(root) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(root).join("herdr")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/herdr")
+    } else {
+        std::env::temp_dir().join("herdr")
+    };
+    if let Ok(name) = std::env::var("HERDR_SESSION") {
+        if name.is_empty()
+            || name.len() > 64
+            || matches!(name.as_str(), "." | "..")
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err(Error::PrivateSecurity);
+        }
+        if name != "default" {
+            root = root.join("sessions").join(name);
+        }
+    }
+    Ok(root.join("herdr.sock"))
+}
+
+#[cfg(unix)]
+async fn private_ipc(path: &std::path::Path, method: &str, params: Value) -> Result<Value> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    crate::private::redact_errors(true, async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_socket()
+                || metadata.mode() & 0o7777 != 0o600
+                || metadata.uid() != rustix::process::getuid().as_raw()
+            {
+                return Err(Error::PrivateSecurity);
+            }
+            let mut stream = tokio::net::UnixStream::connect(path).await?;
+            // Check the connected peer as well as the pathname (which can be replaced).
+            if stream.peer_cred()?.uid() != rustix::process::getuid().as_raw() {
+                return Err(Error::PrivateSecurity);
+            }
+            let id = Uuid::new_v4().to_string();
+            let mut bytes = serde_json::to_vec(
+                &serde_json::json!({"id": id, "method": method, "params": params}),
+            )?;
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await?;
+            let mut response = Vec::new();
+            BufReader::new(stream.take(1024 * 1024 + 1))
+                .read_until(b'\n', &mut response)
+                .await?;
+            if response.len() > 1024 * 1024 || response.last() != Some(&b'\n') {
+                return Err(Error::PrivateSecurity);
+            }
+            let value: Value = serde_json::from_slice(&response)?;
+            if value["id"] != id || value.get("error").is_some() || !value["result"].is_object() {
+                return Err(Error::PrivateSecurity);
+            }
+            Ok(value)
+        })
+        .await
+        .map_err(|_| Error::PrivateSecurity)?
+    })
+    .await
+}
+
+#[cfg(not(unix))]
+async fn private_ipc(_path: &std::path::Path, _method: &str, _params: Value) -> Result<Value> {
+    Err(Error::PrivateSecurity)
+}
+
+/// Call before creating an advisory fork/checkout, using the configured backend.
+/// Only audited releases are accepted; debug builds need HERDR_SOCKET_PATH.
+pub async fn verify_private_herdr_transport(runner: &crate::Runner) -> Result<()> {
+    crate::private::redact_errors(true, async {
+        runner
+            .backend(BackendKind::Herdr)?
+            .verify_private_transport()
+            .await
+    })
+    .await
+}
+
+fn validate_private_status(status: &HerdrStatus, path: &std::path::Path) -> Result<()> {
+    validate_status(status).map_err(|_| Error::PrivateSecurity)?;
+    let protocol = match status.client.version.as_str() {
+        "0.8.2" => 20,
+        "0.9.0" => 22,
+        _ => return Err(Error::PrivateSecurity),
+    };
+    if status.client.protocol != protocol || status.server.socket.as_deref() != Some(path) {
+        return Err(Error::PrivateSecurity);
+    }
+    Ok(())
+}
+
+struct ProvisionalWorkspace {
+    executable: PathBuf,
+    workspace: Option<String>,
+}
+
+impl ProvisionalWorkspace {
+    async fn cleanup(&mut self) {
+        if let Some(workspace) = &self.workspace {
+            let args = vec![
+                "workspace".into(),
+                "close".into(),
+                "--workspace".into(),
+                workspace.into(),
+            ];
+            if run_output(&self.executable, &args, None).await.is_ok() {
+                self.workspace = None;
+            }
+        }
+    }
+}
+
+impl Drop for ProvisionalWorkspace {
+    fn drop(&mut self) {
+        if let Some(workspace) = self.workspace.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let executable = self.executable.clone();
+            runtime.spawn(async move {
+                // Do not capture another Drop guard: shutdown may discard this
+                // task before polling it, recursively spawning cleanup forever.
+                let args = vec![
+                    "workspace".into(),
+                    "close".into(),
+                    "--workspace".into(),
+                    workspace.into(),
+                ];
+                let _ = run_output(&executable, &args, None).await;
+            });
+        }
+    }
 }
 
 #[async_trait]
@@ -146,6 +336,34 @@ impl Backend for HerdrBackend {
             .is_ok_and(|record| matches!(record.session, BackendSession::Herdr { .. }))
     }
 
+    async fn confidential_runs(&self) -> Vec<RunSummary> {
+        let mut runs = Vec::new();
+        for mut run in self.registry.summaries().await {
+            if run.confidential && self.owns_run(&run.id).await {
+                run.message = None;
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
+    async fn verify_private_transport(&self) -> Result<()> {
+        crate::private::redact_errors(true, async {
+            let path = private_socket_path()?;
+            let status = self.reported_status().await?;
+            validate_private_status(&status, &path)?;
+            let response = private_ipc(&path, "ping", serde_json::json!({})).await?;
+            if response["result"]["type"] != "pong"
+                || response["result"]["version"] != status.client.version
+                || response["result"]["protocol"].as_u64() != Some(status.client.protocol)
+            {
+                return Err(Error::PrivateSecurity);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn detect(&self, _repository: &Repository) -> Result<BackendDetection> {
         let (manager_running, result) = match self.reported_status().await {
             Ok(status) => (status.server.running, validate_status(&status)),
@@ -161,109 +379,203 @@ impl Backend for HerdrBackend {
         })
     }
 
-    async fn dispatch(&self, request: DispatchRequest) -> Result<DispatchResult> {
-        request.validate()?;
-        self.status().await?;
+    fn verify_private_storage(&self) -> Result<()> {
+        self.registry.verify_private_storage()
+    }
 
-        let issue_hash = stable_hash(&request.issue.key.canonical());
-        let workspace_name = request.workspace_name.clone().unwrap_or_else(|| {
-            sanitize_workspace_name(&format!(
-                "{}-{}",
-                request.issue.identifier, request.issue.title
-            ))
-        });
-        let branch = sanitize_branch(
-            request
-                .branch
-                .as_deref()
-                .unwrap_or(&format!("agent/{workspace_name}-{}", &issue_hash[..8])),
-        );
-        let args = resolved_worktree_create_args(
-            &request.repository.root,
-            &branch,
-            &workspace_name,
-            request.base_branch.as_deref(),
-        )
-        .await?;
-        let response = self.command(args).await?;
-        let worktree = parse_worktree(&response)?;
+    async fn dispatch(&self, mut request: DispatchRequest) -> Result<DispatchResult> {
+        let private = request.private_fork.is_some() || request.issue.security_advisory.is_some();
+        let result = async {
+            request.validate()?;
+            if private {
+                self.verify_private_storage()?;
+                self.verify_private_transport().await?;
+            }
+            crate::private::guard_dispatch(&request, self.kind()).await?;
+            if request.model.is_some()
+                && !matches!(request.agent.as_str(), "claude" | "opencode" | "pi")
+            {
+                return Err(Error::InvalidRequest(
+                    "Herdr model selection is supported only for claude, opencode, and pi".into(),
+                ));
+            }
+            if !private {
+                self.status().await?;
+            }
+            crate::private::private_branch(&mut request).await?;
 
-        let agent_name = format!("launcher-{}", &Uuid::new_v4().simple().to_string()[..23]);
-        let launch_result: Result<()> = async {
-            self.start_agent(&agent_name, &request.agent, &worktree.pane_id)
+            let issue_hash = stable_hash(&request.issue.key.canonical());
+            let workspace_name = request.workspace_name.clone().unwrap_or_else(|| {
+                sanitize_workspace_name(&format!(
+                    "{}-{}",
+                    request.issue.identifier, request.issue.title
+                ))
+            });
+            let branch = sanitize_branch(
+                request
+                    .branch
+                    .as_deref()
+                    .unwrap_or(&format!("agent/{workspace_name}-{}", &issue_hash[..8])),
+            );
+            let args = if request.private_fork.is_some() {
+                private_workspace_args(&request.repository.root)
+            } else {
+                resolved_worktree_create_args(
+                    &request.repository.root,
+                    &branch,
+                    &workspace_name,
+                    request.base_branch.as_deref(),
+                )
+                .await?
+            };
+            let response = self.command(args).await?;
+            let mut provisional = ProvisionalWorkspace {
+                executable: self.config.executable.clone(),
+                workspace: if private {
+                    response
+                        .pointer("/result/workspace/workspace_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                } else {
+                    None
+                },
+            };
+            let mut worktree = match parse_worktree(&response) {
+                Ok(worktree) => worktree,
+                Err(error) => {
+                    provisional.cleanup().await;
+                    return Err(error);
+                },
+            };
+            if request.private_fork.is_some() {
+                worktree.path = Some(request.repository.root.clone());
+            }
+
+            let agent_name = format!("launcher-{}", &Uuid::new_v4().simple().to_string()[..23]);
+            let launch_result: Result<()> = async {
+                if let Some(fork) = &request.private_fork {
+                    crate::verify_private_checkout(&request.repository, fork).await?;
+                    self.command(agent_start_args(
+                        &agent_name,
+                        &request.agent,
+                        &worktree.pane_id,
+                        request.model.as_deref(),
+                    ))
+                    .await
+                    .map_err(|_| Error::PrivateSecurity)?;
+                    self.private_prompt(&agent_name, &request.prompt)
+                        .await
+                        .map_err(|_| Error::PrivateSecurity)?;
+                    return Ok(());
+                }
+                self.start_agent(
+                    &agent_name,
+                    &request.agent,
+                    &worktree.pane_id,
+                    request.model.as_deref(),
+                )
                 .await?;
-            self.submit_initial_prompt(&agent_name, &request.prompt)
-                .await?;
-            Ok(())
+                self.submit_initial_prompt(&agent_name, &request.prompt)
+                    .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = launch_result {
+                if request.private_fork.is_some() {
+                    provisional.cleanup().await;
+                    return Err(Error::PrivateSecurity);
+                }
+                return Err(self.rollback_workspace(&worktree.workspace_id, error).await);
+            }
+
+            let now = Utc::now();
+            let run_id = Uuid::new_v4().to_string();
+            let summary = RunSummary {
+                confidential: request.private_fork.is_some(),
+                id: run_id,
+                issue_key: request.issue.key.canonical(),
+                workspace: Some(WorkspaceRef {
+                    backend: BackendKind::Herdr,
+                    id: worktree.workspace_id.clone(),
+                    host: None,
+                    path: worktree.path,
+                    branch,
+                }),
+                agent: request.agent,
+                model: request.model,
+                state: RunState::Running,
+                message: None,
+                session_id: Some(agent_name.clone()),
+                started_at: now,
+                updated_at: now,
+            };
+            let inserted = self
+                .registry
+                .insert(RunRecord {
+                    summary: summary.clone(),
+                    session: BackendSession::Herdr {
+                        workspace_id: worktree.workspace_id,
+                        pane_id: worktree.pane_id,
+                        agent_name,
+                    },
+                    deletion: None,
+                })
+                .await;
+            if let Err(error) = inserted {
+                provisional.cleanup().await;
+                return Err(error);
+            }
+            provisional.workspace = None;
+            Ok(DispatchResult {
+                run: summary,
+                capabilities: self.capabilities(),
+            })
         }
         .await;
-        if let Err(error) = launch_result {
-            return Err(self.rollback_workspace(&worktree.workspace_id, error).await);
-        }
-
-        let now = Utc::now();
-        let run_id = Uuid::new_v4().to_string();
-        let summary = RunSummary {
-            id: run_id,
-            issue_key: request.issue.key.canonical(),
-            workspace: Some(WorkspaceRef {
-                backend: BackendKind::Herdr,
-                id: worktree.workspace_id.clone(),
-                host: None,
-                path: worktree.path,
-                branch,
-            }),
-            agent: request.agent,
-            state: RunState::Running,
-            message: None,
-            session_id: Some(agent_name.clone()),
-            started_at: now,
-            updated_at: now,
-        };
-        self.registry
-            .insert(RunRecord {
-                summary: summary.clone(),
-                session: BackendSession::Herdr {
-                    workspace_id: worktree.workspace_id,
-                    pane_id: worktree.pane_id,
-                    agent_name,
-                },
-                deletion: None,
-            })
-            .await?;
-        Ok(DispatchResult {
-            run: summary,
-            capabilities: self.capabilities(),
+        result.map_err(|error| {
+            if private {
+                Error::PrivateSecurity
+            } else {
+                error
+            }
         })
     }
 
     async fn refresh(&self, run_id: &str) -> Result<StatusResult> {
         let record = self.record(run_id).await?;
-        let BackendSession::Herdr { agent_name, .. } = &record.session else {
-            unreachable!()
-        };
-        let agent = match self
-            .command(vec!["agent".into(), "get".into(), agent_name.into()])
-            .await
-        {
-            Ok(value) => parse_agent(&value)?,
-            Err(error) => {
-                let summary = self
-                    .registry
-                    .set_state(run_id, RunState::Disconnected, Some(error.to_string()))
-                    .await?;
-                return Ok(StatusResult {
-                    run: summary,
-                    output: None,
-                });
-            },
-        };
-        let output =
-            run_output(&self.config.executable, &agent_read_args(agent_name), None).await?;
-        let mut summary = record.summary;
-        if summary.state != RunState::Cancelled {
-            summary.state = map_agent_status(&agent.status);
-            summary.message = match agent.status.as_str() {
+        let private = record.summary.confidential;
+        crate::private::redact_errors(private, async {
+            let BackendSession::Herdr { agent_name, .. } = &record.session else {
+                unreachable!()
+            };
+            let agent = match self
+                .command(vec!["agent".into(), "get".into(), agent_name.into()])
+                .await
+            {
+                Ok(value) => parse_agent(&value)?,
+                Err(error) => {
+                    let error = error.for_private(private);
+                    let summary = self
+                        .registry
+                        .set_state(run_id, RunState::Disconnected, Some(error.to_string()))
+                        .await?;
+                    return Ok(StatusResult {
+                        run: summary,
+                        output: None,
+                    });
+                },
+            };
+            let output = if private {
+                None
+            } else {
+                let output =
+                    run_output(&self.config.executable, &agent_read_args(agent_name), None).await?;
+                (!output.is_empty()).then_some(output)
+            };
+            let mut summary = record.summary;
+            if summary.state != RunState::Cancelled {
+                summary.state = map_agent_status(&agent.status);
+                summary.message = match agent.status.as_str() {
                 "blocked" => Some(
                     "Herdr reports the agent is blocked; the required interaction is not exposed"
                         .into(),
@@ -271,13 +583,15 @@ impl Backend for HerdrBackend {
                 "unknown" => Some("Herdr cannot classify the agent state".into()),
                 _ => None,
             };
-            summary.updated_at = Utc::now();
-            self.registry.update_summary(summary.clone()).await?;
-        }
-        Ok(StatusResult {
-            run: summary,
-            output: (!output.is_empty()).then_some(output),
+                summary.updated_at = Utc::now();
+                self.registry.update_summary(summary.clone()).await?;
+            }
+            Ok(StatusResult {
+                run: summary,
+                output,
+            })
         })
+        .await
     }
 
     async fn send_input(&self, run_id: &str, text: &str) -> Result<()> {
@@ -285,64 +599,94 @@ impl Backend for HerdrBackend {
             return Err(Error::InvalidRequest("input cannot be empty".into()));
         }
         let record = self.record(run_id).await?;
-        let BackendSession::Herdr { agent_name, .. } = record.session else {
-            unreachable!()
-        };
-        self.command(agent_prompt_args(&agent_name, text)).await?;
-        self.registry
-            .set_state(run_id, RunState::Running, None)
-            .await?;
-        Ok(())
+        crate::private::redact_errors(record.summary.confidential, async {
+            let BackendSession::Herdr { agent_name, .. } = record.session else {
+                unreachable!()
+            };
+            if record.summary.confidential {
+                self.verify_private_transport().await?;
+                self.private_prompt(&agent_name, text).await?;
+            } else {
+                self.command(agent_prompt_args(&agent_name, text)).await?;
+            }
+            self.registry
+                .set_state(run_id, RunState::Running, None)
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn stop(&self, run_id: &str) -> Result<()> {
         let record = self.record(run_id).await?;
-        if record.summary.state == RunState::Cancelled {
-            return Ok(());
-        }
-        let BackendSession::Herdr { agent_name, .. } = record.session else {
-            unreachable!()
-        };
-        let agent = self
-            .command(vec![
-                "agent".into(),
-                "get".into(),
-                agent_name.clone().into(),
-            ])
-            .await?;
-        if parse_agent(&agent)?.status == "blocked" {
-            self.command(agent_send_keys_args(&agent_name, "esc"))
+        crate::private::redact_errors(record.summary.confidential, async {
+            if record.summary.state == RunState::Cancelled {
+                return Ok(());
+            }
+            if record.summary.confidential {
+                let BackendSession::Herdr { workspace_id, .. } = &record.session else {
+                    unreachable!()
+                };
+                self.command(vec![
+                    "workspace".into(),
+                    "close".into(),
+                    "--workspace".into(),
+                    workspace_id.into(),
+                ])
                 .await?;
-        }
-        self.command(agent_send_keys_args(&agent_name, "ctrl+c"))
-            .await?;
-        self.registry
-            .set_state(
-                run_id,
-                RunState::Cancelled,
-                Some("interrupt sent through Herdr".into()),
-            )
-            .await?;
-        Ok(())
+                self.registry
+                    .set_state(run_id, RunState::Cancelled, None)
+                    .await?;
+                return Ok(());
+            }
+            let BackendSession::Herdr { agent_name, .. } = record.session else {
+                unreachable!()
+            };
+            let agent = self
+                .command(vec![
+                    "agent".into(),
+                    "get".into(),
+                    agent_name.clone().into(),
+                ])
+                .await?;
+            if parse_agent(&agent)?.status == "blocked" {
+                self.command(agent_send_keys_args(&agent_name, "esc"))
+                    .await?;
+            }
+            self.command(agent_send_keys_args(&agent_name, "ctrl+c"))
+                .await?;
+            self.registry
+                .set_state(
+                    run_id,
+                    RunState::Cancelled,
+                    Some("interrupt sent through Herdr".into()),
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn open(&self, run_id: &str) -> Result<OpenResult> {
         let record = self.record(run_id).await?;
-        let BackendSession::Herdr { agent_name, .. } = record.session else {
-            unreachable!()
-        };
-        self.command(vec![
-            "agent".into(),
-            "focus".into(),
-            agent_name.clone().into(),
-        ])
-        .await?;
-        let uri = Url::parse(&format!("herdr://agent/{agent_name}"))
-            .map_err(|error| Error::InvalidResponse(error.to_string()))?;
-        Ok(OpenResult {
-            uri,
-            launched: true,
+        crate::private::redact_errors(record.summary.confidential, async {
+            let BackendSession::Herdr { agent_name, .. } = record.session else {
+                unreachable!()
+            };
+            self.command(vec![
+                "agent".into(),
+                "focus".into(),
+                agent_name.clone().into(),
+            ])
+            .await?;
+            let uri = Url::parse(&format!("herdr://agent/{agent_name}"))
+                .map_err(|error| Error::InvalidResponse(error.to_string()))?;
+            Ok(OpenResult {
+                uri,
+                launched: true,
+            })
         })
+        .await
     }
 
     async fn delete_worktree(
@@ -356,6 +700,25 @@ impl Backend for HerdrBackend {
             unreachable!()
         };
         self.registry.begin_deletion(run_id, force, None).await?;
+        if record.summary.confidential {
+            // Named private workspaces are not Herdr-managed Git worktrees. Closing
+            // the pane deliberately retains the isolated checkout and private fork.
+            if self
+                .command(vec![
+                    "workspace".into(),
+                    "close".into(),
+                    "--workspace".into(),
+                    workspace_id.clone().into(),
+                ])
+                .await
+                .is_err()
+            {
+                let _ = self.registry.cancel_deletion(run_id).await;
+                return Err(Error::PrivateSecurity);
+            }
+            self.registry.complete_deletion(run_id).await?;
+            return Ok(());
+        }
         if let Err(error) = self
             .command(worktree_remove_args(&workspace_id, force))
             .await
@@ -396,6 +759,8 @@ struct HerdrClientStatus {
 
 #[derive(Debug, Deserialize)]
 struct HerdrServerStatus {
+    #[serde(default)]
+    socket: Option<PathBuf>,
     running: bool,
     version: Option<String>,
     protocol: Option<u64>,
@@ -595,6 +960,41 @@ async fn resolved_worktree_create_args(
     Ok(worktree_create_args(&primary, branch, label, Some(&base)))
 }
 
+fn private_workspace_args(root: &std::path::Path) -> Vec<OsString> {
+    // A named workspace cannot resolve back to a public primary worktree.
+    let mut args = vec![
+        "workspace".into(),
+        "create".into(),
+        "--cwd".into(),
+        root.as_os_str().to_owned(),
+        "--label".into(),
+        crate::private::TITLE.into(),
+        "--no-focus".into(),
+    ];
+    for value in [
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_COUNT=0",
+        "GIT_CONFIG_PARAMETERS=",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_LFS_SKIP_SMUDGE=1",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES=",
+    ] {
+        args.extend(["--env".into(), value.into()]);
+    }
+    for (key, path) in [
+        ("GIT_DIR", root.join(".git")),
+        ("GIT_COMMON_DIR", root.join(".git")),
+        ("GIT_WORK_TREE", root.to_owned()),
+        ("GIT_OBJECT_DIRECTORY", root.join(".git/objects")),
+        ("GIT_INDEX_FILE", root.join(".git/index")),
+    ] {
+        args.extend(["--env".into(), format!("{key}={}", path.display()).into()]);
+    }
+    args
+}
+
 fn worktree_create_args(
     repository: &std::path::Path,
     branch: &str,
@@ -633,8 +1033,8 @@ fn worktree_remove_args(workspace_id: &str, force: bool) -> Vec<OsString> {
     args
 }
 
-fn agent_start_args(name: &str, kind: &str, pane: &str) -> Vec<OsString> {
-    vec![
+fn agent_start_args(name: &str, kind: &str, pane: &str, model: Option<&str>) -> Vec<OsString> {
+    let mut args = vec![
         "agent".into(),
         "start".into(),
         name.into(),
@@ -642,7 +1042,30 @@ fn agent_start_args(name: &str, kind: &str, pane: &str) -> Vec<OsString> {
         kind.into(),
         "--pane".into(),
         pane.into(),
-    ]
+    ];
+    if let Some(model) = model {
+        args.extend(["--".into(), "--model".into(), model.into()]);
+    }
+    args
+}
+
+#[cfg(test)]
+#[test]
+fn model_arguments_are_literal_harness_arguments() {
+    for (kind, model) in [
+        ("claude", "sonnet"),
+        ("opencode", "openai/gpt-5.4"),
+        ("pi", "openai/gpt-5.4"),
+        ("pi", "provider/model; $(touch /tmp/not-executed)"),
+    ] {
+        assert_eq!(
+            agent_start_args("name", kind, "pane", Some(model)),
+            [
+                "agent", "start", "name", "--kind", kind, "--pane", "pane", "--", "--model", model
+            ]
+            .map(OsString::from)
+        );
+    }
 }
 
 fn agent_prompt_args(name: &str, prompt: &str) -> Vec<OsString> {
@@ -704,6 +1127,255 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn private_cleanup_discarded_at_runtime_shutdown_does_not_recurse() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        drop(ProvisionalWorkspace {
+            executable: "never-run-fixture".into(),
+            workspace: Some("w1".into()),
+        });
+        drop(entered);
+        // The cleanup task has never been polled. Dropping it must not construct
+        // another guard that schedules yet another task into the closed runtime.
+        drop(runtime);
+    }
+
+    #[test]
+    fn private_preflight_allows_only_audited_version_protocol_and_socket_pairs() {
+        let path = Path::new("/fixture/herdr.sock");
+        for (version, protocol, accepted) in [
+            ("0.8.2", 20, true),
+            ("0.9.0", 22, true),
+            ("0.8.2", 22, false),
+            ("0.9.0", 20, false),
+            ("0.8.3", 20, false),
+            ("0.9.1", 22, false),
+            ("0.9.0-preview.1", 22, false),
+            ("1.0.0", 22, false),
+        ] {
+            let mut status: HerdrStatus = serde_json::from_value(json!({
+                "client": {"version": version, "protocol": protocol},
+                "server": {"running": true, "version": version, "protocol": protocol,
+                    "compatible": true, "restart_needed": false, "socket": path}
+            }))
+            .unwrap();
+            assert_eq!(
+                validate_private_status(&status, path).is_ok(),
+                accepted,
+                "{version}/{protocol}"
+            );
+            status.server.socket = Some("/different/herdr.sock".into());
+            assert!(validate_private_status(&status, path).is_err());
+            status.server.socket = Some(path.into());
+            status.server.version = Some("unmatched".into());
+            assert!(validate_private_status(&status, path).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_preflight_uses_configured_backend_executable_without_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestRepository::new();
+        let executable = temp.0.join("configured-cli");
+        let marker = temp.0.join("called");
+        std::fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{{\"client\":{{\"version\":\"unsupported\",\"protocol\":22}},\"server\":{{\"running\":false,\"restart_needed\":false}}}}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = SessionRegistry::load(Some(temp.0.join("registry.json")))
+            .await
+            .unwrap();
+        let runner =
+            crate::Runner::new([
+                Arc::new(HerdrBackend::new(HerdrConfig { executable }, registry))
+                    as Arc<dyn Backend>,
+            ]);
+        assert!(matches!(
+            verify_private_herdr_transport(&runner).await,
+            Err(Error::PrivateSecurity)
+        ));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "status\n--json\n");
+        assert!(matches!(
+            verify_private_herdr_transport(&crate::Runner::new([])).await,
+            Err(Error::PrivateSecurity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_refresh_never_reads_transcript_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestRepository::new();
+        let executable = temp.0.join("cli");
+        let marker = temp.0.join("calls");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$1 $2" = 'agent get' ]; then
+printf '%s' '{{"result":{{"agent":{{"agent_status":"working"}}}}}}'
+else
+printf '%s' PRIVATE_TRANSCRIPT_SENTINEL
+exit 1
+fi
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = SessionRegistry::load(Some(temp.0.join("registry/sessions.json")))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        registry
+            .insert(RunRecord {
+                summary: RunSummary {
+                    confidential: true,
+                    id: "private".into(),
+                    issue_key: "private".into(),
+                    workspace: None,
+                    agent: "opencode".into(),
+                    model: None,
+                    state: RunState::Running,
+                    message: None,
+                    session_id: Some("launcher-fixture".into()),
+                    started_at: now,
+                    updated_at: now,
+                },
+                session: BackendSession::Herdr {
+                    workspace_id: "w1".into(),
+                    pane_id: "w1:p1".into(),
+                    agent_name: "launcher-fixture".into(),
+                },
+                deletion: None,
+            })
+            .await
+            .unwrap();
+        let backend = HerdrBackend::new(HerdrConfig { executable }, registry);
+        let status = backend.refresh("private").await.unwrap();
+        assert_eq!(status.run.state, RunState::Running);
+        assert!(status.output.is_none());
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "agent get launcher-fixture\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provisional_workspace_drop_and_explicit_rollback_close_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestRepository::new();
+        let executable = temp.0.join("cli");
+        let marker = temp.0.join("closed");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut guard = ProvisionalWorkspace {
+            executable: executable.clone(),
+            workspace: Some("w1".into()),
+        };
+        guard.cleanup().await;
+        assert!(guard.workspace.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "workspace\nclose\n--workspace\nw1\n"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        drop(ProvisionalWorkspace {
+            executable,
+            workspace: Some("w2".into()),
+        });
+        for _ in 0..200 {
+            if std::fs::read_to_string(&marker).is_ok_and(|text| text.ends_with("w2\n")) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("drop cleanup did not close provisional workspace");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_socket_fixture_transports_sentinel_and_rejects_unsafe_responses() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let temp = TestRepository(PathBuf::from("/tmp").join(format!("ipc-{}", Uuid::new_v4())));
+        std::fs::create_dir(&temp.0).unwrap();
+        let socket = temp.0.join("ipc");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = tokio::spawn(async move {
+            for bad in [false, true] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "agent.prompt");
+                assert_eq!(request["params"]["target"], "launcher-fixture");
+                assert_eq!(
+                    request["params"]["text"],
+                    "PRIVATE_IPC_SENTINEL\nsecond line"
+                );
+                let response = if bad {
+                    json!({"id": request["id"], "error": {"message": "PRIVATE_IPC_SENTINEL"}})
+                } else {
+                    json!({"id": request["id"], "result": {"type": "agent_prompted"}})
+                };
+                reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let params =
+            json!({"target": "launcher-fixture", "text": "PRIVATE_IPC_SENTINEL\nsecond line"});
+        private_ipc(&socket, "agent.prompt", params.clone())
+            .await
+            .unwrap();
+        let error = private_ipc(&socket, "agent.prompt", params.clone())
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("SENTINEL"));
+        server.await.unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            private_ipc(&socket, "agent.prompt", params.clone())
+                .await
+                .is_err()
+        );
+        let link = temp.0.join("link");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        assert!(
+            private_ipc(&link, "agent.prompt", params.clone())
+                .await
+                .is_err()
+        );
+        let regular = temp.0.join("regular");
+        std::fs::write(&regular, "").unwrap();
+        assert!(private_ipc(&regular, "agent.prompt", params).await.is_err());
+        for args in [
+            agent_start_args("launcher-fixture", "opencode", "w1:p1", None),
+            private_workspace_args(&temp.0),
+        ] {
+            assert!(!format!("{args:?}").contains("SENTINEL"));
+        }
+    }
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -860,6 +1532,29 @@ mod tests {
     }
 
     #[test]
+    fn private_workspace_uses_exact_clone_without_worktree_resolution() {
+        let args = private_workspace_args(Path::new("/private/opaque/clone"));
+        assert_eq!(
+            &args[..6],
+            &[
+                "workspace",
+                "create",
+                "--cwd",
+                "/private/opaque/clone",
+                "--label",
+                crate::private::TITLE
+            ]
+            .map(OsString::from)
+        );
+        assert!(!args.iter().any(|arg| arg == "worktree" || arg == "--base"));
+        assert!(args.iter().any(|arg| arg == "GIT_CONFIG_GLOBAL=/dev/null"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "GIT_DIR=/private/opaque/clone/.git")
+        );
+    }
+
+    #[test]
     fn builds_documented_dispatch_commands() {
         assert_eq!(
             worktree_create_args(Path::new("/repo with space"), "agent/fix", "fix", None),
@@ -876,7 +1571,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            agent_start_args("launcher-123", "opencode", "w1:p1"),
+            agent_start_args("launcher-123", "opencode", "w1:p1", None),
             args(&[
                 "agent",
                 "start",

@@ -4,9 +4,11 @@ mod activity;
 mod diagnostics;
 mod error;
 mod notification;
+mod prompts;
 mod service;
 
 pub use diagnostics::Diagnostics;
 pub use error::{Error, Result};
 pub use notification::{DesktopNotifier, NoopNotifier, NotifyRustNotifier};
+pub use prompts::{PromptDocument, discover_prompt_profiles};
 pub use service::{RuntimeHandle, RuntimeService};

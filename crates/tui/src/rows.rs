@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use agent_launcher_core::{Issue, RuntimeSnapshot};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
+use crate::app::InboxTab;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum IssueSort {
     #[default]
@@ -44,10 +46,21 @@ pub(crate) struct DisplayRow {
 pub(crate) fn display_rows(
     snapshot: &RuntimeSnapshot,
     sort: IssueSort,
-    pull_requests: bool,
+    tab: InboxTab,
 ) -> Vec<DisplayRow> {
     let mut ordered = (0..snapshot.issues.len())
-        .filter(|&idx| snapshot.issues[idx].pull_request.is_some() == pull_requests)
+        .filter(|&idx| {
+            let issue = &snapshot.issues[idx];
+            match tab {
+                InboxTab::Security => issue.security_advisory.is_some(),
+                InboxTab::Issues => {
+                    issue.security_advisory.is_none() && issue.pull_request.is_none()
+                },
+                InboxTab::PullRequests => {
+                    issue.security_advisory.is_none() && issue.pull_request.is_some()
+                },
+            }
+        })
         .collect::<Vec<_>>();
     ordered.sort_by(|&left, &right| {
         let left = &snapshot.issues[left];
@@ -114,9 +127,9 @@ pub(crate) fn display_rows_matching(
     snapshot: &RuntimeSnapshot,
     query: &str,
     sort: IssueSort,
-    pull_requests: bool,
+    tab: InboxTab,
 ) -> Vec<DisplayRow> {
-    let rows = display_rows(snapshot, sort, pull_requests);
+    let rows = display_rows(snapshot, sort, tab);
     let query = query.trim();
     if query.is_empty() {
         return rows;
@@ -216,6 +229,8 @@ fn parent_indices(snapshot: &RuntimeSnapshot) -> Vec<Option<usize>> {
                     .copied()
                     .filter(|parent| {
                         *parent != idx
+                            && issue.security_advisory.is_none()
+                            && snapshot.issues[*parent].security_advisory.is_none()
                             && issue.pull_request.is_none()
                             && snapshot.issues[*parent].pull_request.is_none()
                     })
@@ -257,6 +272,12 @@ fn searchable_text(snapshot: &RuntimeSnapshot, issue_idx: usize) -> String {
     fields.extend(issue.author.iter().cloned());
     fields.extend(issue.labels.iter().cloned());
     fields.extend(issue.blocked_by.iter().cloned());
+    if let Some(advisory) = &issue.security_advisory {
+        fields.push(advisory.ghsa_id.clone());
+        fields.extend(advisory.cve_id.iter().cloned());
+        fields.extend(advisory.severity.iter().cloned());
+        fields.push("PRIVATE".into());
+    }
     if let Some(pr) = &issue.pull_request {
         fields.push(pr.number.to_string());
         fields.push(pr.base_ref.clone());
@@ -305,6 +326,47 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn security_is_flat_separate_and_searchable_by_advisory_metadata() {
+        let parent = issue("parent", "ordinary issue", None);
+        let mut advisory = issue(
+            "advisory/GHSA-aaaa-bbbb-cccc",
+            "private title",
+            Some("parent"),
+        );
+        advisory.security_advisory = Some(agent_launcher_core::SecurityAdvisoryMetadata {
+            ghsa_id: "GHSA-aaaa-bbbb-cccc".into(),
+            cve_id: Some("CVE-2026-1234".into()),
+            severity: Some("critical".into()),
+        });
+        let snapshot = RuntimeSnapshot {
+            issues: vec![parent, advisory],
+            ..Default::default()
+        };
+        assert_eq!(
+            display_rows(&snapshot, IssueSort::Newest, InboxTab::Issues).len(),
+            1
+        );
+        assert!(display_rows(&snapshot, IssueSort::Newest, InboxTab::PullRequests).is_empty());
+        for query in [
+            "GHSA-aaaa-bbbb-cccc",
+            "CVE-2026-1234",
+            "critical",
+            "private title",
+        ] {
+            let rows =
+                display_rows_matching(&snapshot, query, IssueSort::Newest, InboxTab::Security);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].issue_idx, 1);
+            assert_eq!(rows[0].depth, 0);
+            assert!(!rows[0].context_only);
+            assert!(
+                display_rows_matching(&snapshot, query, IssueSort::Newest, InboxTab::Issues)
+                    .is_empty()
+            );
+        }
+    }
+
     fn issue(id: &str, title: &str, parent_id: Option<&str>) -> Issue {
         Issue {
             key: IssueKey {
@@ -318,6 +380,7 @@ mod tests {
             description: None,
             state: "open".to_owned(),
             pull_request: None,
+            security_advisory: None,
             activity: None,
             url: None,
             author: None,
@@ -347,7 +410,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
 
-        let rows = display_rows_matching(&snapshot, "authn", IssueSort::Newest, false);
+        let rows = display_rows_matching(&snapshot, "authn", IssueSort::Newest, InboxTab::Issues);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].issue_idx, 0);
         assert!(rows[0].context_only);
@@ -372,7 +435,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
 
-        let rows = display_rows(&snapshot, IssueSort::Newest, false);
+        let rows = display_rows(&snapshot, IssueSort::Newest, InboxTab::Issues);
         let repository_child = rows.iter().find(|row| row.issue_idx == 2).unwrap();
         let other_child = rows.iter().find(|row| row.issue_idx == 3).unwrap();
         assert_eq!(repository_child.depth, 1);
@@ -403,7 +466,7 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
         let ids = |sort| {
-            display_rows(&snapshot, sort, false)
+            display_rows(&snapshot, sort, InboxTab::Issues)
                 .into_iter()
                 .map(|row| snapshot.issues[row.issue_idx].key.native_id.as_str())
                 .collect::<Vec<_>>()

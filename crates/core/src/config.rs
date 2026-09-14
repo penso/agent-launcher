@@ -15,6 +15,9 @@ pub struct AppConfig {
     pub herdr_activity: HerdrActivityConfig,
     #[serde(skip)]
     pub prompt_profiles: Vec<PromptProfile>,
+    /// Explicit editor root supplied at startup; None keeps profiles read-only.
+    #[serde(skip)]
+    pub prompt_root: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -29,6 +32,7 @@ impl Default for AppConfig {
             notifications: NotificationConfig::default(),
             herdr_activity: HerdrActivityConfig::default(),
             prompt_profiles: Vec::new(),
+            prompt_root: None,
         }
     }
 }

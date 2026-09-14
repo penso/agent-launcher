@@ -4,6 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 agent-launcher-core = { path = "../core" }
 async-trait.workspace = true

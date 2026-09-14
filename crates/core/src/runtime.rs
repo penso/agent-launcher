@@ -7,6 +7,25 @@ use crate::{
     BackendKind, EventEnvelope, Issue, IssueKey, Repository, RunSummary, WorktreeDeletePreview,
 };
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DispatchOptions {
+    /// Reject the launch if backend selection changed since the draft was captured.
+    pub expected_backend: Option<BackendKind>,
+    pub harness: Option<String>,
+    pub model: ModelSelection,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ModelSelection {
+    /// Use the configured model only when retaining the configured harness.
+    /// Selecting a different harness clears both inherited model and effort.
+    #[default]
+    Inherit,
+    /// Omit the model and let the selected harness choose its default.
+    HarnessDefault,
+    Explicit(String),
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RuntimeSnapshot {
     #[serde(default)]
@@ -23,6 +42,8 @@ pub struct RuntimeSnapshot {
     pub compute_targets: Vec<ComputeTargetStatus>,
     pub selected_backend: Option<BackendKind>,
     pub selected_agent: String,
+    #[serde(default)]
+    pub selected_model: Option<String>,
     #[serde(default)]
     pub prompt_profiles: Vec<String>,
     pub refreshing: bool,
@@ -96,6 +117,11 @@ pub struct BackendStatus {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCommand {
+    DispatchSecurity {
+        issue: IssueKey,
+        options: DispatchOptions,
+        consent: bool,
+    },
     Refresh,
     DeleteIssue {
         issue: IssueKey,
@@ -104,10 +130,12 @@ pub enum RuntimeCommand {
         issue: IssueKey,
         profile: Option<String>,
         target: Option<String>,
+        options: DispatchOptions,
     },
     Review {
         issue: IssueKey,
         target: Option<String>,
+        options: DispatchOptions,
     },
     SendInput {
         run_id: String,

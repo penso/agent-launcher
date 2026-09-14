@@ -191,6 +191,12 @@ impl Backend for SupersetBackend {
 
     async fn dispatch(&self, request: DispatchRequest) -> Result<DispatchResult> {
         request.validate()?;
+        crate::private::guard_dispatch(&request, self.kind()).await?;
+        if request.model.is_some() {
+            return Err(Error::InvalidRequest(
+                "Superset does not support model selection; use the harness default".into(),
+            ));
+        }
         let project = self.find_project(&request.repository).await?;
         let hash = issue_hash(&request.issue.key.canonical());
         let workspace_name = request.workspace_name.clone().unwrap_or_else(|| {
@@ -235,6 +241,7 @@ impl Backend for SupersetBackend {
         let now = Utc::now();
         let run_id = Uuid::new_v4().to_string();
         let summary = RunSummary {
+            confidential: false,
             id: run_id,
             issue_key: request.issue.key.canonical(),
             workspace: Some(WorkspaceRef {
@@ -245,6 +252,7 @@ impl Backend for SupersetBackend {
                 branch,
             }),
             agent: request.agent,
+            model: None,
             state: RunState::Running,
             message: None,
             session_id: Some(session_id.clone()),

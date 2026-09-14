@@ -219,6 +219,7 @@ struct GitLabIssue {
 impl GitLabIssue {
     fn into_issue(self, source: &SourceKey) -> Issue {
         Issue {
+            security_advisory: None,
             pull_request: None,
             activity: Some(agent_launcher_core::ItemActivity {
                 comments: self.user_notes_count,

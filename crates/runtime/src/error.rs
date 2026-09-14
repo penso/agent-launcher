@@ -4,6 +4,34 @@ use thiserror::Error;
 /// Errors produced while starting or controlling the runtime.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("private advisory operation rejected: {0}")]
+    SecurityRejected(&'static str),
+    #[error("private advisory operation failed; verify access and backend configuration")]
+    SecurityFailed,
+    #[error("private advisory access revoked; cached advisories are unavailable")]
+    SecurityAccessRevoked,
+    #[error("private launch cancelled or source access revoked")]
+    SecurityCancelled,
+    #[error(
+        "private launch or cleanup outcome is unknown; inspect the selected harness before retrying"
+    )]
+    SecurityOutcomeUnknown,
+    #[error("prompt editor is read-only: no prompt root configured")]
+    PromptRootUnavailable,
+    #[error(
+        "invalid prompt name: use one nonempty path component of at most 128 bytes, without slashes or control characters"
+    )]
+    InvalidPromptName,
+    #[error("prompt changed or already exists; reload before saving")]
+    PromptConflict,
+    #[error("prompt editor refuses symlinked or non-regular roots, directories, or files")]
+    UnsafePromptPath,
+    #[error("prompt editor is busy; retry saving")]
+    PromptBusy,
+    #[error("prompt profile `{0}` is read-only; change its permissions before editing")]
+    ReadOnlyPromptProfile(String),
+    #[error("prompt storage error: {0}")]
+    PromptIo(#[source] std::io::Error),
     #[error("issue deletion rejected: {0}")]
     DeleteIssueRejected(&'static str),
     #[error(

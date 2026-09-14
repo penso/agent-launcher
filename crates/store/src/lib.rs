@@ -45,11 +45,18 @@ CREATE TABLE IF NOT EXISTS source_checkpoints (
     checkpoint_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS security_advisory_cache (
+    source TEXT PRIMARY KEY NOT NULL,
+    issues_json TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY NOT NULL,
     issue_key TEXT NOT NULL,
     workspace_json TEXT,
     agent TEXT NOT NULL,
+    model TEXT,
     state_json TEXT NOT NULL,
     message TEXT,
     session_id TEXT,
@@ -83,9 +90,55 @@ CREATE TABLE IF NOT EXISTS herdr_activity_samples (
 
 const MAX_ACTIVITY_SAMPLE_BATCH: usize = 10_000;
 
+pub fn validate_security_cache(source: &str, issues: &[Issue]) -> Result<()> {
+    let components: Vec<_> = source.split(':').collect();
+    if components.len() != 4
+        || components[0] != "security"
+        || components[1] != "github"
+        || components[2].is_empty()
+        || components[3].split('/').count() != 2
+        || components[3].split('/').any(str::is_empty)
+    {
+        return Err(StoreError::SecurityCache);
+    }
+    let encode = |value: &str| value.replace('%', "%25").replace(':', "%3A");
+    let mut keys = HashSet::new();
+    for issue in issues {
+        let Some(metadata) = &issue.security_advisory else {
+            return Err(StoreError::SecurityCache);
+        };
+        if issue.key.provider != IssueProvider::Github
+            || format!(
+                "security:github:{}:{}",
+                encode(&issue.key.host),
+                encode(&issue.key.repository)
+            ) != source
+            || !metadata.ghsa_id.strip_prefix("GHSA-").is_some_and(|id| {
+                id.split('-').count() == 3
+                    && id.split('-').all(|part| {
+                        part.len() == 4
+                            && part
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    })
+            })
+            || issue.key.native_id != format!("advisory/{}", metadata.ghsa_id)
+            || issue.pull_request.is_some()
+            || !keys.insert(issue.key.canonical())
+        {
+            return Err(StoreError::SecurityCache);
+        }
+    }
+    Ok(())
+}
+
 /// Errors returned by [`Store`].
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("private security cache unavailable or invalid")]
+    SecurityCache,
+    #[error("confidential records cannot be persisted in the ordinary cache")]
+    ConfidentialRecord,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("JSON serialization error: {0}")]
@@ -113,6 +166,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     pool: SqlitePool,
     path: Option<std::path::PathBuf>,
+    private_root: Option<std::sync::Arc<std::fs::File>>,
+    security_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Descriptive alias for [`Store`].
@@ -122,17 +177,342 @@ impl Store {
     /// Opens or creates a database at `path` and initializes its schema.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let metadata =
+                std::fs::symlink_metadata(parent).map_err(|_| StoreError::SecurityCache)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(StoreError::SecurityCache);
+            }
+        }
+        // Create with restrictive permissions before SQLite can write any content.
+        // Existing ordinary databases outside a private application root are not hardened.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(_) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata =
+                    std::fs::symlink_metadata(&path).map_err(|_| StoreError::SecurityCache)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(StoreError::SecurityCache);
+                }
+            },
+            Err(_) => return Err(StoreError::SecurityCache),
+        }
+        #[cfg(unix)]
+        let private_root = {
+            use std::os::unix::fs::MetadataExt;
+
+            use rustix::fs::{Mode, OFlags, fchmod, open, openat};
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let root = std::fs::File::from(
+                open(
+                    parent,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| StoreError::SecurityCache)?,
+            );
+            let metadata = root.metadata().map_err(|_| StoreError::SecurityCache)?;
+            let uid = rustix::process::geteuid().as_raw();
+            if metadata.uid() == uid && metadata.mode() & 0o777 == 0o700 {
+                let file = std::fs::File::from(
+                    openat(
+                        &root,
+                        path.file_name().ok_or(StoreError::SecurityCache)?,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(|_| StoreError::SecurityCache)?,
+                );
+                let metadata = file.metadata().map_err(|_| StoreError::SecurityCache)?;
+                if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+                    return Err(StoreError::SecurityCache);
+                }
+                if matches!(metadata.mode() & 0o7777, 0o644 | 0o640) {
+                    fchmod(&file, Mode::from_raw_mode(0o600))
+                        .map_err(|_| StoreError::SecurityCache)?;
+                }
+                Some(std::sync::Arc::new(root))
+            } else {
+                None
+            }
+        };
+        #[cfg(not(unix))]
+        let private_root = None;
         let options = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(5));
         let mut store = Self::connect(options, 5).await?;
         store.path = Some(path);
+        store.private_root = private_root;
         Ok(store)
     }
 
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    fn require_private_cache(&self) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let uid = rustix::process::geteuid().as_raw();
+            self.private_cache_root()?;
+            let file = std::fs::symlink_metadata(path).map_err(|_| StoreError::SecurityCache)?;
+            let parent = path.parent().ok_or(StoreError::SecurityCache)?;
+            let directory =
+                std::fs::symlink_metadata(parent).map_err(|_| StoreError::SecurityCache)?;
+            if !file.is_file()
+                || file.nlink() != 1
+                || file.uid() != uid
+                || file.mode() & 0o777 != 0o600
+                || !directory.is_dir()
+                || directory.uid() != uid
+                || directory.mode() & 0o777 != 0o700
+            {
+                return Err(StoreError::SecurityCache);
+            }
+            // Reject symlinked ancestors, not just a symlinked database leaf.
+            for ancestor in parent.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+                if std::fs::symlink_metadata(ancestor)
+                    .map_err(|_| StoreError::SecurityCache)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err(StoreError::SecurityCache);
+                }
+            }
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                match std::fs::symlink_metadata(sidecar) {
+                    Ok(metadata)
+                        if metadata.is_file()
+                            && metadata.nlink() == 1
+                            && metadata.uid() == uid
+                            && metadata.mode() & 0o777 == 0o600 => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    _ => return Err(StoreError::SecurityCache),
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(StoreError::SecurityCache)
+    }
+
+    fn private_cache_root(&self) -> Result<&std::fs::File> {
+        let root = self
+            .private_root
+            .as_deref()
+            .ok_or(StoreError::SecurityCache)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let pinned = root.metadata().map_err(|_| StoreError::SecurityCache)?;
+            let parent = self
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .ok_or(StoreError::SecurityCache)?;
+            let current =
+                std::fs::symlink_metadata(parent).map_err(|_| StoreError::SecurityCache)?;
+            if !current.is_dir()
+                || current.dev() != pinned.dev()
+                || current.ino() != pinned.ino()
+                || pinned.uid() != rustix::process::geteuid().as_raw()
+                || pinned.mode() & 0o777 != 0o700
+            {
+                return Err(StoreError::SecurityCache);
+            }
+            Ok(root)
+        }
+        #[cfg(not(unix))]
+        Err(StoreError::SecurityCache)
+    }
+
+    fn revocation_marker(&self, source: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        if let Some(name) = self.path.as_ref().and_then(|path| path.file_name()) {
+            digest.update(name.as_encoded_bytes());
+        }
+        digest.update([0]);
+        digest.update(source.as_bytes());
+        format!(".security-revoked-{:x}", digest.finalize())
+    }
+
+    fn security_revoked(&self, source: &str) -> Result<bool> {
+        if self.path.is_none() {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            match rustix::fs::statat(
+                self.private_cache_root()?,
+                self.revocation_marker(source),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(_) => Ok(true),
+                Err(rustix::io::Errno::NOENT) => Ok(false),
+                Err(_) => Err(StoreError::SecurityCache),
+            }
+        }
+        #[cfg(not(unix))]
+        Err(StoreError::SecurityCache)
+    }
+
+    // An empty, exclusively created file is a complete atomic tombstone. It contains
+    // no source name or advisory data and is synced before attempting SQLite deletion.
+    fn mark_security_revoked(&self, source: &str) -> Result<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, fsync, openat};
+            let root = self.private_cache_root()?;
+            match openat(
+                root,
+                self.revocation_marker(source),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o600),
+            ) {
+                Ok(file) => fsync(file).map_err(|_| StoreError::SecurityCache)?,
+                Err(rustix::io::Errno::EXIST) => {},
+                Err(_) => return Err(StoreError::SecurityCache),
+            }
+            fsync(root).map_err(|_| StoreError::SecurityCache)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(StoreError::SecurityCache)
+    }
+
+    fn remove_security_revocation(&self, source: &str) -> Result<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let root = self.private_cache_root()?;
+            match rustix::fs::unlinkat(
+                root,
+                self.revocation_marker(source),
+                rustix::fs::AtFlags::empty(),
+            ) {
+                Ok(()) => rustix::fs::fsync(root).map_err(|_| StoreError::SecurityCache),
+                Err(rustix::io::Errno::NOENT) => Ok(()),
+                Err(_) => Err(StoreError::SecurityCache),
+            }
+        }
+        #[cfg(not(unix))]
+        Err(StoreError::SecurityCache)
+    }
+
+    /// Explicit private snapshot API. Never exposed by ordinary issue/checkpoint loads.
+    pub async fn replace_security_cache<T: serde::Serialize>(
+        &self,
+        source: &str,
+        issues: &[Issue],
+        checkpoint: &T,
+    ) -> Result<()> {
+        let _guard = self.security_lock.lock().await;
+        self.require_private_cache()?;
+        validate_security_cache(source, issues)?;
+        let issues = serde_json::to_string(issues).map_err(|_| StoreError::SecurityCache)?;
+        let checkpoint =
+            serde_json::to_string(checkpoint).map_err(|_| StoreError::SecurityCache)?;
+        // One row is one atomic inventory + conditional-request checkpoint.
+        sqlx::query("INSERT INTO security_advisory_cache VALUES (?, ?, ?) ON CONFLICT(source) DO UPDATE SET issues_json = excluded.issues_json, checkpoint_json = excluded.checkpoint_json")
+            .bind(source).bind(issues).bind(checkpoint).execute(&self.pool).await
+            .map_err(|_| StoreError::SecurityCache)?;
+        self.remove_security_revocation(source)
+    }
+
+    pub async fn load_security_cache<T: serde::de::DeserializeOwned>(
+        &self,
+        source: &str,
+    ) -> Result<Option<(Vec<Issue>, T)>> {
+        let _guard = self.security_lock.lock().await;
+        validate_security_cache(source, &[])?;
+        if self.security_revoked(source)? {
+            return Ok(None);
+        }
+        self.require_private_cache()?;
+        let row = sqlx::query(
+            "SELECT issues_json, checkpoint_json FROM security_advisory_cache WHERE source = ?",
+        )
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| StoreError::SecurityCache)?;
+        row.map(|row| {
+            let issues: Vec<Issue> = serde_json::from_str(row.get("issues_json"))
+                .map_err(|_| StoreError::SecurityCache)?;
+            validate_security_cache(source, &issues)?;
+            let checkpoint = serde_json::from_str(row.get("checkpoint_json"))
+                .map_err(|_| StoreError::SecurityCache)?;
+            Ok((issues, checkpoint))
+        })
+        .transpose()
+    }
+
+    pub async fn clear_security_cache(&self, source: &str) -> Result<()> {
+        let _guard = self.security_lock.lock().await;
+        validate_security_cache(source, &[])?;
+        let marker = self.mark_security_revoked(source);
+        // Deletion exposes no confidential data. In particular, a changed file mode
+        // must not prevent revocation on this already-open database connection.
+        sqlx::query("DELETE FROM security_advisory_cache WHERE source = ?")
+            .bind(source)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| StoreError::SecurityCache)?;
+        // Keep a successful tombstone until a fresh validated replacement commits.
+        // If marking failed, successful SQL deletion is still authoritative.
+        let _ = marker;
+        Ok(())
+    }
+
+    pub async fn prune_security_cache(&self, active: &[String]) -> Result<()> {
+        self.require_private_cache()?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| StoreError::SecurityCache)?;
+        let sources: Vec<String> = sqlx::query_scalar("SELECT source FROM security_advisory_cache")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::SecurityCache)?;
+        for source in sources {
+            if !active.contains(&source) {
+                sqlx::query("DELETE FROM security_advisory_cache WHERE source = ?")
+                    .bind(source)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|_| StoreError::SecurityCache)?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StoreError::SecurityCache)?;
+        Ok(())
     }
 
     /// Opens a private in-memory database, primarily for tests.
@@ -179,8 +559,24 @@ impl Store {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let columns = sqlx::query("PRAGMA table_info(runs)")
+            .fetch_all(&mut *transaction)
+            .await?;
+        if !columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "model")
+        {
+            sqlx::query("ALTER TABLE runs ADD COLUMN model TEXT")
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
-        Ok(Self { pool, path: None })
+        Ok(Self {
+            pool,
+            path: None,
+            private_root: None,
+            security_lock: Default::default(),
+        })
     }
 
     /// Atomically replaces the issues belonging to `source`.
@@ -189,6 +585,11 @@ impl Store {
     /// are upserted by [`IssueKey::canonical`].
     /// For combined sources, callers must supply both issues and pull requests.
     pub async fn replace_issues(&self, source: &str, issues: &[Issue]) -> Result<()> {
+        if source.starts_with("security:")
+            || issues.iter().any(|issue| issue.security_advisory.is_some())
+        {
+            return Err(StoreError::ConfidentialRecord);
+        }
         let mut transaction = self.pool.begin().await?;
         sqlx::query("DELETE FROM issues WHERE source = ?")
             .bind(source)
@@ -205,6 +606,11 @@ impl Store {
 
     /// Upserts changed issues without removing other records from the source.
     pub async fn upsert_issues(&self, source: &str, issues: &[Issue]) -> Result<()> {
+        if source.starts_with("security:")
+            || issues.iter().any(|issue| issue.security_advisory.is_some())
+        {
+            return Err(StoreError::ConfidentialRecord);
+        }
         let mut transaction = self.pool.begin().await?;
         for issue in issues {
             upsert_issue(&mut transaction, source, issue).await?;
@@ -275,6 +681,9 @@ impl Store {
 
     /// Sets or replaces the opaque JSON checkpoint for `source`.
     pub async fn set_source_checkpoint(&self, source: &str, checkpoint: &Value) -> Result<()> {
+        if source.starts_with("security:") {
+            return Err(StoreError::ConfidentialRecord);
+        }
         let checkpoint = serde_json::to_string(checkpoint)?;
         sqlx::query(
             "INSERT INTO source_checkpoints (source, checkpoint_json) VALUES (?, ?) \
@@ -416,15 +825,19 @@ impl Store {
 
     /// Updates an existing run.
     pub async fn update_run(&self, run: &RunSummary) -> Result<()> {
+        if run.confidential {
+            return Err(StoreError::ConfidentialRecord);
+        }
         let workspace = serialize_optional(run.workspace.as_ref())?;
         let state = serde_json::to_string(&run.state)?;
         let result = sqlx::query(
-            "UPDATE runs SET issue_key = ?, workspace_json = ?, agent = ?, state_json = ?, \
+            "UPDATE runs SET issue_key = ?, workspace_json = ?, agent = ?, model = ?, state_json = ?, \
              message = ?, session_id = ?, started_at = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&run.issue_key)
         .bind(workspace)
         .bind(&run.agent)
+        .bind(&run.model)
         .bind(state)
         .bind(&run.message)
         .bind(&run.session_id)
@@ -446,6 +859,9 @@ impl Store {
         run: &RunSummary,
         events: &[EventEnvelope],
     ) -> Result<()> {
+        if run.confidential {
+            return Err(StoreError::ConfidentialRecord);
+        }
         let workspace = serialize_optional(run.workspace.as_ref())?;
         let state = serde_json::to_string(&run.state)?;
         let mut prepared_events = Vec::with_capacity(events.len());
@@ -457,12 +873,13 @@ impl Store {
 
         let mut transaction = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE runs SET issue_key = ?, workspace_json = ?, agent = ?, state_json = ?, \
+            "UPDATE runs SET issue_key = ?, workspace_json = ?, agent = ?, model = ?, state_json = ?, \
              message = ?, session_id = ?, started_at = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&run.issue_key)
         .bind(workspace)
         .bind(&run.agent)
+        .bind(&run.model)
         .bind(state)
         .bind(&run.message)
         .bind(&run.session_id)
@@ -498,7 +915,7 @@ impl Store {
     /// Loads one run by ID.
     pub async fn load_run(&self, run_id: &str) -> Result<Option<RunSummary>> {
         let row = sqlx::query(
-            "SELECT id, issue_key, workspace_json, agent, state_json, message, session_id, \
+            "SELECT id, issue_key, workspace_json, agent, model, state_json, message, session_id, \
              started_at, updated_at FROM runs WHERE id = ?",
         )
         .bind(run_id)
@@ -510,7 +927,7 @@ impl Store {
     /// Loads all runs, newest update first with ID as a stable tie-breaker.
     pub async fn load_runs(&self) -> Result<Vec<RunSummary>> {
         let rows = sqlx::query(
-            "SELECT id, issue_key, workspace_json, agent, state_json, message, session_id, \
+            "SELECT id, issue_key, workspace_json, agent, model, state_json, message, session_id, \
              started_at, updated_at FROM runs ORDER BY updated_at DESC, id ASC",
         )
         .fetch_all(&self.pool)
@@ -666,6 +1083,7 @@ fn issue_from_row(row: &SqliteRow) -> Result<Issue> {
     let provider = IssueProvider::from_str(&provider)
         .map_err(|_| StoreError::InvalidIssueProvider(provider))?;
     Ok(Issue {
+        security_advisory: None,
         activity: row
             .try_get::<Option<String>, _>("activity_json")?
             .map(|value| serde_json::from_str(&value))
@@ -696,11 +1114,14 @@ fn issue_from_row(row: &SqliteRow) -> Result<Issue> {
 }
 
 async fn write_run(pool: &SqlitePool, run: &RunSummary, upsert: bool) -> Result<()> {
+    if run.confidential {
+        return Err(StoreError::ConfidentialRecord);
+    }
     let workspace = serialize_optional(run.workspace.as_ref())?;
     let state = serde_json::to_string(&run.state)?;
     let conflict = if upsert {
         " ON CONFLICT(id) DO UPDATE SET issue_key = excluded.issue_key, \
-         workspace_json = excluded.workspace_json, agent = excluded.agent, \
+         workspace_json = excluded.workspace_json, agent = excluded.agent, model = excluded.model, \
          state_json = excluded.state_json, message = excluded.message, \
          session_id = excluded.session_id, started_at = excluded.started_at, \
          updated_at = excluded.updated_at"
@@ -708,14 +1129,15 @@ async fn write_run(pool: &SqlitePool, run: &RunSummary, upsert: bool) -> Result<
         ""
     };
     let query = format!(
-        "INSERT INTO runs (id, issue_key, workspace_json, agent, state_json, message, session_id, \
-         started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?){conflict}"
+        "INSERT INTO runs (id, issue_key, workspace_json, agent, model, state_json, message, session_id, \
+         started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?){conflict}"
     );
     sqlx::query(&query)
         .bind(&run.id)
         .bind(&run.issue_key)
         .bind(workspace)
         .bind(&run.agent)
+        .bind(&run.model)
         .bind(state)
         .bind(&run.message)
         .bind(&run.session_id)
@@ -733,10 +1155,12 @@ fn run_from_row(row: &SqliteRow) -> Result<RunSummary> {
         .transpose()?;
     let state = deserialize_json(row, "state_json")?;
     Ok(RunSummary {
+        confidential: false,
         id: row.try_get("id")?,
         issue_key: row.try_get("issue_key")?,
         workspace,
         agent: row.try_get("agent")?,
+        model: row.try_get("model")?,
         state,
         message: row.try_get("message")?,
         session_id: row.try_get("session_id")?,
@@ -1177,6 +1601,7 @@ mod tests {
 
     fn issue(provider: IssueProvider, native_id: &str, title: &str) -> Issue {
         Issue {
+            security_advisory: None,
             pull_request: None,
             activity: None,
             key: IssueKey {
@@ -1200,8 +1625,315 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn security_cache_is_atomic_validated_and_separate_from_normal_loads() {
+        let store = Store::in_memory().await.unwrap();
+        let source = "security:github:example.com:acme/widgets";
+        let public = issue(IssueProvider::Github, "1", "Public");
+        store
+            .replace_issues(
+                "github:example.com:acme/widgets",
+                std::slice::from_ref(&public),
+            )
+            .await
+            .unwrap();
+        let mut private = issue(
+            IssueProvider::Github,
+            "advisory/GHSA-test-test-test",
+            "SECRET TITLE",
+        );
+        private.security_advisory = Some(agent_launcher_core::SecurityAdvisoryMetadata {
+            ghsa_id: "GHSA-test-test-test".into(),
+            cve_id: None,
+            severity: None,
+        });
+        private.description = Some("SECRET BODY".into());
+        let checkpoint = json!({"etag": "old", "last_full_at": "2026-09-13T00:00:00Z"});
+        store
+            .replace_security_cache(source, &[private.clone()], &checkpoint)
+            .await
+            .unwrap();
+        let expected = Some((vec![private.clone()], checkpoint.clone()));
+        assert_eq!(
+            store.load_security_cache::<Value>(source).await.unwrap(),
+            expected
+        );
+        assert_eq!(store.load_issues().await.unwrap(), vec![public.clone()]);
+        assert!(store.source_checkpoint(source).await.unwrap().is_none());
+        for invalid in [
+            "github:example.com:acme/widgets",
+            "security:github:other.com:acme/widgets",
+            "security:github:example.com:other/repo",
+        ] {
+            assert!(
+                store
+                    .replace_security_cache(invalid, &[private.clone()], &checkpoint)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .replace_security_cache(source, &[public], &checkpoint)
+                .await
+                .is_err()
+        );
+        sqlx::raw_sql("CREATE TRIGGER reject_private_update BEFORE UPDATE ON security_advisory_cache BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;")
+            .execute(&store.pool).await.unwrap();
+        assert!(
+            store
+                .replace_security_cache(source, &[], &json!({"etag":"new"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_security_cache::<Value>(source).await.unwrap(),
+            expected
+        );
+        sqlx::raw_sql("DROP TRIGGER reject_private_update")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE security_advisory_cache SET issues_json = ?")
+            .bind("SECRET CORRUPT JSON")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let error = store
+            .load_security_cache::<Value>(source)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("SECRET"));
+        store.clear_security_cache(source).await.unwrap();
+        assert!(
+            store
+                .load_security_cache::<Value>(source)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    fn private_fixture_root() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "security-cache-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn security_cache_disk_permissions_symlinks_and_restart() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = private_fixture_root();
+        let path = root.join("cache.sqlite");
+        let source = "security:github:example.com:acme/widgets";
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        store
+            .replace_security_cache(source, &[], &json!({"etag":"saved"}))
+            .await
+            .unwrap();
+        store.pool.close().await;
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(
+            store.load_security_cache::<Value>(source).await.unwrap(),
+            Some((vec![], json!({"etag":"saved"})))
+        );
+        for (target, insecure, secure) in [(&path, 0o644, 0o600), (&root, 0o755, 0o700)] {
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(insecure)).unwrap();
+            assert!(store.load_security_cache::<Value>(source).await.is_err());
+            assert!(
+                store
+                    .replace_security_cache(source, &[], &json!({}))
+                    .await
+                    .is_err()
+            );
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(secure)).unwrap();
+        }
+        let link = root.join("link.sqlite");
+        symlink(&path, &link).unwrap();
+        assert!(Store::open(&link).await.is_err());
+        let linked_root = root.join("linked-root");
+        symlink(&root, &linked_root).unwrap();
+        assert!(Store::open(linked_root.join("cache.sqlite")).await.is_err());
+        store.pool.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_legacy_database_hardening_is_scoped_and_preserves_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+        for (directory_mode, file_mode) in [
+            (0o700, 0o644),
+            (0o700, 0o640),
+            (0o755, 0o644),
+            (0o700, 0o444),
+        ] {
+            let root = private_fixture_root();
+            let path = root.join("legacy.sqlite");
+            let store = Store::open(&path).await.unwrap();
+            let public = issue(IssueProvider::Github, "1", "Public");
+            store
+                .replace_issues("normal", std::slice::from_ref(&public))
+                .await
+                .unwrap();
+            store.pool.close().await;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(directory_mode))
+                .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(file_mode)).unwrap();
+            let result = Store::open(&path).await;
+            let harden = directory_mode == 0o700 && file_mode != 0o444;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                if harden {
+                    0o600
+                } else {
+                    file_mode
+                }
+            );
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                directory_mode
+            );
+            if file_mode != 0o444 {
+                let store = result.unwrap();
+                assert_eq!(store.load_issues().await.unwrap(), vec![public]);
+                let saved = store
+                    .replace_security_cache(
+                        "security:github:example.com:acme/widgets",
+                        &[],
+                        &json!({"etag":"fresh"}),
+                    )
+                    .await;
+                assert_eq!(saved.is_ok(), harden);
+                store.pool.close().await;
+                if harden {
+                    let reopened = Store::open(&path).await.unwrap();
+                    assert!(
+                        reopened
+                            .load_security_cache::<Value>(
+                                "security:github:example.com:acme/widgets"
+                            )
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                    reopened.pool.close().await;
+                }
+            } else if let Ok(store) = result {
+                assert!(
+                    store
+                        .replace_security_cache(
+                            "security:github:example.com:acme/widgets",
+                            &[],
+                            &json!({})
+                        )
+                        .await
+                        .is_err()
+                );
+                store.pool.close().await;
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revocation_survives_permission_changes_sqlite_failure_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        for fail_delete in [false, true] {
+            let root = private_fixture_root();
+            let path = root.join("cache.sqlite");
+            let source = "security:github:example.com:acme/widgets";
+            let store = Store::open(&path).await.unwrap();
+            store
+                .replace_security_cache(source, &[], &json!({"etag":"old"}))
+                .await
+                .unwrap();
+            if fail_delete {
+                sqlx::raw_sql("CREATE TRIGGER fail_revoke BEFORE DELETE ON security_advisory_cache BEGIN SELECT RAISE(ABORT, 'fixture'); END;").execute(&store.pool).await.unwrap();
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                store.clear_security_cache(source).await.is_err(),
+                fail_delete
+            );
+            let marker = root.join(store.revocation_marker(source));
+            let metadata = std::fs::metadata(&marker).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert_eq!(metadata.len(), 0);
+            assert!(
+                store
+                    .load_security_cache::<Value>(source)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            store.pool.close().await;
+            let reopened = Store::open(&path).await.unwrap();
+            assert!(
+                reopened
+                    .load_security_cache::<Value>(source)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if fail_delete {
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM security_advisory_cache")
+                        .fetch_one(&reopened.pool)
+                        .await
+                        .unwrap(),
+                    1
+                );
+                sqlx::raw_sql("CREATE TRIGGER fail_replace BEFORE UPDATE ON security_advisory_cache BEGIN SELECT RAISE(ABORT, 'fixture'); END;").execute(&reopened.pool).await.unwrap();
+                assert!(
+                    reopened
+                        .replace_security_cache(source, &[], &json!({"etag":"rejected"}))
+                        .await
+                        .is_err()
+                );
+                assert!(marker.exists());
+                sqlx::raw_sql("DROP TRIGGER fail_replace")
+                    .execute(&reopened.pool)
+                    .await
+                    .unwrap();
+            }
+            reopened
+                .replace_security_cache(source, &[], &json!({"etag":"new-live"}))
+                .await
+                .unwrap();
+            assert!(!marker.exists());
+            assert_eq!(
+                reopened.load_security_cache::<Value>(source).await.unwrap(),
+                Some((vec![], json!({"etag":"new-live"})))
+            );
+            reopened.pool.close().await;
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn run(id: &str, updated_at: DateTime<Utc>) -> RunSummary {
         RunSummary {
+            confidential: false,
             id: id.to_string(),
             issue_key: "github:example.com:acme/widgets:1".to_string(),
             workspace: Some(WorkspaceRef {
@@ -1212,12 +1944,59 @@ mod tests {
                 branch: "agent/issue-1".to_string(),
             }),
             agent: "opencode".to_string(),
+            model: None,
             state: RunState::Running,
             message: Some("working".to_string()),
             session_id: Some("session-1".to_string()),
             started_at: timestamp(1_700_000_000),
             updated_at,
         }
+    }
+
+    #[tokio::test]
+    async fn model_migration_and_all_run_writes_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "launcher-model-{}.sqlite",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(&SCHEMA.replace("    model TEXT,\n", ""))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runs (id, issue_key, agent, state_json, started_at, updated_at) VALUES ('old', 'issue', 'opencode', '\"running\"', ?, ?)")
+            .bind(timestamp(100)).bind(timestamp(100)).execute(&pool).await.unwrap();
+        pool.close().await;
+        for _ in 0..2 {
+            let store = Store::open(&path).await.unwrap();
+            assert_eq!(store.load_run("old").await.unwrap().unwrap().model, None);
+            let mut selected = run("selected", timestamp(100));
+            selected.model = Some("openai/gpt-5.4".into());
+            store.upsert_run(&selected).await.unwrap();
+            assert_eq!(
+                store.load_run("selected").await.unwrap(),
+                Some(selected.clone())
+            );
+            selected.model = Some("anthropic/claude-sonnet".into());
+            store.update_run(&selected).await.unwrap();
+            assert_eq!(
+                store.load_run("selected").await.unwrap(),
+                Some(selected.clone())
+            );
+            selected.model = None;
+            store.update_run_with_events(&selected, &[]).await.unwrap();
+            assert_eq!(store.load_run("selected").await.unwrap(), Some(selected));
+            store.pool.close().await;
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -1248,6 +2027,73 @@ mod tests {
         expected.sort_by_key(|value| value.key.canonical());
         assert_eq!(loaded, expected);
         assert!(!loaded.contains(&github_one));
+    }
+
+    #[tokio::test]
+    async fn confidential_records_never_enter_sqlite_or_purge_normal_cache() {
+        let store = Store::in_memory().await.unwrap();
+        let ordinary = issue(IssueProvider::Github, "1", "public title");
+        store
+            .replace_issues(
+                "github:example.com:acme/widgets",
+                std::slice::from_ref(&ordinary),
+            )
+            .await
+            .unwrap();
+        let mut private = ordinary.clone();
+        private.title = "SECRET ADVISORY BODY".into();
+        private.security_advisory = Some(agent_launcher_core::SecurityAdvisoryMetadata {
+            ghsa_id: "GHSA-test-test-test".into(),
+            cve_id: None,
+            severity: None,
+        });
+        for source in [
+            "github:example.com:acme/widgets",
+            "security:github:example.com:acme/widgets",
+        ] {
+            assert!(matches!(
+                store
+                    .replace_issues(source, &[ordinary.clone(), private.clone()])
+                    .await,
+                Err(StoreError::ConfidentialRecord)
+            ));
+            assert!(matches!(
+                store
+                    .upsert_issues(source, &[ordinary.clone(), private.clone()])
+                    .await,
+                Err(StoreError::ConfidentialRecord)
+            ));
+        }
+        assert_eq!(store.load_issues().await.unwrap(), vec![ordinary]);
+        assert!(matches!(
+            store
+                .set_source_checkpoint(
+                    "security:github:example.com:acme/widgets",
+                    &json!({"secret": "body"})
+                )
+                .await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        let mut private_run = run("private", timestamp(100));
+        private_run.confidential = true;
+        private_run.message = Some("SECRET RUN OUTPUT".into());
+        assert!(matches!(
+            store.insert_run(&private_run).await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        assert!(matches!(
+            store.upsert_run(&private_run).await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        assert!(matches!(
+            store.update_run(&private_run).await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        assert!(matches!(
+            store.update_run_with_events(&private_run, &[]).await,
+            Err(StoreError::ConfidentialRecord)
+        ));
+        assert!(store.load_runs().await.unwrap().is_empty());
     }
 
     #[tokio::test]

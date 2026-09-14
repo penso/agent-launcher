@@ -11,8 +11,11 @@ chrono.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 fuzzy-matcher.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 serde_json.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+unicode-segmentation = "1.12"
+unicode-width = "0.2"

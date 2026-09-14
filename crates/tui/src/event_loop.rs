@@ -1,15 +1,15 @@
 use std::{future::Future, io, time::Duration};
 
 use agent_launcher_core::{
-    BackendKind, ComputeTargetAvailability, RunEvent, RunState, RuntimeSnapshot,
-    WorktreeDeletePreview,
+    BackendKind, ComputeTargetAvailability, DispatchOptions, ModelSelection, RunEvent, RunState,
+    RuntimeSnapshot, WorktreeDeletePreview,
 };
 use agent_launcher_runtime::RuntimeHandle;
 use crossterm::{
     cursor::Show,
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
     style::Print,
@@ -40,6 +40,16 @@ const POP_TITLE: Print<&str> = Print("\x1b[23;0t");
 const LAUNCHER_TITLE: SetTitle<&str> = SetTitle("launcher");
 
 enum UiActionResult {
+    Security {
+        request_id: u64,
+        result: agent_launcher_runtime::Result<()>,
+    },
+    Prompt {
+        request_id: u64,
+        issue_key: agent_launcher_core::IssueKey,
+        name: String,
+        result: Result<PromptReply, String>,
+    },
     IssueDelete {
         issue_key: agent_launcher_core::IssueKey,
         result: agent_launcher_runtime::Result<()>,
@@ -55,6 +65,12 @@ enum UiActionResult {
     },
 }
 
+enum PromptReply {
+    Preview(String),
+    Loaded(agent_launcher_runtime::PromptDocument),
+    Saved(agent_launcher_runtime::PromptDocument),
+}
+
 type UiActionSender = tokio::sync::mpsc::UnboundedSender<UiActionResult>;
 
 /// Runs the interactive terminal UI against a live runtime handle.
@@ -63,7 +79,12 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     enable_raw_mode()?;
 
     let mut output = io::stdout();
-    execute!(output, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        output,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     execute!(output, PUSH_TITLE)?;
     cleanup.title_saved = true;
     execute!(output, LAUNCHER_TITLE)?;
@@ -102,6 +123,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     let mut needs_draw = true;
 
     loop {
+        ensure_prompt_preview(&mut app, &runtime, &action_tx);
         if needs_draw {
             terminal.draw(|frame| draw(frame, &snapshot, &mut app))?;
             needs_draw = false;
@@ -110,11 +132,11 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                        if app.issue_delete_overlay.is_some()
-                            && crossterm::terminal::size().ok()
+                        if crossterm::terminal::size().ok()
                                 != Some((app.mouse.screen.width, app.mouse.screen.height))
                         {
                             app.issue_delete_confirmation_visible = false;
+                            app.security_confirmation_visible = false;
                         }
                         let should_quit = handle_key(
                             &mut app,
@@ -127,6 +149,9 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                             break;
                         }
                         needs_draw = true;
+                    },
+                    Some(Ok(Event::Paste(text))) => {
+                        needs_draw |= handle_paste(&mut app, &text);
                     },
                     Some(Ok(Event::Mouse(mouse))) => {
                         // Query the live size too: a mouse event can precede a queued resize.
@@ -143,6 +168,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                     Some(Ok(Event::Resize(_, _))) => {
                         app.mouse = Default::default();
                         app.issue_delete_confirmation_visible = false;
+                        app.security_confirmation_visible = false;
                         needs_draw = true;
                     },
                     Some(Ok(_)) => {},
@@ -177,6 +203,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
             }
             Some(result) = action_rx.recv() => {
                 apply_ui_action_result(&mut app, result);
+                app.reconcile_dispatch(&snapshot);
                 needs_draw = true;
             }
             signal = &mut termination => {
@@ -339,8 +366,12 @@ fn handle_list_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot
     let count = app.rows(snapshot).len();
     match key.code {
         KeyCode::Esc => return true,
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             app.switch_tab();
+            app.status_message = None;
+        },
+        KeyCode::BackTab => {
+            app.set_tab(app.tab.previous());
             app.status_message = None;
         },
         KeyCode::Enter => {
@@ -513,9 +544,10 @@ fn open_issue_delete(app: &mut AppState, snapshot: &RuntimeSnapshot) {
     };
     if issue.key.provider != agent_launcher_core::IssueProvider::Beads
         || issue.pull_request.is_some()
+        || issue.security_advisory.is_some()
     {
         app.status_message = Some(
-            "Unsupported: use provider tools. Source deletion supports Beads issues only, not PRs; closing is not deletion.".into(),
+            "Unsupported: use provider tools. Source deletion supports Beads issues only, not PRs or private advisories; closing is not deletion.".into(),
         );
         return;
     }
@@ -639,6 +671,161 @@ fn handle_input_key(
     false
 }
 
+fn ensure_prompt_preview(app: &mut AppState, runtime: &RuntimeHandle, actions: &UiActionSender) {
+    if app.dispatch_overlay.as_ref().is_some_and(|o| {
+        o.stage == DispatchStage::Prompt
+            && o.prompt.editor.is_none()
+            && o.prompt.request.is_none()
+            && o.prompt.preview.is_none()
+    }) {
+        prompt_request(app, runtime, actions, None, true);
+    }
+}
+
+fn handle_paste(app: &mut AppState, text: &str) -> bool {
+    if let Some(editor) = app
+        .dispatch_overlay
+        .as_mut()
+        .and_then(|o| o.settings.model_editor.as_mut())
+    {
+        editor.insert(&text.chars().filter(|c| !c.is_control()).collect::<String>());
+        return true;
+    }
+    if let Some(editor) = app
+        .dispatch_overlay
+        .as_mut()
+        .and_then(|o| o.prompt.editor.as_mut())
+        && !editor.busy
+        && !editor.discard
+    {
+        if editor.naming {
+            editor.name.extend(text.chars().filter(|c| !c.is_control()));
+        } else {
+            editor.buffer.insert(text);
+        }
+        return true;
+    }
+    false
+}
+
+fn prompt_request(
+    app: &mut AppState,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+    save: Option<(String, Option<String>)>,
+    preview: bool,
+) {
+    let Some(overlay) = app.dispatch_overlay.as_mut() else {
+        return;
+    };
+    app.next_request_id = app.next_request_id.wrapping_add(1);
+    let request_id = app.next_request_id;
+    overlay.prompt.request = Some(request_id);
+    overlay.prompt.loading_source = save.is_none() && !preview;
+    let issue_key = overlay.issue_key.clone();
+    let name = overlay
+        .prompt
+        .editor
+        .as_ref()
+        .map_or_else(|| overlay.prompt.name.clone(), |e| e.name.clone());
+    let runtime = runtime.clone();
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let result = if let Some((source, expected)) = save {
+            runtime
+                .save_prompt(name.clone(), source, expected)
+                .await
+                .map(PromptReply::Saved)
+        } else if preview {
+            runtime
+                .load_prompt(name.clone())
+                .await
+                .map(|document| PromptReply::Preview(document.source))
+        } else {
+            runtime
+                .load_prompt(name.clone())
+                .await
+                .map(PromptReply::Loaded)
+        }
+        .map_err(|error| error.to_string());
+        let _ = actions.send(UiActionResult::Prompt {
+            request_id,
+            issue_key,
+            name,
+            result,
+        });
+    });
+}
+
+fn edit_prompt(
+    view: &mut crate::app::PromptView,
+    key: KeyEvent,
+) -> Option<(String, Option<String>)> {
+    let editor = view.editor.as_mut()?;
+    if editor.busy {
+        return None;
+    }
+    if view.error.is_some() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        view.scroll = if key.code == KeyCode::PageUp {
+            view.scroll.saturating_sub(8)
+        } else {
+            view.scroll.saturating_add(8).min(view.scroll_max)
+        };
+        return None;
+    }
+    if editor.discard {
+        match key.code {
+            KeyCode::Char('y') => {
+                view.editor = None;
+                view.request = None;
+                view.error = None;
+            },
+            KeyCode::Esc | KeyCode::Char('n') => editor.discard = false,
+            _ => {},
+        }
+        return None;
+    }
+    if key.code == KeyCode::Esc {
+        if editor.original.as_deref() != Some(editor.buffer.text.as_str()) {
+            editor.discard = true;
+        } else {
+            view.editor = None;
+            view.error = None;
+        }
+        return None;
+    }
+    if key.code == KeyCode::Char('n')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && editor.original.is_none()
+    {
+        editor.naming = true;
+        return None;
+    }
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && editor.original.is_none() {
+        editor.naming = !editor.naming;
+        return None;
+    }
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let save = (editor.buffer.text.clone(), editor.original.clone());
+        editor.busy = true;
+        view.error = None;
+        return Some(save);
+    }
+    if editor.naming {
+        match key.code {
+            KeyCode::Enter => editor.naming = false,
+            KeyCode::Backspace => {
+                editor.name.pop();
+            },
+            KeyCode::Char(c) if printable(c, key.modifiers) => editor.name.push(c),
+            _ => {},
+        }
+        return None;
+    }
+    editor.buffer.key(key);
+    None
+}
+
 fn dispatch_selected(
     app: &mut AppState,
     snapshot: &RuntimeSnapshot,
@@ -651,7 +838,19 @@ fn dispatch_selected(
 }
 
 fn prepare_dispatch(app: &mut AppState, snapshot: &RuntimeSnapshot) -> Option<LaunchAction> {
+    if app.security_launch_pending.is_some() {
+        app.status_message = Some("private dispatch is still pending".into());
+        return None;
+    }
     let issue_key = dispatch_target(app, snapshot)?;
+    if is_security(snapshot, &issue_key) && !security_supported(snapshot) {
+        app.status_message = Some("Private dispatch requires local Native (no compute targets) or Herdr. No automatic public fallback.".into());
+        return None;
+    }
+    if is_security(snapshot, &issue_key) && !security_ready(snapshot, &issue_key) {
+        app.status_message = Some("Private advisory is read-only here: accept triage reports on GitHub manually first; only draft advisories can be dispatched.".into());
+        return None;
+    }
     if let Some(run) = snapshot.runs.iter().find(|run| {
         run.issue_key == issue_key.canonical()
             && (run.state.is_active()
@@ -663,18 +862,16 @@ fn prepare_dispatch(app: &mut AppState, snapshot: &RuntimeSnapshot) -> Option<La
     }) {
         app.status_message = Some(if run.state.is_active() {
             "run already active".to_owned()
+        } else if is_security(snapshot, &issue_key) {
+            "private run retained; open its harness to review. Separate private-clone cleanup is unavailable".into()
         } else {
             "existing native run must be resumed or deleted before dispatching again".to_owned()
         });
         return None;
     }
-    if let Some(overlay) = staged_dispatch_overlay(issue_key.clone(), snapshot) {
-        app.status_message = None;
-        app.dispatch_overlay = Some(overlay);
-        return None;
-    }
-    let profile = snapshot.prompt_profiles.first().cloned();
-    Some(launch_action(snapshot, issue_key, profile, None))
+    app.status_message = None;
+    app.dispatch_overlay = staged_dispatch_overlay(issue_key, snapshot);
+    None
 }
 
 fn is_pull_request(snapshot: &RuntimeSnapshot, key: &agent_launcher_core::IssueKey) -> bool {
@@ -684,25 +881,69 @@ fn is_pull_request(snapshot: &RuntimeSnapshot, key: &agent_launcher_core::IssueK
         .any(|issue| issue.key == *key && issue.pull_request.is_some())
 }
 
+fn is_security(snapshot: &RuntimeSnapshot, key: &agent_launcher_core::IssueKey) -> bool {
+    snapshot
+        .issues
+        .iter()
+        .any(|issue| issue.key == *key && issue.security_advisory.is_some())
+}
+
+fn security_supported(snapshot: &RuntimeSnapshot) -> bool {
+    snapshot.selected_backend == Some(BackendKind::Herdr)
+        || (snapshot.selected_backend == Some(BackendKind::Native)
+            && snapshot.compute_targets.is_empty())
+}
+
+fn security_ready(snapshot: &RuntimeSnapshot, key: &agent_launcher_core::IssueKey) -> bool {
+    snapshot.issues.iter().any(|issue| {
+        issue.key == *key && issue.security_advisory.is_some() && issue.state == "draft"
+    })
+}
+
 fn staged_dispatch_overlay(
     issue_key: agent_launcher_core::IssueKey,
     snapshot: &RuntimeSnapshot,
 ) -> Option<DispatchOverlay> {
     let review = is_pull_request(snapshot, &issue_key);
-    let stage = if !review && snapshot.prompt_profiles.len() > 1 {
+    let security = is_security(snapshot, &issue_key);
+    let stage = if security {
+        DispatchStage::Settings {
+            profile: None,
+            target: None,
+        }
+    } else if !review {
         DispatchStage::Prompt
     } else if has_target_stage(snapshot) {
-        DispatchStage::Target {
-            profile: if review {
-                None
-            } else {
-                snapshot.prompt_profiles.first().cloned()
-            },
-        }
+        DispatchStage::Target { profile: None }
     } else {
-        return None;
+        DispatchStage::Settings {
+            profile: None,
+            target: None,
+        }
     };
     Some(DispatchOverlay {
+        settings: crate::app::LaunchSettings {
+            backend: snapshot.selected_backend,
+            default_harness: snapshot.selected_agent.clone(),
+            default_model: snapshot.selected_model.clone(),
+            target_choices: snapshot
+                .compute_targets
+                .iter()
+                .map(|t| t.id.clone())
+                .collect(),
+            had_targets: has_target_stage(snapshot),
+            review,
+            security,
+            ..Default::default()
+        },
+        prompt: crate::app::PromptView {
+            name: snapshot
+                .prompt_profiles
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            ..Default::default()
+        },
         issue_key,
         cursor: 0,
         stage,
@@ -716,9 +957,130 @@ fn handle_dispatch_key(
     runtime: &RuntimeHandle,
     actions: &UiActionSender,
 ) -> bool {
+    match dispatch_key(app, key, snapshot) {
+        DispatchEffect::None => {},
+        DispatchEffect::Load => prompt_request(app, runtime, actions, None, false),
+        DispatchEffect::Save(source, expected) => {
+            prompt_request(app, runtime, actions, Some((source, expected)), false);
+        },
+        DispatchEffect::Select(index) => {
+            dispatch_from_overlay(app, snapshot, runtime, actions, index)
+        },
+    }
+    false
+}
+
+#[derive(Debug, PartialEq)]
+enum DispatchEffect {
+    None,
+    Load,
+    Save(String, Option<String>),
+    Select(usize),
+}
+
+fn dispatch_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot) -> DispatchEffect {
+    if app
+        .dispatch_overlay
+        .as_ref()
+        .is_some_and(|o| o.settings.privacy_confirmation)
+    {
+        match key.code {
+            KeyCode::Esc => {
+                app.dispatch_overlay = None;
+                app.security_confirmation_visible = false;
+            },
+            KeyCode::Char('y')
+                if key.kind == KeyEventKind::Press
+                    && key.modifiers.is_empty()
+                    && app.security_confirmation_visible =>
+            {
+                return DispatchEffect::Select(0);
+            },
+            KeyCode::Enter | KeyCode::Char('y') => {
+                app.status_message = Some("Review the full privacy warning; resize if needed, then press y to consent. Enter never consents.".into());
+            },
+            _ => {},
+        }
+        return DispatchEffect::None;
+    }
+    if app
+        .dispatch_overlay
+        .as_ref()
+        .is_some_and(|o| matches!(o.stage, DispatchStage::Settings { .. }))
+    {
+        return settings_key(app, key);
+    }
     let option_count = dispatch_option_count(app, snapshot);
+    if let Some(view) = app.dispatch_overlay.as_mut().map(|o| &mut o.prompt)
+        && view.editor.is_some()
+    {
+        return edit_prompt(view, key).map_or(DispatchEffect::None, |(source, expected)| {
+            DispatchEffect::Save(source, expected)
+        });
+    }
+    let prompt_stage = app
+        .dispatch_overlay
+        .as_ref()
+        .is_some_and(|o| o.stage == DispatchStage::Prompt);
+    if prompt_stage {
+        match key.code {
+            KeyCode::Char('a') => {
+                let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+                view.request = None;
+                view.error = None;
+                view.editor = Some(crate::app::PromptEditor {
+                    name: String::new(),
+                    naming: true,
+                    buffer: crate::widgets::editor::Editor::new(
+                        "{{ issue_title }}\n\n{{ issue_text }}".into(),
+                    ),
+                    original: None,
+                    discard: false,
+                    busy: false,
+                });
+                return DispatchEffect::None;
+            },
+            KeyCode::Char('e') => {
+                let view = &app.dispatch_overlay.as_ref().unwrap().prompt;
+                if !(view.name.is_empty() || view.loading_source && view.request.is_some()) {
+                    return DispatchEffect::Load;
+                }
+                return DispatchEffect::None;
+            },
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+                view.scroll = if key.code == KeyCode::PageUp {
+                    view.scroll.saturating_sub(8)
+                } else {
+                    view.scroll.saturating_add(8).min(view.scroll_max)
+                };
+                return DispatchEffect::None;
+            },
+            KeyCode::Char('r') => {
+                let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+                view.request = None;
+                view.preview = None;
+                view.error = None;
+                return DispatchEffect::None;
+            },
+            _ => {},
+        }
+    }
     match key.code {
-        KeyCode::Esc => app.dispatch_overlay = None,
+        KeyCode::Esc => {
+            let overlay = app.dispatch_overlay.as_mut().unwrap();
+            if matches!(overlay.stage, DispatchStage::Target { .. }) && !overlay.settings.review {
+                overlay.settings.target_cursor = overlay.cursor;
+                overlay.stage = DispatchStage::Prompt;
+                overlay.cursor = snapshot
+                    .prompt_profiles
+                    .iter()
+                    .position(|p| *p == overlay.prompt.name)
+                    .unwrap_or(0);
+            } else {
+                app.dispatch_overlay = None;
+            }
+        },
         KeyCode::Up if option_count > 0 => move_dispatch_cursor(app, snapshot, false),
         KeyCode::Down if option_count > 0 => move_dispatch_cursor(app, snapshot, true),
         KeyCode::Char(character @ '1'..='9') => {
@@ -726,20 +1088,119 @@ fn handle_dispatch_key(
             if index < option_count {
                 if let Some(overlay) = app.dispatch_overlay.as_mut() {
                     overlay.cursor = index;
+                    if prompt_stage {
+                        overlay.prompt.name = snapshot
+                            .prompt_profiles
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_default();
+                        overlay.prompt.preview = None;
+                        overlay.prompt.request = None;
+                        overlay.prompt.error = None;
+                        overlay.prompt.scroll = 0;
+                    }
                 }
-                dispatch_from_overlay(app, snapshot, runtime, actions, index);
+                if !prompt_stage {
+                    return DispatchEffect::Select(index);
+                }
             }
         },
         KeyCode::Enter if option_count > 0 => {
+            if let Some(overlay) = &app.dispatch_overlay
+                && prompt_stage
+                && (overlay.prompt.request.is_some()
+                    || !matches!(overlay.prompt.preview, Some(Ok(_)))
+                    || snapshot
+                        .prompt_profiles
+                        .get(overlay.cursor)
+                        .map(String::as_str)
+                        .unwrap_or("")
+                        != overlay.prompt.name)
+            {
+                return DispatchEffect::None;
+            }
             let index = app
                 .dispatch_overlay
                 .as_ref()
                 .map_or(0, |overlay| overlay.cursor.min(option_count - 1));
-            dispatch_from_overlay(app, snapshot, runtime, actions, index);
+            return DispatchEffect::Select(index);
         },
         _ => {},
     }
-    false
+    DispatchEffect::None
+}
+
+fn settings_key(app: &mut AppState, key: KeyEvent) -> DispatchEffect {
+    let overlay = app.dispatch_overlay.as_mut().unwrap();
+    let settings = &mut overlay.settings;
+    if let Some(editor) = &mut settings.model_editor {
+        match key.code {
+            KeyCode::PageUp => settings.scroll = settings.scroll.saturating_sub(8),
+            KeyCode::PageDown => {
+                settings.scroll = settings.scroll.saturating_add(8).min(settings.scroll_max)
+            },
+            KeyCode::Esc => settings.model_editor = None,
+            KeyCode::Enter => {
+                if editor.text.trim().is_empty() {
+                    app.status_message =
+                        Some("Custom model cannot be empty; choose Harness default instead".into());
+                } else {
+                    settings.options.model = ModelSelection::Explicit(editor.text.trim().into());
+                    settings.model_editor = None;
+                    app.status_message = None;
+                }
+            },
+            _ => editor.key(key),
+        }
+        return DispatchEffect::None;
+    }
+    match key.code {
+        KeyCode::PageUp => settings.scroll = settings.scroll.saturating_sub(8),
+        KeyCode::PageDown => {
+            settings.scroll = settings.scroll.saturating_add(8).min(settings.scroll_max)
+        },
+        KeyCode::Char('h') => {
+            let choices = settings.harness_choices();
+            if !choices.is_empty() {
+                settings.options.harness = match settings.options.harness.as_deref() {
+                    None => Some(choices[0].into()),
+                    Some(current) => choices
+                        .iter()
+                        .position(|h| *h == current)
+                        .and_then(|i| choices.get(i + 1))
+                        .map(|h| (*h).into()),
+                };
+                settings.options.model = ModelSelection::HarnessDefault;
+            }
+        },
+        KeyCode::Char('1') => settings.options.model = ModelSelection::Inherit,
+        KeyCode::Char('2') => settings.options.model = ModelSelection::HarnessDefault,
+        KeyCode::Char('3') | KeyCode::Char('m') => {
+            let text = match &settings.options.model {
+                ModelSelection::Explicit(model) => model.clone(),
+                _ => String::new(),
+            };
+            let cursor = text.len();
+            settings.model_editor = Some(crate::widgets::editor::Editor { text, cursor });
+        },
+        KeyCode::Enter if key.kind == KeyEventKind::Press => return DispatchEffect::Select(0),
+        KeyCode::Esc => {
+            if let DispatchStage::Settings { profile, .. } = &overlay.stage {
+                if settings.had_targets {
+                    overlay.stage = DispatchStage::Target {
+                        profile: profile.clone(),
+                    };
+                    overlay.cursor = settings.target_cursor;
+                } else if !settings.review && !settings.security {
+                    overlay.stage = DispatchStage::Prompt;
+                } else {
+                    app.dispatch_overlay = None;
+                }
+            }
+        },
+        _ => {},
+    }
+    DispatchEffect::None
 }
 
 fn dispatch_from_overlay(
@@ -749,6 +1210,20 @@ fn dispatch_from_overlay(
     actions: &UiActionSender,
     index: usize,
 ) {
+    if let Some(overlay) = &app.dispatch_overlay
+        && overlay.stage == DispatchStage::Prompt
+        && (overlay.prompt.editor.is_some()
+            || overlay.prompt.request.is_some()
+            || !matches!(overlay.prompt.preview, Some(Ok(_)))
+            || snapshot
+                .prompt_profiles
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("")
+                != overlay.prompt.name)
+    {
+        return;
+    }
     if let Some(action) = select_dispatch(app, snapshot, index) {
         start_launch(app, runtime, actions, action);
     }
@@ -762,19 +1237,66 @@ fn select_dispatch(
     let stage = app.dispatch_overlay.as_ref()?.stage.clone();
     match stage {
         DispatchStage::Prompt => {
-            let (issue_key, profile) = select_prompt(app, snapshot, index)?;
-            Some(launch_action(snapshot, issue_key, Some(profile), None))
+            select_prompt(app, snapshot, index);
+            None
         },
         DispatchStage::Target { profile } => {
             let target = select_target(app, snapshot, index).ok()?;
-            let issue_key = app
-                .dispatch_overlay
-                .as_ref()
-                .expect("overlay exists")
-                .issue_key
-                .clone();
-            app.dispatch_overlay = None;
-            Some(launch_action(snapshot, issue_key, profile, target))
+            let overlay = app.dispatch_overlay.as_mut()?;
+            overlay.settings.target_cursor = index;
+            overlay.stage = DispatchStage::Settings { profile, target };
+            app.status_message = None;
+            None
+        },
+        DispatchStage::Settings { profile, target } => {
+            let overlay = app.dispatch_overlay.as_ref()?;
+            if overlay.settings.model_editor.is_some() {
+                return None;
+            }
+            if snapshot.selected_backend != overlay.settings.backend
+                || snapshot.selected_agent != overlay.settings.default_harness
+                || snapshot.selected_model != overlay.settings.default_model
+            {
+                app.status_message = Some("Dispatch defaults changed; cancel and reopen the chooser to review the new configuration".into());
+                if overlay.settings.security {
+                    app.dispatch_overlay = None;
+                    app.security_confirmation_visible = false;
+                }
+                return None;
+            }
+            if overlay.settings.security {
+                if !security_ready(snapshot, &overlay.issue_key) || !security_supported(snapshot) {
+                    app.dispatch_overlay = None;
+                    app.security_confirmation_visible = false;
+                    app.status_message = Some("Private dispatch unavailable; no automatic public fallback. Reopen after reviewing configuration.".into());
+                    return None;
+                }
+                if !overlay.settings.privacy_confirmation {
+                    app.dispatch_overlay.as_mut()?.settings.privacy_confirmation = true;
+                    app.security_confirmation_visible = false;
+                    app.status_message = None;
+                    return None;
+                }
+                if !app.security_confirmation_visible || app.security_launch_pending.is_some() {
+                    return None;
+                }
+                let mut overlay = app.dispatch_overlay.take()?;
+                app.security_confirmation_visible = false;
+                overlay.settings.options.expected_backend = overlay.settings.backend;
+                return Some(LaunchAction::Security {
+                    issue: overlay.issue_key,
+                    options: overlay.settings.options,
+                });
+            }
+            let mut overlay = app.dispatch_overlay.take()?;
+            overlay.settings.options.expected_backend = overlay.settings.backend;
+            Some(launch_action(
+                overlay.settings.review,
+                overlay.issue_key,
+                profile,
+                target,
+                overlay.settings.options,
+            ))
         },
     }
 }
@@ -811,23 +1333,27 @@ fn select_prompt(
     app: &mut AppState,
     snapshot: &RuntimeSnapshot,
     index: usize,
-) -> Option<(agent_launcher_core::IssueKey, String)> {
-    let Some(profile) = snapshot.prompt_profiles.get(index).cloned() else {
+) -> Option<(agent_launcher_core::IssueKey, Option<String>)> {
+    if app.dispatch_overlay.as_ref()?.prompt.editor.is_some() {
+        return None;
+    }
+    let profile = snapshot.prompt_profiles.get(index).cloned();
+    if profile.is_none() && !(snapshot.prompt_profiles.is_empty() && index == 0) {
         app.status_message = Some("selected prompt profile is no longer available".into());
         return None;
-    };
+    }
     let overlay = app.dispatch_overlay.as_mut()?;
-    if has_target_stage(snapshot) {
-        overlay.cursor = 0;
-        overlay.stage = DispatchStage::Target {
-            profile: Some(profile),
-        };
+    if overlay.settings.had_targets {
+        overlay.cursor = overlay.settings.target_cursor;
+        overlay.stage = DispatchStage::Target { profile };
         app.status_message = None;
         None
     } else {
-        let issue_key = overlay.issue_key.clone();
-        app.dispatch_overlay = None;
-        Some((issue_key, profile))
+        overlay.stage = DispatchStage::Settings {
+            profile,
+            target: None,
+        };
+        None
     }
 }
 
@@ -839,8 +1365,9 @@ fn dispatch_option_count(app: &AppState, snapshot: &RuntimeSnapshot) -> usize {
     app.dispatch_overlay
         .as_ref()
         .map_or(0, |overlay| match &overlay.stage {
-            DispatchStage::Prompt => snapshot.prompt_profiles.len(),
+            DispatchStage::Prompt => snapshot.prompt_profiles.len().max(1),
             DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
+            DispatchStage::Settings { .. } => 1,
         })
 }
 
@@ -849,8 +1376,9 @@ fn move_dispatch_cursor(app: &mut AppState, snapshot: &RuntimeSnapshot, forward:
         return;
     };
     let count = match &overlay.stage {
-        DispatchStage::Prompt => snapshot.prompt_profiles.len(),
+        DispatchStage::Prompt => snapshot.prompt_profiles.len().max(1),
         DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
+        DispatchStage::Settings { .. } => 1,
     };
     for distance in 1..=count {
         let candidate = if forward {
@@ -859,7 +1387,7 @@ fn move_dispatch_cursor(app: &mut AppState, snapshot: &RuntimeSnapshot, forward:
             (overlay.cursor + count - distance % count) % count
         };
         let enabled = match &overlay.stage {
-            DispatchStage::Prompt => true,
+            DispatchStage::Prompt | DispatchStage::Settings { .. } => true,
             DispatchStage::Target { .. } if candidate == 0 => snapshot
                 .compute_targets
                 .iter()
@@ -870,6 +1398,17 @@ fn move_dispatch_cursor(app: &mut AppState, snapshot: &RuntimeSnapshot, forward:
         };
         if enabled {
             overlay.cursor = candidate;
+            if overlay.stage == DispatchStage::Prompt {
+                overlay.prompt.name = snapshot
+                    .prompt_profiles
+                    .get(candidate)
+                    .cloned()
+                    .unwrap_or_default();
+                overlay.prompt.preview = None;
+                overlay.prompt.request = None;
+                overlay.prompt.error = None;
+                overlay.prompt.scroll = 0;
+            }
             break;
         }
     }
@@ -895,30 +1434,42 @@ fn target_unavailable_message(target: &agent_launcher_core::ComputeTargetStatus)
 
 #[derive(Debug, Eq, PartialEq)]
 enum LaunchAction {
+    Security {
+        issue: agent_launcher_core::IssueKey,
+        options: DispatchOptions,
+    },
     Review {
         issue: agent_launcher_core::IssueKey,
         target: Option<String>,
+        options: DispatchOptions,
     },
     Dispatch {
         issue: agent_launcher_core::IssueKey,
         profile: Option<String>,
         target: Option<String>,
+        options: DispatchOptions,
     },
 }
 
 fn launch_action(
-    snapshot: &RuntimeSnapshot,
+    review: bool,
     issue: agent_launcher_core::IssueKey,
     profile: Option<String>,
     target: Option<String>,
+    options: DispatchOptions,
 ) -> LaunchAction {
-    if is_pull_request(snapshot, &issue) {
-        LaunchAction::Review { issue, target }
+    if review {
+        LaunchAction::Review {
+            issue,
+            target,
+            options,
+        }
     } else {
         LaunchAction::Dispatch {
             issue,
             profile,
             target,
+            options,
         }
     }
 }
@@ -929,12 +1480,32 @@ fn start_launch(
     actions: &UiActionSender,
     action: LaunchAction,
 ) {
-    let (issue, profile, target) = match action {
-        LaunchAction::Review { issue, target } => {
+    let (issue, profile, target, options) = match action {
+        LaunchAction::Security { issue, options } => {
+            if app.security_launch_pending.is_some() {
+                return;
+            }
+            app.next_request_id = app.next_request_id.wrapping_add(1);
+            let request_id = app.next_request_id;
+            app.security_launch_pending = Some(request_id);
+            app.status_message = Some("starting private security review...".into());
+            let runtime = runtime.clone();
+            let actions = actions.clone();
+            tokio::spawn(async move {
+                let result = runtime.dispatch_security(issue, options, true).await;
+                let _ = actions.send(UiActionResult::Security { request_id, result });
+            });
+            return;
+        },
+        LaunchAction::Review {
+            issue,
+            target,
+            options,
+        } => {
             app.status_message = Some("starting PR review...".to_owned());
             let runtime = runtime.clone();
             spawn_runtime_action(actions, "PR review started", None, async move {
-                runtime.review(issue, target).await
+                runtime.review_with_options(issue, target, options).await
             });
             return;
         },
@@ -942,7 +1513,8 @@ fn start_launch(
             issue,
             profile,
             target,
-        } => (issue, profile, target),
+            options,
+        } => (issue, profile, target, options),
     };
     let status = match (profile.as_deref(), target.as_deref()) {
         (Some(profile), Some(target)) => format!("dispatching {profile} on {target}..."),
@@ -953,11 +1525,9 @@ fn start_launch(
     app.status_message = Some(status);
     let runtime = runtime.clone();
     spawn_runtime_action(actions, "agent dispatched", None, async move {
-        if target.is_some() {
-            runtime.dispatch_on_target(issue, profile, target).await
-        } else {
-            runtime.dispatch(issue, profile).await
-        }
+        runtime
+            .dispatch_with_options(issue, profile, target, options)
+            .await
     });
 }
 
@@ -1044,6 +1614,14 @@ fn open_delete(
     let Some(issue) = selected_action_issue(app, snapshot) else {
         return;
     };
+    if issue.security_advisory.is_some()
+        || app
+            .latest_run(snapshot, issue)
+            .is_some_and(|run| run.confidential)
+    {
+        app.status_message = Some("Private clone retained. Separate private-clone cleanup is unavailable; normal worktree deletion is blocked.".into());
+        return;
+    }
     let Some(run_id) = app.latest_run(snapshot, issue).map(|run| run.id.clone()) else {
         app.status_message = Some("no worktree to delete".to_owned());
         return;
@@ -1074,7 +1652,9 @@ fn selected_action_issue<'a>(
         Route::Detail => app.detail_issue(snapshot),
     };
     if issue.is_none() {
-        app.status_message = Some(if app.tab == crate::app::InboxTab::PullRequests {
+        app.status_message = Some(if app.tab == crate::app::InboxTab::Security {
+            "no private advisory selected".to_owned()
+        } else if app.tab == crate::app::InboxTab::PullRequests {
             "no PR selected".to_owned()
         } else {
             "no issue selected".to_owned()
@@ -1108,6 +1688,72 @@ fn spawn_runtime_action(
 
 fn apply_ui_action_result(app: &mut AppState, result: UiActionResult) {
     match result {
+        UiActionResult::Security { request_id, result } => {
+            if app.security_launch_pending != Some(request_id) {
+                return;
+            }
+            app.security_launch_pending = None;
+            // Runtime errors can contain provider response bodies. Keep this status generic.
+            app.status_message = Some(if result.is_ok() {
+                "private security review started"
+            } else {
+                "private security dispatch failed; check advisory access and local backend configuration (no public fallback)"
+            }.into());
+        },
+        UiActionResult::Prompt {
+            request_id,
+            issue_key,
+            name,
+            result,
+        } => {
+            let Some(overlay) = app.dispatch_overlay.as_mut() else {
+                return;
+            };
+            let view = &mut overlay.prompt;
+            let current_name = view
+                .editor
+                .as_ref()
+                .map_or(view.name.as_str(), |e| e.name.as_str());
+            if overlay.stage != DispatchStage::Prompt
+                || overlay.issue_key != issue_key
+                || view.request != Some(request_id)
+                || current_name != name
+            {
+                return;
+            }
+            view.request = None;
+            view.loading_source = false;
+            match result {
+                Ok(PromptReply::Preview(text)) => view.preview = Some(Ok(text)),
+                Ok(PromptReply::Loaded(document)) => {
+                    view.error = None;
+                    view.editor = Some(crate::app::PromptEditor {
+                        name: document.name,
+                        naming: false,
+                        buffer: crate::widgets::editor::Editor::new(document.source.clone()),
+                        original: Some(document.source),
+                        discard: false,
+                        busy: false,
+                    });
+                },
+                Ok(PromptReply::Saved(document)) => {
+                    view.name = document.name;
+                    view.editor = None;
+                    view.error = None;
+                    view.preview = None;
+                    view.scroll = 0;
+                },
+                Err(error) => {
+                    view.scroll = 0;
+                    if let Some(editor) = &mut view.editor {
+                        editor.busy = false;
+                    } else {
+                        view.preview = Some(Err(error.clone()));
+                    }
+                    view.error = Some(error);
+                },
+            }
+        },
         UiActionResult::IssueDelete { issue_key, result } => {
             if !app
                 .issue_delete_overlay
@@ -1226,7 +1872,7 @@ impl Drop for TerminalCleanup {
         let _ = disable_raw_mode();
         // Attempt each restoration even if an earlier terminal write fails.
         let mut output = io::stdout();
-        let _ = execute!(output, DisableMouseCapture);
+        let _ = execute!(output, DisableMouseCapture, DisableBracketedPaste);
         let _ = execute!(output, LeaveAlternateScreen);
         let _ = execute!(output, Show);
         if self.title_saved {
@@ -1283,6 +1929,7 @@ mod tests {
             description: None,
             state: "open".to_owned(),
             pull_request: None,
+            security_advisory: None,
             activity: None,
             url: None,
             author: None,
@@ -1639,6 +2286,297 @@ mod tests {
         assert!(app.selected < app.rows(&refreshed).len());
     }
 
+    fn security_issue(id: &str) -> Issue {
+        let mut issue = issue(id, Duration::zero());
+        issue.key.native_id = format!("advisory/{id}");
+        issue.identifier = id.into();
+        issue.title = "Private advisory title".into();
+        issue.description = Some("CONFIDENTIAL BODY SENT ONLY AFTER CONSENT".into());
+        issue.state = "draft".into();
+        issue.security_advisory = Some(agent_launcher_core::SecurityAdvisoryMetadata {
+            ghsa_id: id.into(),
+            cve_id: Some("CVE-2026-1234".into()),
+            severity: Some("critical".into()),
+        });
+        issue
+    }
+
+    #[test]
+    fn all_three_tabs_preserve_filters_sort_scroll_and_reconcile_by_key() {
+        use crate::app::InboxTab;
+        let mut snapshot = RuntimeSnapshot::default();
+        for id in 1..=8 {
+            snapshot.issues.extend([
+                issue(&id.to_string(), Duration::days(id)),
+                pull_request(&(id + 10).to_string()),
+                security_issue(&format!("GHSA-aaaa-bbbb-{id:04}")),
+            ]);
+        }
+        let mut app = AppState::default();
+        let filters = ["Issue", "Review", "CVE-2026-1234"];
+        let sorts = [IssueSort::Newest, IssueSort::Oldest, IssueSort::Title];
+        let mut keys = Vec::new();
+        for tab in InboxTab::ALL {
+            app.set_tab(tab);
+            app.search_query = filters[tab.index()].into();
+            app.issue_sort = sorts[tab.index()];
+            app.selected = tab.index() + 2;
+            app.scroll = tab.index() + 1;
+            keys.push(app.selected_issue(&snapshot).unwrap().key.clone());
+        }
+        let mut refreshed = snapshot.clone();
+        refreshed.issues.reverse();
+        app.reconcile_lists(&snapshot, &refreshed);
+        assert_eq!(app.tab, InboxTab::Security);
+        for tab in [InboxTab::PullRequests, InboxTab::Issues, InboxTab::Security] {
+            handle_list_key(&mut app, KeyCode::BackTab.into(), &refreshed);
+            assert_eq!(app.tab, tab);
+            assert_eq!(app.search_query, filters[tab.index()]);
+            assert_eq!(app.issue_sort, sorts[tab.index()]);
+            assert_eq!(app.scroll, tab.index() + 1);
+            assert_eq!(
+                app.selected_issue(&refreshed).unwrap().key,
+                keys[tab.index()]
+            );
+        }
+        refreshed.issues.retain(|issue| issue.key != keys[2]);
+        app.reconcile_lists(&snapshot, &refreshed);
+        assert!(app.selected < app.rows(&refreshed).len());
+        app.search_query.clear();
+        for c in "d123?".chars() {
+            handle_list_key(&mut app, KeyCode::Char(c).into(), &refreshed);
+        }
+        assert_eq!(app.search_query, "d123?");
+        assert!(app.dispatch_overlay.is_none());
+        handle_list_key(&mut app, KeyCode::Tab.into(), &refreshed);
+        assert_eq!(app.tab, InboxTab::Issues);
+    }
+
+    #[test]
+    fn security_settings_require_full_warning_and_explicit_consent_for_stable_target() {
+        let snapshot = RuntimeSnapshot {
+            issues: vec![
+                security_issue("GHSA-aaaa-bbbb-cccc"),
+                security_issue("GHSA-dddd-eeee-ffff"),
+            ],
+            selected_backend: Some(BackendKind::Herdr),
+            selected_agent: "claude".into(),
+            prompt_profiles: vec!["must-not-load".into()],
+            ..Default::default()
+        };
+        let mut app = AppState {
+            tab: crate::app::InboxTab::Security,
+            ..Default::default()
+        };
+        let target = app.selected_issue(&snapshot).unwrap().key.clone();
+        assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+        let overlay = app.dispatch_overlay.as_ref().unwrap();
+        assert!(overlay.settings.security);
+        assert!(matches!(overlay.stage, DispatchStage::Settings {
+            profile: None,
+            target: None
+        }));
+        assert!(overlay.prompt.preview.is_none());
+        assert!(overlay.prompt.request.is_none());
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Char('a').into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .prompt
+                .editor
+                .is_none()
+        );
+        settings_key(&mut app, KeyCode::Char('2').into());
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .privacy_confirmation
+        );
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Char('y').into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::render::draw(frame, &snapshot, &mut app))
+            .unwrap();
+        assert!(app.security_confirmation_visible);
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                dispatch_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('y'), modifiers),
+                    &snapshot
+                ),
+                DispatchEffect::None
+            );
+        }
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert_eq!(
+            dispatch_key(
+                &mut app,
+                KeyEvent {
+                    kind: KeyEventKind::Repeat,
+                    ..KeyCode::Char('y').into()
+                },
+                &snapshot
+            ),
+            DispatchEffect::None
+        );
+        app.selected = 1;
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Char('y').into(), &snapshot),
+            DispatchEffect::Select(0)
+        );
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 0),
+            Some(LaunchAction::Security {
+                issue: target,
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Herdr),
+                    model: ModelSelection::HarnessDefault,
+                    ..Default::default()
+                },
+            })
+        );
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        app.security_launch_pending = Some(42);
+        app.reset_detail();
+        assert_eq!(app.security_launch_pending, Some(42));
+        assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+        apply_ui_action_result(&mut app, UiActionResult::Security {
+            request_id: 41,
+            result: Ok(()),
+        });
+        assert_eq!(app.security_launch_pending, Some(42));
+        apply_ui_action_result(&mut app, UiActionResult::Security {
+            request_id: 42,
+            result: Ok(()),
+        });
+        assert!(app.security_launch_pending.is_none());
+        app.security_launch_pending = Some(43);
+        apply_ui_action_result(&mut app, UiActionResult::Security {
+            request_id: 43,
+            result: Err(agent_launcher_runtime::Error::PromptProfileNotFound(
+                "CONFIDENTIAL_RESPONSE_BODY".into(),
+            )),
+        });
+        assert!(
+            !app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("CONFIDENTIAL_RESPONSE_BODY")
+        );
+    }
+
+    #[test]
+    fn security_rejects_unsupported_readonly_changed_and_missing_targets() {
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![security_issue("GHSA-aaaa-bbbb-cccc")],
+            selected_backend: Some(BackendKind::Herdr),
+            ..Default::default()
+        };
+        let mut app = AppState {
+            tab: crate::app::InboxTab::Security,
+            ..Default::default()
+        };
+        for backend in [
+            None,
+            Some(BackendKind::Superset),
+            Some(BackendKind::Conductor),
+        ] {
+            snapshot.selected_backend = backend;
+            assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+            assert!(app.dispatch_overlay.is_none());
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("No automatic public fallback")
+            );
+        }
+        snapshot.selected_backend = Some(BackendKind::Native);
+        snapshot.compute_targets.push(compute_target(
+            "remote",
+            ComputeTargetAvailability::Online,
+            0,
+            None,
+        ));
+        assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+        assert!(app.dispatch_overlay.is_none());
+        snapshot.compute_targets.clear();
+        for state in ["triage", "closed", "published"] {
+            snapshot.issues[0].state = state.into();
+            prepare_dispatch(&mut app, &snapshot);
+            assert!(app.dispatch_overlay.is_none());
+            assert!(app.status_message.as_deref().unwrap().contains("read-only"));
+        }
+        snapshot.issues[0].state = "draft".into();
+        app.route = Route::Detail;
+        app.detail_issue_key = Some(snapshot.issues[0].key.clone());
+        open_issue_delete(&mut app, &snapshot);
+        assert!(app.issue_delete_overlay.is_none());
+        app.reset_detail();
+        prepare_dispatch(&mut app, &snapshot);
+        select_dispatch(&mut app, &snapshot, 0);
+        snapshot.compute_targets.push(compute_target(
+            "remote",
+            ComputeTargetAvailability::Online,
+            0,
+            None,
+        ));
+        app.security_confirmation_visible = true;
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert!(app.dispatch_overlay.is_none());
+        snapshot.compute_targets.clear();
+        prepare_dispatch(&mut app, &snapshot);
+        select_dispatch(&mut app, &snapshot, 0);
+        app.security_confirmation_visible = true;
+        snapshot.selected_model = Some("changed-default".into());
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert!(app.dispatch_overlay.is_none());
+        prepare_dispatch(&mut app, &snapshot);
+        dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+        assert!(app.dispatch_overlay.is_none());
+        prepare_dispatch(&mut app, &snapshot);
+        assert!(!app.security_confirmation_visible);
+        select_dispatch(&mut app, &snapshot, 0);
+        assert!(!app.security_confirmation_visible);
+        dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+        assert!(app.dispatch_overlay.is_none());
+        prepare_dispatch(&mut app, &snapshot);
+        select_dispatch(&mut app, &snapshot, 0);
+        app.security_confirmation_visible = true;
+        snapshot.issues[0].state = "closed".into();
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert!(app.dispatch_overlay.is_none());
+        snapshot.issues[0].state = "draft".into();
+        prepare_dispatch(&mut app, &snapshot);
+        snapshot.issues.clear();
+        assert!(app.reconcile_dispatch(&snapshot));
+        assert!(app.dispatch_overlay.is_none());
+    }
+
     #[test]
     fn printable_command_characters_remain_filter_text_on_both_tabs() {
         let snapshot = RuntimeSnapshot::default();
@@ -1718,8 +2656,12 @@ mod tests {
         assert!(app.dispatch_overlay.is_none());
         assert!(app.status_message.is_none());
         assert_eq!(
-            prepare_dispatch(&mut app, &snapshot),
+            {
+                assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+                select_dispatch(&mut app, &snapshot, 0)
+            },
             Some(LaunchAction::Review {
+                options: DispatchOptions::default(),
                 issue: pr.key,
                 target: None,
             })
@@ -1755,8 +2697,15 @@ mod tests {
         snapshot.prompt_profiles.clear();
         assert!(!app.reconcile_dispatch(&snapshot));
         assert_eq!(
-            select_dispatch(&mut app, &snapshot, 2),
+            {
+                assert!(select_dispatch(&mut app, &snapshot, 2).is_none());
+                select_dispatch(&mut app, &snapshot, 0)
+            },
             Some(LaunchAction::Review {
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Native),
+                    ..Default::default()
+                },
                 issue: pr.key.clone(),
                 target: Some("ready".into()),
             })
@@ -1764,8 +2713,15 @@ mod tests {
         assert!(app.dispatch_overlay.is_none());
         app.dispatch_overlay = staged_dispatch_overlay(pr.key.clone(), &snapshot);
         assert_eq!(
-            select_dispatch(&mut app, &snapshot, 0),
+            {
+                assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+                select_dispatch(&mut app, &snapshot, 0)
+            },
             Some(LaunchAction::Review {
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Native),
+                    ..Default::default()
+                },
                 issue: pr.key.clone(),
                 target: None,
             })
@@ -1799,8 +2755,15 @@ mod tests {
         );
         assert_eq!(select_dispatch(&mut app, &snapshot, 1), None);
         assert_eq!(
-            select_dispatch(&mut app, &snapshot, 1),
+            {
+                assert!(select_dispatch(&mut app, &snapshot, 1).is_none());
+                select_dispatch(&mut app, &snapshot, 0)
+            },
             Some(LaunchAction::Dispatch {
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Native),
+                    ..Default::default()
+                },
                 issue: selected.key,
                 profile: Some("designer".into()),
                 target: Some("ready".into()),
@@ -1850,7 +2813,7 @@ mod tests {
     }
 
     #[test]
-    fn herdr_profile_selection_finishes_the_chooser_without_a_target_stage() {
+    fn herdr_profile_selection_requires_settings_without_a_target_stage() {
         let selected = issue("1", Duration::zero());
         let snapshot = RuntimeSnapshot {
             issues: vec![selected.clone()],
@@ -1862,8 +2825,15 @@ mod tests {
         let mut app = AppState::default();
         assert_eq!(prepare_dispatch(&mut app, &snapshot), None);
         assert_eq!(
-            select_dispatch(&mut app, &snapshot, 1),
+            {
+                assert!(select_dispatch(&mut app, &snapshot, 1).is_none());
+                select_dispatch(&mut app, &snapshot, 0)
+            },
             Some(LaunchAction::Dispatch {
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Herdr),
+                    ..Default::default()
+                },
                 issue: selected.key,
                 profile: Some("designer".into()),
                 target: None,
@@ -1984,6 +2954,8 @@ mod tests {
         let now = Utc::now();
         let preview = WorktreeDeletePreview {
             run: RunSummary {
+                confidential: false,
+                model: None,
                 id: "run-1".to_owned(),
                 issue_key: issue("1", Duration::zero()).key.canonical(),
                 workspace: None,
@@ -2048,9 +3020,11 @@ mod tests {
         let selected = issue("2", Duration::zero());
         let mut app = AppState {
             dispatch_overlay: Some(DispatchOverlay {
+                settings: Default::default(),
                 issue_key: selected.key,
                 cursor: 0,
                 stage: DispatchStage::Prompt,
+                prompt: Default::default(),
             }),
             ..AppState::default()
         };
@@ -2083,7 +3057,12 @@ mod tests {
         };
         let mut app = AppState {
             dispatch_overlay: Some(DispatchOverlay {
+                settings: crate::app::LaunchSettings {
+                    had_targets: true,
+                    ..Default::default()
+                },
                 issue_key: selected_key.clone(),
+                prompt: Default::default(),
                 cursor: 0,
                 stage: DispatchStage::Prompt,
             }),
@@ -2115,9 +3094,11 @@ mod tests {
         };
         let mut app = AppState {
             dispatch_overlay: Some(DispatchOverlay {
+                settings: Default::default(),
                 issue_key: selected.key,
                 cursor: 0,
                 stage: DispatchStage::Target { profile: None },
+                prompt: Default::default(),
             }),
             ..AppState::default()
         };
@@ -2144,8 +3125,10 @@ mod tests {
         };
         let mut app = AppState {
             dispatch_overlay: Some(DispatchOverlay {
+                settings: Default::default(),
                 issue_key: selected.key,
                 cursor: 1,
+                prompt: Default::default(),
                 stage: DispatchStage::Target {
                     profile: Some("reviewer".to_owned()),
                 },
@@ -2162,7 +3145,7 @@ mod tests {
     }
 
     #[test]
-    fn native_targets_open_immediately_for_zero_or_one_prompt_profile() {
+    fn zero_or_one_prompt_profile_always_opens_chooser() {
         let selected = issue("2", Duration::zero());
         let mut snapshot = RuntimeSnapshot {
             selected_backend: Some(BackendKind::Native),
@@ -2176,16 +3159,418 @@ mod tests {
         };
 
         let overlay = staged_dispatch_overlay(selected.key.clone(), &snapshot).unwrap();
-        assert_eq!(overlay.stage, DispatchStage::Target { profile: None });
+        assert_eq!(overlay.stage, DispatchStage::Prompt);
 
         snapshot.prompt_profiles = vec!["implementer".to_owned()];
         let overlay = staged_dispatch_overlay(selected.key.clone(), &snapshot).unwrap();
-        assert_eq!(overlay.stage, DispatchStage::Target {
-            profile: Some("implementer".to_owned())
-        });
+        assert_eq!(overlay.stage, DispatchStage::Prompt);
 
         snapshot.selected_backend = Some(BackendKind::Superset);
-        assert!(staged_dispatch_overlay(selected.key, &snapshot).is_none());
+        assert_eq!(
+            staged_dispatch_overlay(selected.key, &snapshot)
+                .unwrap()
+                .stage,
+            DispatchStage::Prompt
+        );
+    }
+
+    #[test]
+    fn prompt_enter_requires_preview_then_settings_for_zero_or_one_profile() {
+        let selected = issue("1", Duration::zero());
+        for profiles in [vec![], vec!["alpha".to_owned()]] {
+            let snapshot = RuntimeSnapshot {
+                issues: vec![selected.clone()],
+                prompt_profiles: profiles,
+                selected_backend: Some(BackendKind::Superset),
+                ..Default::default()
+            };
+            let mut app = AppState::default();
+            assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+            for preview in [None, Some(Err("invalid template".into()))] {
+                app.dispatch_overlay.as_mut().unwrap().prompt.preview = preview;
+                assert_eq!(
+                    dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+                    DispatchEffect::None
+                );
+            }
+            app.dispatch_overlay.as_mut().unwrap().prompt.preview =
+                Some(Ok("{{ issue_text }}".into()));
+            assert_eq!(
+                dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+                DispatchEffect::Select(0)
+            );
+            assert_eq!(
+                {
+                    assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+                    select_dispatch(&mut app, &snapshot, 0)
+                },
+                Some(LaunchAction::Dispatch {
+                    options: DispatchOptions {
+                        expected_backend: Some(BackendKind::Superset),
+                        ..Default::default()
+                    },
+                    issue: selected.key.clone(),
+                    profile: snapshot.prompt_profiles.first().cloned(),
+                    target: None,
+                })
+            );
+            assert!(app.dispatch_overlay.is_none());
+        }
+    }
+
+    #[test]
+    fn prompt_modal_events_preserve_new_drafts_through_load_save_and_paste() {
+        let selected = issue("1", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            prompt_profiles: vec!["zeta".into()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        prepare_dispatch(&mut app, &snapshot);
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Char('e').into(), &snapshot),
+            DispatchEffect::Load
+        );
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(1);
+        app.dispatch_overlay.as_mut().unwrap().prompt.loading_source = true;
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Char('e').into(), &snapshot),
+            DispatchEffect::None
+        );
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        dispatch_key(&mut app, KeyCode::Char('a').into(), &snapshot);
+        assert!(handle_paste(&mut app, "alpha\r\n\u{1b}"));
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 1,
+            issue_key: selected.key.clone(),
+            name: "zeta".into(),
+            result: Ok(PromptReply::Loaded(
+                agent_launcher_runtime::PromptDocument {
+                    name: "zeta".into(),
+                    source: "obsolete".into(),
+                },
+            )),
+        });
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .prompt
+                .editor
+                .as_ref()
+                .unwrap()
+                .name,
+            "alpha"
+        );
+        dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
+        assert!(handle_paste(&mut app, "é界\r\nx\ry\u{1b}[31m\u{3}"));
+        for key in [
+            KeyCode::Home,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Right,
+            KeyCode::Delete,
+            KeyCode::Enter,
+        ] {
+            assert_eq!(
+                dispatch_key(&mut app, key.into(), &snapshot),
+                DispatchEffect::None
+            );
+        }
+        let draft = app
+            .dispatch_overlay
+            .as_ref()
+            .unwrap()
+            .prompt
+            .editor
+            .as_ref()
+            .unwrap()
+            .buffer
+            .text
+            .clone();
+        assert!(draft.starts_with("é\n\nx\ny[31m"));
+        assert!(!draft.contains('\r') && !draft.contains('\u{1b}') && !draft.contains('\u{3}'));
+        dispatch_key(&mut app, KeyCode::BackTab.into(), &snapshot);
+        let save = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            dispatch_key(&mut app, save, &snapshot),
+            DispatchEffect::Save(draft.clone(), None)
+        );
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(2);
+        for key in [
+            KeyCode::Char('a').into(),
+            KeyCode::Char('e').into(),
+            KeyCode::Tab.into(),
+            KeyCode::Enter.into(),
+            KeyCode::Esc.into(),
+            save,
+        ] {
+            assert_eq!(dispatch_key(&mut app, key, &snapshot), DispatchEffect::None);
+        }
+        assert!(!handle_paste(&mut app, "lost edit"));
+        app.route = Route::Detail;
+        app.detail_issue_key = Some(selected.key.clone());
+        assert!(!app.reconcile_detail(&RuntimeSnapshot::default()));
+        assert!(!app.reconcile_dispatch(&RuntimeSnapshot::default()));
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .prompt
+                .editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .text,
+            draft
+        );
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 2,
+            issue_key: selected.key.clone(),
+            name: "alpha".into(),
+            result: Err("conflict: file changed".into()),
+        });
+        app.dispatch_overlay.as_mut().unwrap().prompt.scroll_max = 30;
+        dispatch_key(&mut app, KeyCode::PageDown.into(), &snapshot);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().prompt.scroll, 8);
+        dispatch_key(&mut app, KeyCode::PageUp.into(), &snapshot);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().prompt.scroll, 0);
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .prompt
+                .editor
+                .as_ref()
+                .unwrap()
+                .buffer
+                .text,
+            draft
+        );
+        dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+        assert!(!handle_paste(&mut app, "y"));
+        dispatch_key(&mut app, KeyCode::Char('n').into(), &snapshot);
+        assert_eq!(
+            dispatch_key(&mut app, save, &snapshot),
+            DispatchEffect::Save(draft.clone(), None)
+        );
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(3);
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 3,
+            issue_key: selected.key,
+            name: "alpha".into(),
+            result: Ok(PromptReply::Saved(agent_launcher_runtime::PromptDocument {
+                name: "alpha".into(),
+                source: draft,
+            })),
+        });
+        // Save acknowledgement may precede the UI consuming the inventory watch update.
+        app.reconcile_dispatch(&snapshot);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().prompt.name, "alpha");
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+            DispatchEffect::None
+        );
+        let mut published = snapshot;
+        published.prompt_profiles.push("alpha".into());
+        app.reconcile_dispatch(&published);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 1);
+        app.dispatch_overlay.as_mut().unwrap().prompt.preview = Some(Ok("rendered alpha".into()));
+        assert_eq!(
+            dispatch_key(&mut app, KeyCode::Enter.into(), &published),
+            DispatchEffect::Select(1)
+        );
+    }
+
+    #[test]
+    fn prompt_modal_selection_invalidates_load_and_keeps_captured_issue() {
+        let first = issue("1", Duration::zero());
+        let second = issue("2", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![first.clone(), second],
+            prompt_profiles: vec!["alpha".into(), "beta".into()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        prepare_dispatch(&mut app, &snapshot);
+        let captured = app.dispatch_overlay.as_ref().unwrap().issue_key.clone();
+        app.selected = 1;
+        dispatch_key(&mut app, KeyCode::Char('e').into(), &snapshot);
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(1);
+        dispatch_key(&mut app, KeyCode::Char('2').into(), &snapshot);
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 1,
+            issue_key: captured.clone(),
+            name: "alpha".into(),
+            result: Err("obsolete load error".into()),
+        });
+        let overlay = app.dispatch_overlay.as_ref().unwrap();
+        assert_eq!(overlay.issue_key, captured);
+        assert_eq!(overlay.prompt.name, "beta");
+        assert!(overlay.prompt.error.is_none());
+        assert!(overlay.prompt.editor.is_none());
+        dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+        assert!(app.dispatch_overlay.is_none());
+    }
+
+    #[test]
+    fn prompt_results_reject_obsolete_identity_and_generation() {
+        let selected = issue("1", Duration::zero());
+        let snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            prompt_profiles: vec!["alpha".into(), "beta".into()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        assert_eq!(prepare_dispatch(&mut app, &snapshot), None);
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(10);
+        for (request_id, key, name) in [
+            (9, selected.key.clone(), "alpha"),
+            (10, issue("2", Duration::zero()).key, "alpha"),
+            (10, selected.key.clone(), "beta"),
+        ] {
+            apply_ui_action_result(&mut app, UiActionResult::Prompt {
+                request_id,
+                issue_key: key,
+                name: name.into(),
+                result: Ok(PromptReply::Preview("obsolete".into())),
+            });
+            assert!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .prompt
+                    .preview
+                    .is_none()
+            );
+        }
+        move_dispatch_cursor(&mut app, &snapshot, true);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().prompt.name, "beta");
+        app.dispatch_overlay = None;
+        prepare_dispatch(&mut app, &snapshot);
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(11);
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 10,
+            issue_key: selected.key.clone(),
+            name: "alpha".into(),
+            result: Ok(PromptReply::Preview("obsolete reopened".into())),
+        });
+        assert!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .prompt
+                .preview
+                .is_none()
+        );
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 11,
+            issue_key: selected.key,
+            name: "alpha".into(),
+            result: Ok(PromptReply::Preview("{{ issue_text }}".into())),
+        });
+        assert_eq!(
+            app.dispatch_overlay.as_ref().unwrap().prompt.preview,
+            Some(Ok("{{ issue_text }}".into()))
+        );
+        let mut reordered = snapshot.clone();
+        reordered.prompt_profiles.reverse();
+        app.reconcile_dispatch(&reordered);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 1);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().prompt.name, "alpha");
+    }
+
+    #[test]
+    fn prompt_editor_retains_conflicts_and_selects_saved_name_after_inventory_reorder() {
+        let selected = issue("1", Duration::zero());
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![selected.clone()],
+            prompt_profiles: vec!["zeta".into()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        prepare_dispatch(&mut app, &snapshot);
+        app.dispatch_overlay.as_mut().unwrap().prompt.request = Some(1);
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 1,
+            issue_key: selected.key.clone(),
+            name: "zeta".into(),
+            result: Ok(PromptReply::Loaded(
+                agent_launcher_runtime::PromptDocument {
+                    name: "zeta".into(),
+                    source: "{{ issue_title }}".into(),
+                },
+            )),
+        });
+        let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+        assert_eq!(
+            view.editor.as_ref().unwrap().buffer.text,
+            "{{ issue_title }}"
+        );
+        edit_prompt(view, KeyCode::Enter.into());
+        let draft = view.editor.as_ref().unwrap().buffer.text.clone();
+        let save_key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            edit_prompt(view, save_key),
+            Some((draft.clone(), Some("{{ issue_title }}".into())))
+        );
+        assert!(edit_prompt(view, save_key).is_none());
+        view.request = Some(2);
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 2,
+            issue_key: selected.key.clone(),
+            name: "zeta".into(),
+            result: Err("conflict: file changed on disk".into()),
+        });
+        let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+        assert_eq!(view.editor.as_ref().unwrap().buffer.text, draft);
+        assert!(!view.editor.as_ref().unwrap().busy);
+        assert!(view.error.as_deref().unwrap().contains("conflict"));
+        edit_prompt(view, KeyCode::Esc.into());
+        assert!(view.editor.as_ref().unwrap().discard);
+        edit_prompt(view, KeyCode::Esc.into());
+        assert!(!view.editor.as_ref().unwrap().discard);
+        edit_prompt(view, KeyCode::Esc.into());
+        edit_prompt(view, KeyCode::Char('y').into());
+        assert!(view.editor.is_none());
+
+        view.editor = Some(crate::app::PromptEditor {
+            name: "alpha".into(),
+            naming: false,
+            buffer: crate::widgets::editor::Editor::new(draft.clone()),
+            original: None,
+            discard: false,
+            busy: false,
+        });
+        assert_eq!(edit_prompt(view, save_key), Some((draft.clone(), None)));
+        view.request = Some(3);
+        // The watch inventory can arrive before the save acknowledgement.
+        snapshot.prompt_profiles.insert(0, "alpha".into());
+        app.reconcile_dispatch(&snapshot);
+        apply_ui_action_result(&mut app, UiActionResult::Prompt {
+            request_id: 3,
+            issue_key: selected.key,
+            name: "alpha".into(),
+            result: Ok(PromptReply::Saved(agent_launcher_runtime::PromptDocument {
+                name: "alpha".into(),
+                source: draft,
+            })),
+        });
+        app.reconcile_dispatch(&snapshot);
+        let overlay = app.dispatch_overlay.as_ref().unwrap();
+        assert_eq!(overlay.cursor, 0);
+        assert_eq!(overlay.prompt.name, "alpha");
+        assert!(overlay.prompt.preview.is_none());
+        assert!(overlay.prompt.editor.is_none());
     }
 
     #[test]
@@ -2193,7 +3578,12 @@ mod tests {
         let selected = issue("2", Duration::zero());
         let mut app = AppState {
             dispatch_overlay: Some(DispatchOverlay {
+                settings: crate::app::LaunchSettings {
+                    target_choices: vec!["ready".into()],
+                    ..Default::default()
+                },
                 issue_key: selected.key.clone(),
+                prompt: Default::default(),
                 cursor: 1,
                 stage: DispatchStage::Target {
                     profile: Some("reviewer".to_owned()),
@@ -2220,6 +3610,401 @@ mod tests {
             DispatchStage::Target {
                 profile: Some("reviewer".to_owned())
             }
+        );
+    }
+
+    #[test]
+    fn launch_settings_harness_kinds_and_model_defaults_are_backend_aware() {
+        for (backend, expected) in [
+            (BackendKind::Herdr, vec!["opencode", "claude", "pi"]),
+            (BackendKind::Native, vec!["opencode"]),
+            (BackendKind::Conductor, vec![
+                "claude", "codex", "cursor", "acp",
+            ]),
+            (BackendKind::Superset, vec![]),
+        ] {
+            let snapshot = RuntimeSnapshot {
+                issues: vec![pull_request("42")],
+                selected_backend: Some(backend),
+                selected_agent: "configured-custom".into(),
+                selected_model: Some("provider/old-model".into()),
+                ..Default::default()
+            };
+            let mut app = AppState {
+                tab: crate::app::InboxTab::PullRequests,
+                ..Default::default()
+            };
+            assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+            let settings = &app.dispatch_overlay.as_ref().unwrap().settings;
+            assert_eq!(settings.harness_choices(), expected);
+            assert_eq!(
+                settings.model_label(),
+                "Configured default: provider/old-model"
+            );
+            for harness in &expected {
+                assert_eq!(
+                    dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot),
+                    DispatchEffect::None
+                );
+                let settings = &app.dispatch_overlay.as_ref().unwrap().settings;
+                assert_eq!(settings.options.harness.as_deref(), Some(*harness));
+                assert_eq!(settings.options.model, ModelSelection::HarnessDefault);
+                dispatch_key(&mut app, KeyCode::Char('1').into(), &snapshot);
+                assert_eq!(
+                    app.dispatch_overlay
+                        .as_ref()
+                        .unwrap()
+                        .settings
+                        .model_label(),
+                    if backend == BackendKind::Native {
+                        "Configured default: provider/old-model"
+                    } else {
+                        "Configured default: uses harness default (different harness)"
+                    }
+                );
+            }
+            dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+            assert_eq!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .options
+                    .harness,
+                None
+            );
+            dispatch_key(&mut app, KeyCode::Char('1').into(), &snapshot);
+            assert_eq!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .options
+                    .model,
+                ModelSelection::Inherit
+            );
+            app.dispatch_overlay
+                .as_mut()
+                .unwrap()
+                .settings
+                .default_model = None;
+            assert_eq!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .model_label(),
+                "Configured default: uses harness default"
+            );
+        }
+    }
+
+    #[test]
+    fn native_subagent_configured_model_summary_and_confirmed_options_agree() {
+        for review in [false, true] {
+            let selected = if review {
+                pull_request("42")
+            } else {
+                issue("1", Duration::zero())
+            };
+            let snapshot = RuntimeSnapshot {
+                issues: vec![selected.clone()],
+                selected_backend: Some(BackendKind::Native),
+                selected_agent: "reviewer".into(),
+                selected_model: Some("openai/gpt-5.4".into()),
+                prompt_profiles: vec!["reviewer".into()],
+                ..Default::default()
+            };
+            let mut app = AppState {
+                tab: if review {
+                    crate::app::InboxTab::PullRequests
+                } else {
+                    crate::app::InboxTab::Issues
+                },
+                ..Default::default()
+            };
+            assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+            if !review {
+                app.dispatch_overlay.as_mut().unwrap().prompt.preview = Some(Ok("source".into()));
+                assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+            }
+            dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+            assert_eq!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .options
+                    .model,
+                ModelSelection::HarnessDefault
+            );
+            dispatch_key(&mut app, KeyCode::Char('1').into(), &snapshot);
+            assert_eq!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .model_label(),
+                "Configured default: openai/gpt-5.4"
+            );
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &snapshot, &mut app))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("Configured default: openai/gpt-5.4"));
+            assert!(!text.contains("different harness"));
+
+            let mut changed = snapshot.clone();
+            changed.selected_backend = Some(BackendKind::Herdr);
+            assert!(select_dispatch(&mut app, &changed, 0).is_none());
+            assert_eq!(
+                app.dispatch_overlay.as_ref().unwrap().settings.backend,
+                Some(BackendKind::Native)
+            );
+            assert_eq!(
+                dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+                DispatchEffect::Select(0)
+            );
+            // Runtime resolves Native + opencode + Inherit to the configured model,
+            // even when the configured OpenCode subagent is named "reviewer".
+            let options = DispatchOptions {
+                expected_backend: Some(BackendKind::Native),
+                harness: Some("opencode".into()),
+                model: ModelSelection::Inherit,
+            };
+            let expected = if review {
+                LaunchAction::Review {
+                    issue: selected.key,
+                    target: None,
+                    options,
+                }
+            } else {
+                LaunchAction::Dispatch {
+                    issue: selected.key,
+                    profile: Some("reviewer".into()),
+                    target: None,
+                    options,
+                }
+            };
+            assert_eq!(select_dispatch(&mut app, &snapshot, 0), Some(expected));
+        }
+    }
+
+    #[test]
+    fn model_drafts_confirm_cancel_and_launch_independently_for_pr_reviews() {
+        let snapshot = RuntimeSnapshot {
+            issues: vec![pull_request("42")],
+            selected_backend: Some(BackendKind::Herdr),
+            selected_agent: "claude".into(),
+            selected_model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        let mut app = AppState {
+            tab: crate::app::InboxTab::PullRequests,
+            ..Default::default()
+        };
+        for harness in ["opencode", "claude", "pi"] {
+            assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+            assert_eq!(
+                app.dispatch_overlay.as_ref().unwrap().settings.options,
+                DispatchOptions::default()
+            );
+            loop {
+                dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+                if app
+                    .dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .options
+                    .harness
+                    .as_deref()
+                    == Some(harness)
+                {
+                    break;
+                }
+            }
+            dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+            assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+            assert_eq!(
+                dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+                DispatchEffect::None
+            );
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("cannot be empty")
+            );
+            assert!(handle_paste(&mut app, "é界\r\n\u{1b}"));
+            for key in [KeyCode::Left, KeyCode::Backspace, KeyCode::Delete] {
+                dispatch_key(&mut app, key.into(), &snapshot);
+            }
+            assert_eq!(
+                app.dispatch_overlay
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .model_editor
+                    .as_ref()
+                    .unwrap()
+                    .text,
+                ""
+            );
+            let model = if harness == "claude" {
+                "sonnet"
+            } else {
+                "openai/gpt-5.4"
+            };
+            for c in model.chars() {
+                dispatch_key(&mut app, KeyCode::Char(c).into(), &snapshot);
+            }
+            assert_eq!(
+                dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+                DispatchEffect::None
+            );
+            let options = DispatchOptions {
+                harness: Some(harness.into()),
+                model: ModelSelection::Explicit(model.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                app.dispatch_overlay.as_ref().unwrap().settings.options,
+                options
+            );
+            dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+            handle_paste(&mut app, "cancelled");
+            dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+            assert_eq!(
+                app.dispatch_overlay.as_ref().unwrap().settings.options,
+                options
+            );
+            assert_eq!(
+                dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
+                DispatchEffect::Select(0)
+            );
+            assert_eq!(
+                select_dispatch(&mut app, &snapshot, 0),
+                Some(LaunchAction::Review {
+                    issue: snapshot.issues[0].key.clone(),
+                    target: None,
+                    options: DispatchOptions {
+                        expected_backend: Some(BackendKind::Herdr),
+                        ..options
+                    },
+                })
+            );
+            assert!(app.dispatch_overlay.is_none());
+        }
+        assert_eq!(snapshot.selected_model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn settings_keep_profile_target_and_options_across_refresh_and_back_navigation() {
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::zero())],
+            selected_backend: Some(BackendKind::Native),
+            selected_agent: "custom-opencode-agent".into(),
+            prompt_profiles: vec!["reviewer".into()],
+            compute_targets: vec![
+                compute_target("first", ComputeTargetAvailability::Online, 0, None),
+                compute_target("second", ComputeTargetAvailability::Online, 0, None),
+            ],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        prepare_dispatch(&mut app, &snapshot);
+        app.dispatch_overlay.as_mut().unwrap().prompt.preview = Some(Ok("source".into()));
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        move_dispatch_cursor(&mut app, &snapshot, true);
+        snapshot.compute_targets.reverse();
+        assert!(!app.reconcile_dispatch(&snapshot));
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 2);
+        assert!(select_dispatch(&mut app, &snapshot, 2).is_none());
+        dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+        handle_paste(&mut app, "openai/gpt-5.4");
+        dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot);
+        snapshot.prompt_profiles = vec!["replacement".into(), "reviewer".into()];
+        snapshot.issues.insert(0, issue("2", Duration::days(-1)));
+        snapshot.compute_targets.reverse();
+        app.reconcile_dispatch(&snapshot);
+        dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+        app.reconcile_dispatch(&snapshot);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 1);
+        dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
+        app.reconcile_dispatch(&snapshot);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 1);
+        assert_eq!(
+            app.dispatch_overlay.as_ref().unwrap().prompt.name,
+            "reviewer"
+        );
+        assert!(select_dispatch(&mut app, &snapshot, 1).is_none());
+        app.reconcile_dispatch(&snapshot);
+        assert_eq!(app.dispatch_overlay.as_ref().unwrap().cursor, 1);
+        assert!(select_dispatch(&mut app, &snapshot, 1).is_none());
+        assert_eq!(
+            select_dispatch(&mut app, &snapshot, 0),
+            Some(LaunchAction::Dispatch {
+                issue: snapshot.issues[1].key.clone(),
+                profile: Some("reviewer".into()),
+                target: Some("first".into()),
+                options: DispatchOptions {
+                    expected_backend: Some(BackendKind::Native),
+                    harness: None,
+                    model: ModelSelection::Explicit("openai/gpt-5.4".into())
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn changed_defaults_do_not_overwrite_settings_and_harness_change_clears_custom_model() {
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![pull_request("42")],
+            selected_backend: Some(BackendKind::Herdr),
+            selected_agent: "claude".into(),
+            selected_model: Some("sonnet".into()),
+            ..Default::default()
+        };
+        let mut app = AppState {
+            tab: crate::app::InboxTab::PullRequests,
+            ..Default::default()
+        };
+        prepare_dispatch(&mut app, &snapshot);
+        dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+        handle_paste(&mut app, "custom");
+        snapshot.selected_model = Some("changed".into());
+        app.reconcile_dispatch(&snapshot);
+        dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot);
+        assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("defaults changed")
+        );
+        let settings = &app.dispatch_overlay.as_ref().unwrap().settings;
+        assert_eq!(settings.default_model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            settings.options.model,
+            ModelSelection::Explicit("custom".into())
+        );
+        dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .options
+                .model,
+            ModelSelection::HarnessDefault
         );
     }
 

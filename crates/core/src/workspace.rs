@@ -61,10 +61,14 @@ impl RunState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunSummary {
+    #[serde(default)]
+    pub confidential: bool,
     pub id: String,
     pub issue_key: String,
     pub workspace: Option<WorkspaceRef>,
     pub agent: String,
+    #[serde(default)]
+    pub model: Option<String>,
     pub state: RunState,
     pub message: Option<String>,
     pub session_id: Option<String>,

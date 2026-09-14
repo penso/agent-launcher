@@ -17,7 +17,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+rustix = { version = "1", features = ["fs"] }
+uuid.workspace = true
 
 [dev-dependencies]
+agent-launcher-issues = { path = "../issues", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
 sqlx.workspace = true
+tempfile = "3"

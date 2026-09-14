@@ -244,6 +244,7 @@ impl Backend for ConductorBackend {
 
     async fn dispatch(&self, request: DispatchRequest) -> Result<DispatchResult> {
         request.validate()?;
+        crate::private::guard_dispatch(&request, self.kind()).await?;
         let agent = validate_agent(&request.agent)?;
         self.identity().await?;
         let project = self.find_project(&request.repository).await?;
@@ -288,6 +289,7 @@ impl Backend for ConductorBackend {
         let now = Utc::now();
         let run_id = Uuid::new_v4().to_string();
         let summary = RunSummary {
+            confidential: false,
             id: run_id,
             issue_key: request.issue.key.canonical(),
             workspace: Some(WorkspaceRef {
@@ -298,6 +300,7 @@ impl Backend for ConductorBackend {
                 branch,
             }),
             agent: agent.into(),
+            model: request.model.clone(),
             state: RunState::Running,
             message: None,
             session_id: Some(created.session_id.clone()),
@@ -765,6 +768,26 @@ mod tests {
                 "message": "Fix the login"
             })
         );
+    }
+
+    #[test]
+    fn model_changes_dispatch_identity() {
+        let key = |model| {
+            stable_hash(&format!(
+                "issue\0{}",
+                workspace_body(
+                    "project",
+                    "workspace",
+                    "branch",
+                    "claude",
+                    model,
+                    None,
+                    "review"
+                )
+            ))
+        };
+        assert_ne!(key(None), key(Some("sonnet")));
+        assert_ne!(key(Some("sonnet")), key(Some("opus")));
     }
 
     #[test]

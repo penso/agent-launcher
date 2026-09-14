@@ -297,6 +297,7 @@ impl BeadsIssue {
         blocked_by.dedup();
 
         Issue {
+            security_advisory: None,
             pull_request: None,
             activity: None,
             key: IssueKey {

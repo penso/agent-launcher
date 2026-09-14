@@ -10,7 +10,8 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
     widgets::{
-        Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
+        Block, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+        Sparkline, Widget,
     },
 };
 
@@ -26,6 +27,7 @@ use crate::{
 };
 
 pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut AppState) {
+    app.security_confirmation_visible = false;
     app.activity_history_origin = crate::activity::history_origin(
         &snapshot.herdr_activity,
         chrono::Utc::now(),
@@ -69,7 +71,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
     if app.issue_delete_overlay.is_some() {
         crate::detail::draw_issue_delete_overlay(frame, content, app);
     }
-    draw_footer(frame, area, snapshot, &app.host_metrics);
+    draw_footer(frame, area, snapshot, &app.host_metrics, app.tab);
     app.mouse.scroll = app.scroll;
 }
 
@@ -484,7 +486,9 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         && app.delete_overlay.is_none();
     if app.search_query.is_empty() {
         frame.render_widget(
-            Paragraph::new(if app.tab == InboxTab::PullRequests {
+            Paragraph::new(if app.tab == InboxTab::Security {
+                "Search private advisories (GHSA / CVE / severity)..."
+            } else if app.tab == InboxTab::PullRequests {
                 "Search PRs…"
             } else {
                 "Search issues…"
@@ -533,12 +537,25 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
     let metadata = app.issue_sort.label();
     let mut tabs = Vec::new();
     let mut x = inner.x;
-    for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+    let compact = inner.width < 27;
+    for tab in InboxTab::ALL {
         if !tabs.is_empty() {
-            tabs.push(Span::raw("  "));
-            x += 2;
+            tabs.push(Span::raw(if compact {
+                " "
+            } else {
+                "  "
+            }));
+            x += if compact {
+                1
+            } else {
+                2
+            };
         }
-        let label = format!(" {} ", tab.label());
+        let label = if compact {
+            tab.label().to_owned()
+        } else {
+            format!(" {} ", tab.label())
+        };
         let width = label.len() as u16;
         app.mouse
             .tabs
@@ -626,7 +643,23 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         .max()
         .unwrap_or(2);
     let pr_columns = pr_columns(Rect::new(area.x, area.y, table_width, 1), number_width);
-    if app.tab == InboxTab::PullRequests {
+    if app.tab == InboxTab::Security {
+        for (column, label) in security_columns(Rect::new(area.x, area.y, table_width, 1))
+            .into_iter()
+            .zip(["", "age", "severity", "title (private)", "state"])
+        {
+            frame.render_widget(
+                Paragraph::new(label)
+                    .style(Style::new().fg(theme::muted()))
+                    .alignment(if label == "state" {
+                        Alignment::Right
+                    } else {
+                        Alignment::Left
+                    }),
+                column,
+            );
+        }
+    } else if app.tab == InboxTab::PullRequests {
         for (column, label) in pr_columns
             .into_iter()
             .zip(["PR", "title", "author", "diff", "status", "activity"])
@@ -674,6 +707,58 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         };
         let row_area = Rect::new(area.x, area.y + 1 + screen_row as u16, table_width, 1);
         app.mouse.rows.push((row_area, index, issue.key.clone()));
+        if let Some(advisory) = &issue.security_advisory {
+            let style = Style::new().fg(theme::text()).bg(if index == app.selected {
+                theme::element()
+            } else {
+                theme::panel()
+            });
+            frame.render_widget(Block::new().style(style), row_area);
+            let severity = advisory.severity.as_deref().unwrap_or("unknown");
+            let severity_color = match severity.to_ascii_lowercase().as_str() {
+                "critical" => theme::error(),
+                "high" => theme::primary(),
+                "medium" => theme::secondary(),
+                _ => theme::muted(),
+            };
+            let state_color = match issue.state.to_ascii_lowercase().as_str() {
+                "triage" => theme::primary(),
+                "draft" => theme::secondary(),
+                "published" | "closed" => theme::done(),
+                _ => theme::muted(),
+            };
+            let age = age_label(issue.created_at);
+            for (index, (column, (text, color))) in security_columns(row_area)
+                .into_iter()
+                .zip([
+                    (
+                        if index == app.selected {
+                            "▶"
+                        } else {
+                            " "
+                        },
+                        theme::primary(),
+                    ),
+                    (age.as_str(), theme::muted()),
+                    (severity, severity_color),
+                    (issue.title.as_str(), theme::text()),
+                    (issue.state.as_str(), state_color),
+                ])
+                .enumerate()
+            {
+                frame.render_widget(
+                    Paragraph::new(truncate(text, column.width as usize))
+                        .style(style.fg(color))
+                        .alignment(if index == 4 {
+                            Alignment::Right
+                        } else {
+                            Alignment::Left
+                        }),
+                    column,
+                );
+            }
+            continue;
+        }
         if issue.pull_request.is_some() {
             draw_pr_row(frame, row_area, issue, index == app.selected, pr_columns);
             continue;
@@ -693,6 +778,32 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
     if rows.len() > visible_rows {
         render_scrollbar(frame, area, rows.len(), visible_rows, app.scroll);
     }
+}
+
+fn security_columns(area: Rect) -> [Rect; 5] {
+    let marker = area.width.min(2);
+    let remaining = area.width - marker;
+    let age = 6.min(remaining / 3);
+    let remaining = remaining - age;
+    let state = 10.min(remaining / 2);
+    let severity = if area.width >= 36 {
+        9
+    } else {
+        0
+    };
+    let title = remaining - state - severity;
+    let mut x = area.x;
+    [marker, age, severity, title, state].map(|width| {
+        // Leave a cell between content columns, even when the title fills its space.
+        let content_width = if x + width < area.right() {
+            width.saturating_sub(1)
+        } else {
+            width
+        };
+        let column = Rect::new(x, area.y, content_width, area.height);
+        x += width;
+        column
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1130,6 +1241,22 @@ fn draw_empty_state(
             ),
             Style::new().fg(theme::muted()),
         ));
+    } else if tab == InboxTab::Security {
+        let sources = snapshot
+            .sources
+            .iter()
+            .filter(|source| source.name.starts_with("security:github:"))
+            .collect::<Vec<_>>();
+        let message = if !snapshot.initialized || snapshot.refreshing {
+            "Loading private GitHub advisories...".to_owned()
+        } else if sources.is_empty() {
+            "No GitHub advisory source. Configure a GitHub repository and authenticate with advisory access.".to_owned()
+        } else if sources.iter().any(|source| !source.connected) {
+            "Private advisory access unavailable or unauthorized. Check GitHub authentication and repository advisory permissions; Ctrl+G, r retries.".to_owned()
+        } else {
+            "No private advisories in triage or draft. Closed/published advisory history is excluded. Ctrl+G, r refreshes.".to_owned()
+        };
+        lines.push(Line::styled(message, Style::new().fg(theme::muted())));
     } else if let Some(error) = snapshot.error.as_deref() {
         lines.push(Line::styled(
             format!("Could not load sources · {error}"),
@@ -1350,7 +1477,9 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Line::raw(""),
         command_help_line(
             "d",
-            if app.tab == InboxTab::PullRequests {
+            if app.tab == InboxTab::Security {
+                "private review (settings, then privacy consent)"
+            } else if app.tab == InboxTab::PullRequests {
                 "review selected PR"
             } else {
                 "dispatch selected issue"
@@ -1361,7 +1490,7 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         command_help_line("g", "debug runtime status"),
         command_help_line("c", "clear search"),
         command_help_line("q", "quit agent-launcher"),
-        command_help_line("Tab / BackTab", "switch Issues / PRs"),
+        command_help_line("Tab / BackTab", "next / previous: Issues / PRs / Security"),
         Line::raw(""),
         Line::styled("Inbox", Style::new().fg(theme::primary()).bold()),
         command_help_line("↑/↓ · PgUp/PgDn · Home/End", "navigate; wheel scrolls"),
@@ -1371,14 +1500,23 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Line::styled("Details", Style::new().fg(theme::primary()).bold()),
         command_help_line(
             "d · o · s",
-            if app.tab == InboxTab::PullRequests {
+            if app.tab == InboxTab::Security {
+                "private review · open · stop"
+            } else if app.tab == InboxTab::PullRequests {
                 "review PR · open · stop"
             } else {
                 "dispatch · open · stop"
             },
         ),
         command_help_line("i · Esc", "input · back"),
-        command_help_line("x worktree · X issue", "detail only; confirm"),
+        command_help_line(
+            "x worktree · X issue",
+            if app.tab == InboxTab::Security {
+                "blocked; private clone retained"
+            } else {
+                "detail only; confirm"
+            },
+        ),
         command_help_line("Ctrl+C", "quit from anywhere"),
     ];
     frame.render_widget(
@@ -1396,21 +1534,109 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     );
 }
 
+fn draw_security_confirmation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+    app.security_confirmation_visible = false;
+    let Some(overlay) = app.dispatch_overlay.as_ref() else {
+        return;
+    };
+    let settings = &overlay.settings;
+    let popup = area.inner(Margin::new(1, 1));
+    if popup.is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::new().style(Style::new().bg(theme::element())), popup);
+    let inner = popup.inner(Margin::new(1, 1));
+    let lines = vec![
+        Line::styled(
+            "PRIVATE SECURITY REVIEW - EXPLICIT CONSENT",
+            Style::new().fg(theme::error()).bold(),
+        ),
+        Line::raw(format!("Advisory: {}", overlay.issue_key.canonical())),
+        Line::raw(format!(
+            "Backend: {} | Harness: {}",
+            settings
+                .backend
+                .map_or_else(|| "unavailable".into(), |b| b.to_string()),
+            settings.options.harness.as_deref().unwrap_or(
+                if settings.backend == Some(BackendKind::Native) {
+                    "opencode"
+                } else {
+                    &settings.default_harness
+                }
+            )
+        )),
+        Line::raw(settings.model_label()),
+        Line::raw(""),
+        Line::raw(
+            "This sends the confidential advisory AND private repository code to the chosen harness/model provider, which may be a cloud service. Review that provider's data retention and privacy policy before consenting.",
+        ),
+        Line::raw(
+            "The request may create the advisory's temporary private fork on GitHub, where CI and integrations are disabled. Work uses a local isolated clone with private remotes only, never a public fallback.",
+        ),
+        Line::raw(
+            "No automatic public PR, advisory publication, or merge is requested by this workflow. Do not publish this private worktree or advisory; these restrictions are not a sandbox.",
+        ),
+        Line::raw(
+            "The model/harness may write its own sessions and history. The agent is NOT OS-sandboxed. Git hooks and remote checks are defense in depth, not a sandbox or a guarantee against disclosure.",
+        ),
+        Line::raw(
+            "Private-clone cleanup is separate and unavailable here; the clone is retained. Advisory content is cached locally with owner-only permissions, without encryption. Private run output is not stored in launcher SQLite or runtime event history. Backend/harness transcripts and other local copies may persist.",
+        ),
+        Line::raw(""),
+        Line::styled(
+            "y I reviewed this warning and consent to private dispatch | Esc cancel",
+            Style::new().fg(theme::primary()).bold(),
+        ),
+        Line::raw(
+            "Enter does not consent. No advisory or code is sent to the harness/model provider before explicit consent.",
+        ),
+    ];
+    let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+    if inner.width >= 20 && paragraph.line_count(inner.width) <= usize::from(inner.height) {
+        frame.render_widget(paragraph, inner);
+        app.security_confirmation_visible = true;
+    } else {
+        frame.render_widget(Paragraph::new("Resize to review the FULL privacy warning and target. Confirmation disabled. Esc cancel.")
+            .wrap(ratatui::widgets::Wrap { trim: false }).style(Style::new().fg(theme::error())), popup);
+    }
+}
+
 fn draw_dispatch_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &RuntimeSnapshot,
-    app: &AppState,
+    app: &mut AppState,
 ) {
-    let Some(overlay) = app.dispatch_overlay.as_ref() else {
+    if app
+        .dispatch_overlay
+        .as_ref()
+        .is_some_and(|overlay| overlay.settings.privacy_confirmation)
+    {
+        draw_security_confirmation(frame, area, app);
+        return;
+    }
+    let Some(overlay) = app.dispatch_overlay.as_mut() else {
         return;
     };
     let item_count = match &overlay.stage {
-        DispatchStage::Prompt => snapshot.prompt_profiles.len(),
+        DispatchStage::Prompt => snapshot.prompt_profiles.len().max(1),
         DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
+        DispatchStage::Settings { .. } => 17,
     };
-    let width = area.width.saturating_sub(2).min(86);
-    let wanted_height = item_count.saturating_add(6) as u16;
+    let width = area
+        .width
+        .saturating_sub(2)
+        .min(if overlay.stage == DispatchStage::Prompt {
+            140
+        } else {
+            86
+        });
+    let wanted_height = if overlay.stage == DispatchStage::Prompt {
+        area.height.saturating_sub(2)
+    } else {
+        item_count.saturating_add(6) as u16
+    };
     let height = area.height.saturating_sub(2).min(wanted_height.max(7));
     if width == 0 || height == 0 {
         return;
@@ -1442,6 +1668,124 @@ fn draw_dispatch_overlay(
         return;
     }
 
+    if overlay.stage == DispatchStage::Prompt {
+        draw_prompt_view(frame, inner, snapshot, overlay);
+        return;
+    }
+
+    if let DispatchStage::Settings { profile, target } = &overlay.stage {
+        let settings = &mut overlay.settings;
+        let backend = settings
+            .backend
+            .map_or_else(|| "unavailable".into(), |b| b.to_string());
+        let default = if settings.security && settings.backend == Some(BackendKind::Native) {
+            "opencode"
+        } else if settings.default_harness.is_empty() {
+            "backend default"
+        } else {
+            &settings.default_harness
+        };
+        let harness = settings.options.harness.as_deref().map_or_else(
+            || format!("Configured default ({default})"),
+            |h| h.to_owned(),
+        );
+        let kinds = settings.harness_choices().join(", ");
+        let mut lines = vec![
+            Line::styled("Launch settings", Style::new().fg(theme::primary()).bold()),
+            Line::raw(format!("Issue: {}", overlay.issue_key.canonical())),
+            Line::raw(format!(
+                "Profile: {}",
+                if settings.security {
+                    "Private security review (fixed; no custom prompt)"
+                } else if settings.review {
+                    "PR review (no issue profile)"
+                } else {
+                    profile.as_deref().unwrap_or("Built-in default")
+                }
+            )),
+            Line::raw(format!("Backend: {backend}")),
+            Line::raw(format!(
+                "Target: {}",
+                target.as_deref().unwrap_or(if settings.security {
+                    "Local isolated private clone only"
+                } else if settings.had_targets {
+                    "Automatic"
+                } else {
+                    "Backend-managed"
+                })
+            )),
+            Line::raw(format!("Harness: {harness}")),
+            Line::raw(if kinds.is_empty() {
+                "Harness choices: configured preset only".into()
+            } else {
+                format!("h cycle: Configured default, {kinds} (supported kinds)")
+            }),
+            Line::raw(settings.model_label()),
+            Line::raw("1 Configured default / 2 Harness default / 3 Custom model"),
+            Line::raw("m edit custom model; h resets model to Harness default"),
+            Line::raw("Examples: Claude sonnet; OpenCode/Pi openai/gpt-5.4"),
+            Line::raw("Manual model ID, not a discovered or installed catalog."),
+            Line::raw("Availability is determined by the harness on the selected host."),
+            Line::raw("This launch only; no config changes, installs or permission changes."),
+        ];
+        if let Some(status) = &app.status_message {
+            lines.push(Line::styled(
+                status.clone(),
+                Style::new().fg(theme::error()),
+            ));
+        }
+        let editing = settings.model_editor.is_some();
+        let footer = if editing {
+            "Enter confirm field (does not launch)\nEsc cancel field / PgUp/PgDn scroll"
+        } else if settings.security {
+            "Enter review privacy warning (does not launch) / Esc cancel / PgUp/PgDn scroll"
+        } else {
+            "Enter launch / Esc back / PgUp/PgDn scroll"
+        };
+        let footer = Paragraph::new(footer)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::new().fg(theme::primary()));
+        let footer_height = footer
+            .line_count(inner.width)
+            .min(usize::from(inner.height)) as u16;
+        let body_height = inner
+            .height
+            .saturating_sub(footer_height + u16::from(editing));
+        let body = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        settings.scroll_max = body
+            .line_count(inner.width)
+            .saturating_sub(usize::from(body_height))
+            .min(u16::MAX as usize) as u16;
+        settings.scroll = settings.scroll.min(settings.scroll_max);
+        frame.render_widget(body.scroll((settings.scroll, 0)), Rect {
+            height: body_height,
+            ..inner
+        });
+        frame.render_widget(
+            footer,
+            Rect::new(
+                inner.x,
+                inner.bottom() - footer_height,
+                inner.width,
+                footer_height,
+            ),
+        );
+        if let Some(editor) = &settings.model_editor
+            && body_height + footer_height < inner.height
+        {
+            let field = Rect::new(inner.x, inner.y + body_height, inner.width, 1);
+            let column = Line::raw(&editor.text[..editor.cursor]).width();
+            let left = column.saturating_sub(usize::from(field.width.saturating_sub(1)));
+            frame.render_widget(
+                Paragraph::new(editor.text.as_str())
+                    .scroll((0, left.min(u16::MAX as usize) as u16)),
+                field,
+            );
+            frame.set_cursor_position((field.x + (column - left) as u16, field.y));
+        }
+        return;
+    }
+
     let issue_title = snapshot
         .issues
         .iter()
@@ -1452,9 +1796,8 @@ fn draw_dispatch_overlay(
         .iter()
         .any(|issue| issue.key == overlay.issue_key && issue.pull_request.is_some());
     let mut lines = match &overlay.stage {
-        DispatchStage::Prompt => {
-            dispatch_prompt_lines(snapshot, overlay.cursor, issue_title, inner)
-        },
+        DispatchStage::Prompt => unreachable!("prompt view rendered above"),
+        DispatchStage::Settings { .. } => unreachable!("settings rendered above"),
         DispatchStage::Target { profile } => dispatch_target_lines(
             snapshot,
             overlay.cursor,
@@ -1472,72 +1815,221 @@ fn draw_dispatch_overlay(
         Paragraph::new(lines).style(Style::new().bg(theme::element())),
         inner,
     );
-    render_bottom_edge(
-        popup,
-        theme::primary(),
-        theme::element(),
-        theme::bg(),
-        frame.buffer_mut(),
-    );
 }
 
-fn dispatch_prompt_lines<'a>(
-    snapshot: &'a RuntimeSnapshot,
-    cursor: usize,
-    issue_title: &str,
+fn draw_prompt_view(
+    frame: &mut Frame<'_>,
     inner: Rect,
-) -> Vec<Line<'a>> {
-    let selected_name = snapshot
-        .prompt_profiles
-        .get(cursor)
-        .map_or("unavailable", String::as_str);
-    if inner.height < 5 {
-        return vec![Line::from(vec![
-            Span::styled("Prompt  ", Style::new().fg(theme::primary()).bold()),
-            Span::styled(
-                selected_name.to_owned(),
-                Style::new().fg(theme::text()).bold(),
-            ),
-            Span::styled(
-                "  Enter dispatch · Esc cancel",
-                Style::new().fg(theme::muted()),
-            ),
-        ])];
-    }
-
-    let mut lines = vec![
-        Line::styled(
-            format!(
-                "Choose prompt · {}/{}",
-                cursor + 1,
-                snapshot.prompt_profiles.len()
-            ),
-            Style::new().fg(theme::primary()).bold(),
-        ),
-        Line::styled(
-            truncate(issue_title, inner.width as usize),
-            Style::new().fg(theme::muted()),
-        ),
-        Line::styled(
-            "↑/↓ select · Enter dispatch · 1-9 · Esc cancel",
-            Style::new().fg(theme::muted()),
-        ),
-        Line::raw(""),
-    ];
-    let visible = (inner.height as usize).saturating_sub(4).max(1);
-    let start = cursor
-        .saturating_sub(visible / 2)
-        .min(snapshot.prompt_profiles.len().saturating_sub(visible));
-    lines.extend(
-        snapshot
-            .prompt_profiles
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-            .map(|(index, name)| dispatch_choice_line(index, cursor, true, name.clone())),
+    snapshot: &RuntimeSnapshot,
+    overlay: &mut crate::app::DispatchOverlay,
+) {
+    use ratatui::{
+        layout::{Constraint, Layout},
+        widgets::Wrap,
+    };
+    let view = &mut overlay.prompt;
+    let style = Style::new().fg(theme::text()).bg(theme::element());
+    let name = if view.name.is_empty() {
+        "Built-in default"
+    } else {
+        &view.name
+    };
+    let title = if let Some(editor) = &view.editor {
+        format!("Edit prompt: {}", editor.name)
+    } else if view.loading_source && view.request.is_some() {
+        format!("Loading source: {name}")
+    } else {
+        format!("Choose prompt: {name}")
+    };
+    let editor_footer = view.editor.as_ref().map(|editor| {
+        let help = if editor.busy {
+            "Saving..."
+        } else if editor.discard {
+            "Discard draft? y discard / n or Esc keep editing"
+        } else if editor.naming {
+            "Enter/Tab edit / Ctrl+S save / Esc cancel"
+        } else if editor.original.is_none() {
+            "Ctrl+S save / Esc cancel\nTab name / Ctrl+N name"
+        } else {
+            "Ctrl+S save / Esc cancel"
+        };
+        if view.error.is_some() {
+            format!("{help}\nPgUp/PgDn scroll error")
+        } else {
+            help.to_owned()
+        }
+    });
+    let warning_height = if inner.height >= 12 {
+        2
+    } else {
+        0
+    };
+    let chooser_footer = if view.name.is_empty() {
+        "Enter next / Esc cancel\nUp/Down 1-9 select / PgUp/PgDn\na add / r reload (built-in is read-only)"
+    } else {
+        "Enter next / Esc cancel\nUp/Down 1-9 select / PgUp/PgDn\na add / e edit / r reload"
+    };
+    let footer_height = {
+        Paragraph::new(editor_footer.as_deref().unwrap_or(chooser_footer))
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width)
+            .min(usize::from(
+                if view.error.is_some() && view.editor.is_some() {
+                    inner.height / 3
+                } else {
+                    inner.height.saturating_sub(3 + warning_height)
+                },
+            )) as u16
+    };
+    let error_height = if view.editor.is_some() {
+        view.error.as_ref().map_or(0, |error| {
+            Paragraph::new(error.as_str())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .min(usize::from(
+                    inner
+                        .height
+                        .saturating_sub(2 + warning_height + footer_height),
+                )) as u16
+        })
+    } else {
+        0
+    };
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(warning_height),
+        Constraint::Min(1),
+        Constraint::Length(error_height),
+        Constraint::Length(footer_height),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(title).style(style.fg(theme::primary()).bold()),
+        sections[0],
     );
-    lines
+    frame.render_widget(
+        Paragraph::new("Shared user config: changes affect ALL repositories.")
+            .wrap(Wrap { trim: false })
+            .style(style.fg(theme::muted())),
+        sections[1],
+    );
+    if let Some(editor) = &view.editor {
+        if let Some(error) = &view.error {
+            let error = Paragraph::new(error.as_str())
+                .wrap(Wrap { trim: false })
+                .style(style.fg(theme::error()));
+            view.scroll_max = error
+                .line_count(sections[3].width)
+                .saturating_sub(usize::from(sections[3].height))
+                .min(u16::MAX as usize) as u16;
+            view.scroll = view.scroll.min(view.scroll_max);
+            frame.render_widget(error.scroll((view.scroll, 0)), sections[3]);
+        }
+        frame.render_widget(
+            Paragraph::new(editor_footer.unwrap_or_default())
+                .wrap(Wrap { trim: false })
+                .style(style.fg(if view.error.is_some() {
+                    theme::error()
+                } else {
+                    theme::muted()
+                })),
+            sections[4],
+        );
+        if editor.naming {
+            let name = format!("Name: {}", editor.name);
+            let column = Line::raw(name.as_str()).width();
+            let left = column.saturating_sub(usize::from(sections[2].width.saturating_sub(1)));
+            frame.render_widget(
+                Paragraph::new(name)
+                    .scroll((0, left.min(u16::MAX as usize) as u16))
+                    .style(style),
+                sections[2],
+            );
+            if !sections[2].is_empty() && !editor.discard && !editor.busy {
+                frame.set_cursor_position((sections[2].x + (column - left) as u16, sections[2].y));
+            }
+        } else {
+            let body = sections[2];
+            let (row, _) = editor.buffer.position();
+            let top = row.saturating_sub(usize::from(body.height.saturating_sub(1)));
+            let before = &editor.buffer.text[..editor.buffer.cursor];
+            let column = Line::raw(before.rsplit('\n').next().unwrap_or("")).width();
+            let left = column.saturating_sub(usize::from(body.width.saturating_sub(1)));
+            frame.render_widget(
+                Paragraph::new(editor.buffer.text.as_str())
+                    .scroll((
+                        top.min(u16::MAX as usize) as u16,
+                        left.min(u16::MAX as usize) as u16,
+                    ))
+                    .style(style),
+                body,
+            );
+            if !body.is_empty() && !editor.discard && !editor.busy {
+                frame.set_cursor_position((
+                    body.x + (column - left) as u16,
+                    body.y + (row - top) as u16,
+                ));
+            }
+        }
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(chooser_footer)
+            .wrap(Wrap { trim: false })
+            .style(style.fg(theme::muted())),
+        sections[4],
+    );
+    let panes = if inner.width >= 86 {
+        Layout::horizontal([Constraint::Length(28), Constraint::Min(1)])
+            .spacing(1)
+            .split(sections[2])
+    } else {
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1)])
+            .spacing(u16::from(sections[2].height > 4))
+            .split(sections[2])
+    };
+    let names = if snapshot.prompt_profiles.is_empty() {
+        vec!["Built-in default".to_owned()]
+    } else {
+        snapshot.prompt_profiles.clone()
+    };
+    let cursor = snapshot
+        .prompt_profiles
+        .iter()
+        .position(|n| *n == view.name)
+        .unwrap_or(overlay.cursor);
+    let start = cursor.saturating_sub(usize::from(panes[0].height) / 2);
+    let lines: Vec<_> = names
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(i, name)| dispatch_choice_line(i, cursor, true, name.clone()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(style.bg(theme::panel()))
+            .block(Block::default().padding(Padding::horizontal(u16::from(panes[0].width > 2)))),
+        panes[0],
+    );
+    let (text, error) = match &view.preview {
+        Some(Ok(text)) => (text.as_str(), false),
+        Some(Err(error)) => (error.as_str(), true),
+        None => ("Loading template...", false),
+    };
+    let preview = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .style(style.fg(if error {
+            theme::error()
+        } else {
+            theme::text()
+        }));
+    let max = preview
+        .line_count(panes[1].width)
+        .saturating_sub(usize::from(panes[1].height))
+        .min(u16::MAX as usize) as u16;
+    view.scroll_max = max;
+    view.scroll = view.scroll.min(max);
+    frame.render_widget(preview.scroll((view.scroll, 0)), panes[1]);
 }
 
 fn dispatch_target_lines<'a>(
@@ -1568,11 +2060,7 @@ fn dispatch_target_lines<'a>(
                 Style::new().fg(theme::text()).bold(),
             ),
             Span::styled(
-                if review {
-                    "  Enter review PR · Esc cancel"
-                } else {
-                    "  Enter dispatch · Esc cancel"
-                },
+                "  Enter settings · Esc back",
                 Style::new().fg(theme::muted()),
             ),
         ])];
@@ -1607,11 +2095,7 @@ fn dispatch_target_lines<'a>(
             Style::new().fg(theme::muted()),
         ),
         Line::styled(
-            if review {
-                "↑/↓ select · Enter review PR · 1-9 · Esc cancel"
-            } else {
-                "↑/↓ select · Enter dispatch · 1-9 · Esc cancel"
-            },
+            "↑/↓ select · Enter settings · 1-9 · Esc back",
             Style::new().fg(theme::muted()),
         ),
         Line::raw(""),
@@ -1813,6 +2297,7 @@ fn draw_footer(
     area: Rect,
     snapshot: &RuntimeSnapshot,
     metrics: &HostMetrics,
+    tab: InboxTab,
 ) {
     if area.height == 0 {
         return;
@@ -1828,7 +2313,7 @@ fn draw_footer(
             )
         },
     );
-    let mut text = footer_source_label(snapshot);
+    let mut text = footer_source_label(snapshot, tab);
     text.spans.push(Span::raw(format!(" {repository}")));
     let identity_width = text.width();
     let version = env!("CARGO_PKG_VERSION");
@@ -1850,22 +2335,29 @@ fn draw_footer(
             Paragraph::new(cpu_label).style(Style::new().fg(load_color(metrics.cpu_percent))),
             Rect::new(metrics_x, footer.y, 13, 1),
         );
-        let spark_data = metrics
-            .cpu_sparkline(usize::from(spark_width) * 2)
-            .into_iter()
-            .map(|value| SparklineSample {
-                value: Some(value),
-                partial: false,
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            BrailleSparkline::new(&spark_data).max(100).style(
-                Style::new()
-                    .fg(load_color(metrics.cpu_percent))
-                    .bg(theme::bg()),
-            ),
-            Rect::new(metrics_x + 13, footer.y, spark_width, 1),
-        );
+        let spark_area = Rect::new(metrics_x + 13, footer.y, spark_width, 1);
+        if metrics.has_cpu_history() {
+            let spark_data = metrics.cpu_sparkline(usize::from(spark_width));
+            frame.render_widget(
+                Sparkline::default().data(&spark_data).max(100).style(
+                    Style::new()
+                        .fg(load_color(metrics.cpu_percent))
+                        .bg(theme::bg()),
+                ),
+                spark_area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(if spark_width >= 10 {
+                    "warming up"
+                } else {
+                    "warming"
+                })
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(theme::muted()).bg(theme::bg())),
+                spark_area,
+            );
+        }
         frame.render_widget(
             Paragraph::new(format!("  MEM {:>3}%", metrics.memory_percent))
                 .style(Style::new().fg(load_color(metrics.memory_percent))),
@@ -2169,40 +2661,41 @@ fn worktree_manager_label(snapshot: &RuntimeSnapshot) -> &'static str {
         })
 }
 
-fn footer_source_label(snapshot: &RuntimeSnapshot) -> Line<'static> {
-    if snapshot.sources.is_empty() {
-        return Line::from("no source");
-    }
-    let connected = snapshot
+fn footer_source_label(snapshot: &RuntimeSnapshot, tab: InboxTab) -> Line<'static> {
+    let sources = snapshot
         .sources
         .iter()
-        .filter(|source| source.connected)
-        .count();
-    let throttled = snapshot.sources.iter().any(|source| {
+        .filter(|source| source.name.starts_with("security:github:") == (tab == InboxTab::Security))
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return Line::from("no source");
+    }
+    let connected = sources.iter().filter(|source| source.connected).count();
+    let throttled = sources.iter().any(|source| {
         source
             .message
             .as_deref()
             .is_some_and(|message| message.contains("throttled"))
     });
-    let color = if throttled || (connected > 0 && connected < snapshot.sources.len()) {
+    let color = if throttled || (connected > 0 && connected < sources.len()) {
         theme::primary()
     } else if connected == 0 {
         theme::error()
     } else {
         theme::done()
     };
-    let label = if snapshot.sources.len() == 1 {
-        let source = &snapshot.sources[0];
+    let label = if sources.len() == 1 {
+        let source = sources[0];
         let name = source.name.split(':').next().unwrap_or(&source.name);
         if name == "github" {
             return Line::from(Span::styled("\u{f09b}", Style::new().fg(color)));
         } else {
             name.to_owned()
         }
-    } else if connected == snapshot.sources.len() {
-        format!("{} sources", snapshot.sources.len())
+    } else if connected == sources.len() {
+        format!("{} sources", sources.len())
     } else {
-        format!("{connected}/{} sources", snapshot.sources.len())
+        format!("{connected}/{} sources", sources.len())
     };
     Line::from(vec![
         Span::raw(format!("{label} ")),
@@ -2289,6 +2782,7 @@ mod tests {
             description: Some("Detailed acceptance criteria".to_owned()),
             state: "open".to_owned(),
             pull_request: None,
+            security_advisory: None,
             activity: None,
             url: Some(format!("https://github.com/acme/launcher/issues/{id}")),
             author: Some("octocat".to_owned()),
@@ -2332,6 +2826,329 @@ mod tests {
             selected_backend: Some(BackendKind::Superset),
             selected_agent: "opencode".to_owned(),
             ..RuntimeSnapshot::default()
+        }
+    }
+
+    fn security_snapshot() -> RuntimeSnapshot {
+        let mut snapshot = normal_snapshot();
+        let mut advisory = issue(
+            "advisory/GHSA-aaaa-bbbb-cccc",
+            "Confidential advisory title",
+        );
+        advisory.state = "draft".into();
+        advisory.description = Some("PRIVATE_BODY_SENTINEL".into());
+        advisory.security_advisory = Some(agent_launcher_core::SecurityAdvisoryMetadata {
+            ghsa_id: "GHSA-aaaa-bbbb-cccc".into(),
+            cve_id: Some("CVE-2026-1234".into()),
+            severity: Some("critical".into()),
+        });
+        snapshot.issues.push(advisory);
+        snapshot.sources.push(SourceStatus {
+            name: "security:github:github.com:acme/launcher".into(),
+            connected: true,
+            supports_delete: false,
+            message: None,
+        });
+        snapshot.selected_backend = Some(BackendKind::Herdr);
+        snapshot
+    }
+
+    #[test]
+    fn security_rendering_private_details_and_direct_filtered_mouse_selection() {
+        let snapshot = security_snapshot();
+        let mut app = AppState::default();
+        let text = render(120, 48, &snapshot, &mut app);
+        assert!(!text.contains("Confidential advisory title"));
+        assert!(!text.contains("PRIVATE_BODY_SENTINEL"));
+        let tab = app
+            .mouse
+            .tabs
+            .iter()
+            .find(|(_, tab)| *tab == InboxTab::Security)
+            .unwrap()
+            .0;
+        assert!(crate::mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: tab.x,
+                row: tab.y,
+                modifiers: KeyModifiers::NONE
+            },
+            &snapshot,
+            (120, 48)
+        ));
+        assert_eq!(app.tab, InboxTab::Security);
+        app.search_query = "CVE-2026-1234".into();
+        let text = render(120, 48, &snapshot, &mut app);
+        for expected in [
+            "critical",
+            "Confidential advisory title",
+            "draft",
+            "private",
+            "3d",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert!(!text.contains("PRIVATE_BODY_SENTINEL"));
+        assert!(!text.contains("GHSA-aaaa-bbbb-cccc"));
+        let row = app.mouse.rows[0].0;
+        assert!(crate::mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: row.x,
+                row: row.y,
+                modifiers: KeyModifiers::NONE
+            },
+            &snapshot,
+            (120, 48)
+        ));
+        let text = render(120, 60, &snapshot, &mut app);
+        assert!(text.contains("PRIVATE_BODY_SENTINEL"));
+        assert!(text.contains("PRIVATE Security Advisory"));
+        assert!(text.contains("GHSA-aaaa-bbbb-cccc"));
+        assert!(text.contains("CVE-2026-1234"));
+        assert!(!text.contains("review PR"));
+        assert!(!text.contains("x worktree"));
+        assert!(!text.contains("X issue"));
+        for (width, height) in [(80, 24), (30, 12), (10, 6), (1, 1)] {
+            render(width, height, &snapshot, &mut app);
+        }
+        app.reset_detail();
+        app.set_tab(InboxTab::Issues);
+        app.debug_overlay = true;
+        let text = render(120, 60, &snapshot, &mut app);
+        assert!(!text.contains("PRIVATE_BODY_SENTINEL"));
+        assert!(!text.contains("Confidential advisory title"));
+    }
+
+    #[test]
+    fn security_table_colors_spacing_and_narrow_widths() {
+        let mut snapshot = security_snapshot();
+        let mut app = AppState {
+            tab: InboxTab::Security,
+            ..Default::default()
+        };
+        for (state, state_color) in [
+            ("triage", theme::primary()),
+            ("draft", theme::secondary()),
+            ("published", theme::done()),
+            ("closed", theme::done()),
+            ("unknown", theme::muted()),
+        ] {
+            snapshot.issues[1].state = state.into();
+            for (severity, color) in [
+                ("critical", theme::error()),
+                ("high", theme::primary()),
+                ("medium", theme::secondary()),
+                ("low", theme::muted()),
+                ("unknown", theme::muted()),
+            ] {
+                snapshot.issues[1]
+                    .security_advisory
+                    .as_mut()
+                    .unwrap()
+                    .severity = Some(severity.into());
+                for width in (1..=24).chain([36, 80]) {
+                    for title in ["Long title ".repeat(20), "界面🔒e\u{301}".repeat(20)] {
+                        snapshot.issues[1].title = title;
+                        let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+                        terminal
+                            .draw(|frame| draw_table(frame, frame.area(), &snapshot, &mut app))
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let columns = security_columns(Rect::new(0, 1, width, 1));
+                        assert_eq!(buffer[(0, 1)].symbol(), "▶");
+                        if width >= 24 {
+                            assert_eq!(buffer[(columns[1].x, 1)].symbol(), "3");
+                            assert_eq!(buffer[(columns[1].x + 1, 1)].symbol(), "d");
+                            assert_eq!(buffer[(width - 1, 1)].fg, state_color);
+                            let displayed = truncate(state, columns[4].width as usize);
+                            assert_eq!(
+                                buffer[(width - 1, 1)].symbol(),
+                                displayed.chars().last().unwrap().to_string()
+                            );
+                            assert_eq!(buffer[(columns[4].x - 1, 1)].symbol(), " ");
+                        }
+                        if width >= 36 {
+                            assert_eq!(buffer[(columns[2].x, 1)].fg, color);
+                        } else {
+                            assert_eq!(columns[2].width, 0);
+                        }
+                        for x in 0..width {
+                            // Wide glyph continuation cells are reset by TestBackend.
+                            if x > 0 && Line::raw(buffer[(x - 1, 1)].symbol()).width() > 1 {
+                                continue;
+                            }
+                            assert_eq!(buffer[(x, 1)].bg, theme::element());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(issue_color("draft"), theme::error());
+    }
+
+    #[test]
+    fn security_confirmation_is_disabled_until_entire_warning_fits_and_after_resize() {
+        let snapshot = security_snapshot();
+        let mut app = AppState {
+            tab: InboxTab::Security,
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                issue_key: snapshot.issues[1].key.clone(),
+                cursor: 0,
+                prompt: Default::default(),
+                settings: crate::app::LaunchSettings {
+                    backend: Some(BackendKind::Herdr),
+                    default_harness: "claude".into(),
+                    security: true,
+                    privacy_confirmation: true,
+                    ..Default::default()
+                },
+                stage: DispatchStage::Settings {
+                    profile: None,
+                    target: None,
+                },
+            }),
+            ..Default::default()
+        };
+        for (width, height) in [(120, 40), (30, 12), (120, 40), (1, 1), (120, 40)] {
+            let text = render(width, height, &snapshot, &mut app)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(app.security_confirmation_visible, width == 120);
+            assert!(!text.contains("PRIVATE_BODY_SENTINEL"));
+            if width == 120 {
+                for expected in [
+                    "GHSA-aaaa-bbbb-cccc",
+                    "Harness: claude",
+                    "confidential advisory AND private",
+                    "cloud service",
+                    "temporary private fork",
+                    "private remotes only",
+                    "CI and integrations are disabled",
+                    "No automatic public PR",
+                    "Advisory content is cached locally",
+                    "Private run output is not stored in launcher SQLite or runtime event history",
+                    "NOT OS-sandboxed",
+                    "sessions and history",
+                    "not a sandbox",
+                    "y I reviewed",
+                    "Enter does not consent",
+                ] {
+                    assert!(text.contains(expected), "missing {expected}");
+                }
+            } else if width == 30 {
+                assert!(text.contains("Confirmation disabled"));
+            }
+        }
+        app.dispatch_overlay
+            .as_mut()
+            .unwrap()
+            .settings
+            .options
+            .model = agent_launcher_core::ModelSelection::Explicit(
+            "provider/very-long-model-name ".repeat(300),
+        );
+        render(120, 40, &snapshot, &mut app);
+        assert!(!app.security_confirmation_visible);
+    }
+
+    #[test]
+    fn security_empty_states_use_only_security_source_health() {
+        let mut snapshot = security_snapshot();
+        snapshot.issues.clear();
+        let mut app = AppState {
+            tab: InboxTab::Security,
+            ..Default::default()
+        };
+        snapshot.error = Some("ordinary source error".into());
+        let text = render(120, 48, &snapshot, &mut app);
+        assert!(text.contains("No private advisories"));
+        assert!(!text.contains("ordinary source error"));
+        snapshot.error = None;
+        snapshot.sources[1].connected = false;
+        assert_eq!(
+            footer_source_label(&snapshot, InboxTab::Issues).spans[0]
+                .style
+                .fg,
+            Some(theme::done())
+        );
+        assert_eq!(
+            footer_source_label(&snapshot, InboxTab::Security).spans[1]
+                .style
+                .fg,
+            Some(theme::error())
+        );
+        let text = render(120, 48, &snapshot, &mut app);
+        assert!(text.contains("unavailable or unauthorized"));
+        app.set_tab(InboxTab::Issues);
+        let text = render(120, 48, &snapshot, &mut app);
+        assert!(text.contains("No Issues"));
+        assert!(!text.contains("unauthorized"));
+        app.set_tab(InboxTab::Security);
+        snapshot.sources.pop();
+        let text = render(120, 48, &snapshot, &mut app);
+        assert!(text.contains("No GitHub advisory source"));
+    }
+
+    #[test]
+    fn private_run_details_do_not_render_persisted_output_or_model_and_inputs_fit() {
+        let mut snapshot = security_snapshot();
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            id: "private-run".into(),
+            issue_key: snapshot.issues[1].key.canonical(),
+            confidential: true,
+            model: Some("MODEL_SENTINEL".into()),
+            workspace: None,
+            agent: "opencode".into(),
+            state: RunState::NeedsInput,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        snapshot
+            .run_events
+            .insert("private-run".into(), vec![EventEnvelope {
+                run_id: "private-run".into(),
+                sequence: 0,
+                timestamp: now,
+                payload: RunEvent::Output {
+                    stream: OutputStream::Pty,
+                    text: "OUTPUT_SENTINEL".into(),
+                },
+            }]);
+        let mut app = AppState {
+            tab: InboxTab::Security,
+            route: Route::Detail,
+            detail_issue_key: Some(snapshot.issues[1].key.clone()),
+            ..Default::default()
+        };
+        for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
+            app.layout = layout;
+            let text = render(120, 60, &snapshot, &mut app);
+            assert!(text.contains("PRIVATE run"));
+            assert!(text.contains("not persisted"));
+            assert!(!text.contains("MODEL_SENTINEL"));
+            assert!(!text.contains("OUTPUT_SENTINEL"));
+            assert!(text.contains("i input"));
+            assert!(text.contains("Esc back"));
+            app.input_overlay = Some(crate::app::InputOverlay {
+                run_id: "private-run".into(),
+                prompt: "Private follow-up".into(),
+                text: "Review locally".into(),
+            });
+            for (width, height) in [(120, 60), (80, 24), (30, 12), (1, 1)] {
+                let text = render(width, height, &snapshot, &mut app);
+                assert!(app.mouse.blocked);
+                assert!(!text.contains("OUTPUT_SENTINEL"));
+                assert!(!text.contains("MODEL_SENTINEL"));
+            }
+            app.input_overlay = None;
         }
     }
 
@@ -2674,7 +3491,7 @@ mod tests {
                 (InboxTab::Issues, 35, "Issue", &issue_key),
                 (InboxTab::PullRequests, 22, "Review", &pr_key),
             ] {
-                app.switch_tab();
+                app.set_tab(tab);
                 render_buffer(160, height, &snapshot, &mut app);
                 assert_eq!(app.tab, tab);
                 assert_eq!(app.selected, selected);
@@ -3126,6 +3943,8 @@ mod tests {
                 1 => app.sort_overlay = true,
                 2 => {
                     app.dispatch_overlay = Some(crate::app::DispatchOverlay {
+                        settings: Default::default(),
+                        prompt: Default::default(),
                         issue_key: snapshot.issues[0].key.clone(),
                         cursor: 0,
                         stage: DispatchStage::Prompt,
@@ -3142,6 +3961,8 @@ mod tests {
                     app.delete_overlay = Some(crate::app::DeleteOverlay {
                         preview: WorktreeDeletePreview {
                             run: RunSummary {
+                                confidential: false,
+                                model: None,
                                 id: "run".into(),
                                 issue_key: snapshot.issues[0].key.canonical(),
                                 workspace: None,
@@ -3599,6 +4420,8 @@ mod tests {
                         .issues
                         .iter()
                         .map(|issue| RunSummary {
+                            confidential: false,
+                            model: None,
                             id: issue.key.native_id.clone(),
                             issue_key: issue.key.canonical(),
                             workspace: None,
@@ -3867,13 +4690,15 @@ mod tests {
             Some(2),
         )];
         app.dispatch_overlay = Some(crate::app::DispatchOverlay {
+            settings: Default::default(),
+            prompt: Default::default(),
             issue_key: snapshot.issues[1].key.clone(),
             cursor: 0,
             stage: DispatchStage::Target { profile: None },
         });
         let text = render(90, 28, &snapshot, &mut app);
         assert!(text.contains("Review PR: compute target"));
-        assert!(text.contains("Enter review PR"));
+        assert!(text.contains("Enter settings"));
         assert!(text.contains("Automatic"));
         assert!(!text.contains("Enter dispatch"));
         app.status_message = Some("Target ready is full".into());
@@ -3920,6 +4745,8 @@ mod tests {
         let mut snapshot = normal_snapshot();
         let now = Utc::now();
         snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: None,
             id: "run-idle".to_owned(),
             issue_key: snapshot.issues[0].key.canonical(),
             workspace: None,
@@ -4059,7 +4886,7 @@ mod tests {
         assert!(!text.contains("agents · issues · workspaces"));
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains("Search issues…"));
-        assert!(text.contains(" Issues    PRs   newest first"));
+        assert!(text.contains(" Issues    PRs    Security   newest first"));
         assert!(!text.contains("1 source"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
@@ -4802,8 +5629,14 @@ mod tests {
         ];
         let mut app = AppState {
             dispatch_overlay: Some(crate::app::DispatchOverlay {
+                settings: Default::default(),
                 issue_key: snapshot.issues[0].key.clone(),
                 cursor: 1,
+                prompt: crate::app::PromptView {
+                    name: "implementer".into(),
+                    preview: Some(Ok("Repair runtime dispatch".into())),
+                    ..Default::default()
+                },
                 stage: crate::app::DispatchStage::Prompt,
             }),
             ..AppState::default()
@@ -4816,7 +5649,129 @@ mod tests {
         assert!(text.contains("designer"));
         assert!(text.contains("implementer"));
         assert!(text.contains("reviewer"));
-        assert!(text.contains("Enter dispatch"));
+        assert!(text.contains("Enter next"));
+    }
+
+    #[test]
+    fn prompt_preview_is_responsive_scrollable_and_dispatch_bottom_is_flat() {
+        let mut snapshot = normal_snapshot();
+        snapshot.issues[0].description = Some("ISSUE BODY MUST NOT APPEAR".into());
+        snapshot.prompt_profiles = vec!["alpha".into()];
+        for width in [120, 60] {
+            let mut app = AppState {
+                dispatch_overlay: Some(crate::app::DispatchOverlay {
+                    settings: Default::default(),
+                    issue_key: snapshot.issues[0].key.clone(),
+                    cursor: 0,
+                    stage: DispatchStage::Prompt,
+                    prompt: crate::app::PromptView {
+                        name: "alpha".into(),
+                        preview: Some(Ok("{{ issue_text }}\n**literal stars**\nlast".into())),
+                        ..Default::default()
+                    },
+                }),
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| draw_dispatch_overlay(frame, frame.area(), &snapshot, &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |needle: &str| {
+                (0..24)
+                    .find(|y| {
+                        let text: String = (0..width).map(|x| buffer[(x, *y)].symbol()).collect();
+                        text.contains(needle)
+                    })
+                    .unwrap()
+            };
+            if width >= 90 {
+                assert_eq!(row("1  alpha"), row("{{ issue_text }}"));
+            } else {
+                assert!(row("1  alpha") < row("{{ issue_text }}"));
+            }
+            let list_y = row("1  alpha");
+            let list_x = (0..width)
+                .find(|x| buffer[(*x, list_y)].symbol() == "a")
+                .unwrap();
+            let preview_y = row("{{ issue_text }}");
+            let preview_x = (0..width)
+                .find(|x| buffer[(*x, preview_y)].symbol() == "{")
+                .unwrap();
+            assert_ne!(theme::panel(), theme::element());
+            assert_eq!(buffer[(list_x, list_y)].bg, theme::panel());
+            assert_eq!(buffer[(list_x, list_y)].fg, theme::text());
+            assert_eq!(buffer[(list_x - 6, list_y)].bg, theme::panel());
+            assert_eq!(buffer[(list_x - 6, list_y)].symbol(), " ");
+            assert_eq!(buffer[(preview_x, preview_y)].bg, theme::element());
+            let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("**literal stars**"));
+            assert!(!text.contains(snapshot.issues[0].description.as_deref().unwrap()));
+            for x in 1..width - 1 {
+                assert_eq!(buffer[(x, 22)].bg, theme::element());
+                assert_eq!(buffer[(x, 22)].symbol(), " ");
+            }
+            let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+            view.preview = Some(Ok((0..100).map(|i| format!("line {i}\n")).collect()));
+            view.scroll = u16::MAX;
+            terminal
+                .draw(|frame| draw_dispatch_overlay(frame, frame.area(), &snapshot, &mut app))
+                .unwrap();
+            let view = &app.dispatch_overlay.as_ref().unwrap().prompt;
+            assert_eq!(view.scroll, view.scroll_max);
+            assert!(view.scroll > 0);
+        }
+    }
+
+    #[test]
+    fn prompt_editor_and_errors_render_at_narrow_and_tiny_sizes() {
+        let snapshot = normal_snapshot();
+        let mut app = AppState {
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                settings: Default::default(),
+                issue_key: snapshot.issues[0].key.clone(),
+                cursor: 0,
+                stage: DispatchStage::Prompt,
+                prompt: crate::app::PromptView {
+                    name: "alpha".into(),
+                    error: Some("conflict: file changed".into()),
+                    editor: Some(crate::app::PromptEditor {
+                        name: "alpha".into(),
+                        naming: false,
+                        buffer: crate::widgets::editor::Editor::new(
+                            "{{ issue_title }}\nraw source".into(),
+                        ),
+                        original: None,
+                        discard: false,
+                        busy: false,
+                    }),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+        for (width, height) in [(120, 24), (40, 24), (20, 10), (1, 1)] {
+            let text = render(width, height, &snapshot, &mut app);
+            if width >= 20 {
+                assert!(text.contains("conflict:"));
+            }
+            if width >= 40 {
+                assert!(text.contains("{{ issue_title }}"));
+                assert!(text.contains("conflict: file changed"));
+                assert!(text.contains("Ctrl+S save"));
+            }
+        }
+        app.dispatch_overlay.as_mut().unwrap().prompt.error =
+            Some((0..100).map(|i| format!("error detail {i}\n")).collect());
+        let text = render(40, 24, &snapshot, &mut app);
+        assert!(text.contains("error detail 0"));
+        assert!(text.contains("PgUp/PgDn scroll error"));
+        let view = &mut app.dispatch_overlay.as_mut().unwrap().prompt;
+        assert!(view.scroll_max > 0);
+        view.scroll = view.scroll_max;
+        let text = render(40, 24, &snapshot, &mut app);
+        assert!(text.contains("error detail 99"));
+        assert!(text.contains("{{ issue_title }}"));
     }
 
     #[test]
@@ -4825,21 +5780,26 @@ mod tests {
         snapshot.prompt_profiles = (0..20).map(|index| format!("prompt-{index}")).collect();
         let mut app = AppState {
             dispatch_overlay: Some(crate::app::DispatchOverlay {
+                settings: Default::default(),
                 issue_key: snapshot.issues[0].key.clone(),
                 cursor: 15,
+                prompt: crate::app::PromptView {
+                    name: "prompt-15".into(),
+                    ..Default::default()
+                },
                 stage: crate::app::DispatchStage::Prompt,
             }),
             ..AppState::default()
         };
 
         let normal = render(70, 12, &snapshot, &mut app);
-        assert!(normal.contains("Choose prompt · 16/20"));
+        assert!(normal.contains("Choose prompt: prompt-15"));
         assert!(normal.contains("prompt-15"));
 
-        let compact = render(40, 5, &snapshot, &mut app);
-        assert!(compact.contains("Prompt"));
+        let compact = render(40, 18, &snapshot, &mut app);
+        assert!(compact.contains("Choose prompt"));
         assert!(compact.contains("prompt-15"));
-        assert!(compact.contains("Enter dispatch"));
+        assert!(compact.contains("Enter next"));
     }
 
     #[test]
@@ -4853,8 +5813,10 @@ mod tests {
         ];
         let mut app = AppState {
             dispatch_overlay: Some(crate::app::DispatchOverlay {
+                settings: Default::default(),
                 issue_key: snapshot.issues[0].key.clone(),
                 cursor: 0,
+                prompt: Default::default(),
                 stage: crate::app::DispatchStage::Target {
                     profile: Some("reviewer".to_owned()),
                 },
@@ -4870,6 +5832,63 @@ mod tests {
         assert!(text.contains("Target ready  online · 1/3 active · CPU 42% · MEM 57%"));
         assert!(text.contains("Target offline  offline · 0/2 active · CPU 42% · MEM 57%"));
         assert!(text.contains("Target full  full · 2/2 active · CPU 42% · MEM 57%"));
+    }
+
+    #[test]
+    fn launch_settings_render_summary_manual_model_help_and_unicode_editor() {
+        let snapshot = normal_snapshot();
+        let mut app = AppState {
+            dispatch_overlay: Some(crate::app::DispatchOverlay {
+                settings: crate::app::LaunchSettings {
+                    backend: Some(BackendKind::Herdr),
+                    default_harness: "claude".into(),
+                    ..Default::default()
+                },
+                issue_key: snapshot.issues[0].key.clone(),
+                cursor: 0,
+                prompt: Default::default(),
+                stage: DispatchStage::Settings {
+                    profile: Some("reviewer".into()),
+                    target: Some("host-42".into()),
+                },
+            }),
+            ..Default::default()
+        };
+        let text = render(120, 40, &snapshot, &mut app);
+        for expected in [
+            "Launch settings",
+            "Profile: reviewer",
+            "Target: host-42",
+            "Backend: herdr",
+            "Configured default (claude)",
+            "uses harness default",
+            "opencode, claude, pi",
+            "supported kinds",
+            "sonnet",
+            "openai/gpt-5.4",
+            "not a discovered",
+            "Enter launch",
+            "Esc back",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        for (width, height) in [(60, 24), (30, 12), (10, 6), (1, 1)] {
+            render(width, height, &snapshot, &mut app);
+        }
+        let settings = &mut app.dispatch_overlay.as_mut().unwrap().settings;
+        settings.model_editor = Some(crate::widgets::editor::Editor {
+            text: "界é".repeat(100),
+            cursor: 5,
+        });
+        for (width, height) in [(120, 40), (60, 24), (30, 12), (10, 6), (1, 1)] {
+            let text = render(width, height, &snapshot, &mut app);
+            if width >= 60 {
+                assert!(text.contains("Enter confirm field"));
+                assert!(text.contains("does not launch"));
+                assert!(text.contains('界'));
+                assert!(text.contains('é'));
+            }
+        }
     }
 
     #[test]
@@ -5172,7 +6191,7 @@ mod tests {
         ] {
             snapshot.sources[0].connected = connected;
             snapshot.sources[0].message = message.map(str::to_owned);
-            let label = footer_source_label(&snapshot);
+            let label = footer_source_label(&snapshot, InboxTab::Issues);
             assert_eq!(label.to_string(), "\u{f09b}");
             assert_eq!(label.spans[0].style.fg, Some(color));
 
@@ -5198,7 +6217,7 @@ mod tests {
         for name in ["gitlab:gitlab.com:acme/repo", "beads"] {
             snapshot.sources[0].name = name.into();
             assert_eq!(
-                footer_source_label(&snapshot).to_string(),
+                footer_source_label(&snapshot, InboxTab::Issues).to_string(),
                 format!("{} ●", name.split(':').next().unwrap())
             );
         }
@@ -5211,7 +6230,7 @@ mod tests {
         ] {
             snapshot.sources[0].connected = first;
             snapshot.sources[1].connected = second;
-            let status = footer_source_label(&snapshot);
+            let status = footer_source_label(&snapshot, InboxTab::Issues);
             assert_eq!(status.to_string(), label);
             assert_eq!(status.spans[1].style.fg, Some(color));
         }
@@ -5219,11 +6238,14 @@ mod tests {
             source.connected = true;
         }
         snapshot.sources[1].message = Some("GitHub throttled; retry after later".into());
-        let status = footer_source_label(&snapshot);
+        let status = footer_source_label(&snapshot, InboxTab::Issues);
         assert_eq!(status.to_string(), "2 sources ●");
         assert_eq!(status.spans[1].style.fg, Some(theme::primary()));
         snapshot.sources.clear();
-        assert_eq!(footer_source_label(&snapshot).to_string(), "no source");
+        assert_eq!(
+            footer_source_label(&snapshot, InboxTab::Issues).to_string(),
+            "no source"
+        );
     }
 
     #[test]
@@ -5239,7 +6261,9 @@ mod tests {
                 }
                 let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
                 terminal
-                    .draw(|frame| draw_footer(frame, frame.area(), &snapshot, &metrics))
+                    .draw(|frame| {
+                        draw_footer(frame, frame.area(), &snapshot, &metrics, InboxTab::Issues)
+                    })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
                 let text: String = (0..width)
@@ -5263,7 +6287,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_sparkline_uses_braille_only_and_stays_in_footer_row() {
+    fn cpu_sparkline_uses_standard_bars_and_stays_in_footer_row() {
         let snapshot = normal_snapshot();
         let mut metrics = HostMetrics::default();
         for cpu in [0, 12, 25, 50, 75, 100, 100, 25, 100] {
@@ -5273,11 +6297,17 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, 5)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw_footer(frame, Rect::new(0, 1, width, 3), &snapshot, &metrics);
+                    draw_footer(
+                        frame,
+                        Rect::new(0, 1, width, 3),
+                        &snapshot,
+                        &metrics,
+                        InboxTab::Issues,
+                    );
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            let mut dots = 0;
+            let mut bars = 0;
             for y in 0..5 {
                 for x in 0..width {
                     let cell = &buffer[(x, y)];
@@ -5285,9 +6315,9 @@ mod tests {
                         assert_eq!(cell.symbol(), " ");
                     }
                     for ch in cell.symbol().chars() {
-                        assert!(!('\u{2580}'..='\u{259f}').contains(&ch));
-                        if ('\u{2801}'..='\u{28ff}').contains(&ch) {
-                            dots += 1;
+                        assert!(!('\u{2800}'..='\u{28ff}').contains(&ch));
+                        if ('\u{2581}'..='\u{2588}').contains(&ch) {
+                            bars += 1;
                             assert_eq!(y, 3);
                             assert_eq!(cell.bg, theme::bg());
                             assert_eq!(cell.fg, load_color(100));
@@ -5296,7 +6326,26 @@ mod tests {
                     }
                 }
             }
-            assert!(dots > 0);
+            assert!(bars > 0);
+        }
+    }
+
+    #[test]
+    fn cpu_footer_warms_up_before_showing_history() {
+        let mut app = AppState::default();
+        for count in 1..=3 {
+            app.host_metrics.record(20, 55);
+            let text = render(112, 28, &normal_snapshot(), &mut app);
+            let footer = text.lines().last().unwrap();
+            assert!(footer.contains("CPU  20%"));
+            assert!(footer.contains("MEM  55%"));
+            assert_eq!(footer.contains("warming up"), count < 3);
+            assert_eq!(
+                footer
+                    .chars()
+                    .any(|ch| ('\u{2581}'..='\u{2588}').contains(&ch)),
+                count >= 3
+            );
         }
     }
 
@@ -5526,6 +6575,86 @@ mod tests {
     }
 
     #[test]
+    fn all_detail_kinds_style_only_description_and_keep_latest_run_reachable() {
+        let mut snapshot = security_snapshot();
+        snapshot.issues.push(pr_snapshot().issues.pop().unwrap());
+        let source = "### Impact\n\n**Bold** *Italic* normal `inline`\n\n| Path | Risk |\n| --- | ---: |\n| `src/long_component/validation.rs` | high |\n\n```rust\n### literal code\n```";
+        for issue in &mut snapshot.issues {
+            issue.description = Some(source.into());
+        }
+        for tab in [InboxTab::Issues, InboxTab::PullRequests, InboxTab::Security] {
+            let mut app = AppState {
+                tab,
+                ..Default::default()
+            };
+            assert!(app.open_detail(&snapshot));
+            let buffer = render_buffer(120, 70, &snapshot, &mut app);
+            let locate = |needle: &str| {
+                (0..70)
+                    .find_map(|y| {
+                        let row = (0..120)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>();
+                        row.find(needle).map(|x| (x as u16, y))
+                    })
+                    .unwrap_or_else(|| panic!("missing {needle}"))
+            };
+            let bold = buffer[locate("Bold")].clone();
+            assert!(bold.modifier.contains(Modifier::BOLD));
+            assert!(!bold.modifier.contains(Modifier::ITALIC));
+            let italic = buffer[locate("Italic")].clone();
+            assert!(italic.modifier.contains(Modifier::ITALIC));
+            assert!(!italic.modifier.contains(Modifier::BOLD));
+            let normal = buffer[locate("normal")].clone();
+            assert!(
+                !normal
+                    .modifier
+                    .intersects(Modifier::BOLD | Modifier::ITALIC)
+            );
+            assert_eq!(normal.bg, theme::panel());
+            assert_eq!(buffer[locate("inline")].bg, theme::element());
+            assert_eq!(buffer[locate("### literal code")].bg, theme::element());
+            let heading = buffer[locate("Impact")].clone();
+            assert_eq!(heading.fg, theme::primary());
+            assert!(heading.modifier.contains(Modifier::BOLD));
+            assert_eq!(buffer[locate("repository")].bg, theme::panel());
+            assert_eq!(
+                buffer[locate(&app.detail_issue(&snapshot).unwrap().title)].bg,
+                theme::element()
+            );
+            let text = render(120, 70, &snapshot, &mut app);
+            assert!(!text.contains("### Impact"));
+            assert!(!text.contains("**Bold**"));
+            assert!(!text.contains("```"));
+            assert_eq!(
+                app.detail_issue(&snapshot).unwrap().description.as_deref(),
+                Some(source)
+            );
+            for width in [40, 80, 120, 40] {
+                app.detail_scroll = u16::MAX;
+                let text = render(width, 24, &snapshot, &mut app);
+                assert_eq!(app.detail_scroll, app.detail_scroll_max);
+                assert!(text.contains("Latest run"));
+                assert!(text.contains(if tab == InboxTab::Issues {
+                    "Not dispatched."
+                } else {
+                    "Not reviewed."
+                }));
+            }
+            let key = app.detail_issue_key.as_ref().unwrap();
+            snapshot
+                .issues
+                .iter_mut()
+                .find(|i| &i.key == key)
+                .unwrap()
+                .description = Some("**Updated**".into());
+            app.detail_scroll = 0;
+            assert!(render(120, 70, &snapshot, &mut app).contains("Updated"));
+            app.reset_detail();
+        }
+    }
+
+    #[test]
     fn detail_actions_survive_small_and_tiny_layouts_without_rails() {
         let snapshot = pr_snapshot();
         for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
@@ -5665,6 +6794,8 @@ mod tests {
         let mut snapshot = normal_snapshot();
         let now = Utc::now();
         let run = RunSummary {
+            confidential: false,
+            model: None,
             id: "run-7".to_owned(),
             issue_key: snapshot.issues[0].key.canonical(),
             workspace: Some(WorkspaceRef {
@@ -5745,6 +6876,8 @@ mod tests {
         let mut snapshot = normal_snapshot();
         let now = Utc::now();
         let run = RunSummary {
+            confidential: false,
+            model: None,
             id: "run-7".to_owned(),
             issue_key: snapshot.issues[0].key.canonical(),
             workspace: Some(WorkspaceRef {

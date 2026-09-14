@@ -88,13 +88,6 @@ enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("prompt profile `{name}` at {path} is empty")]
-    EmptyPromptProfile { name: String, path: PathBuf },
-    #[error("could not create data directory at {path}: {source}")]
-    CreateDataDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
     #[error(transparent)]
     Issues(#[from] agent_launcher_issues::Error),
     #[error(transparent)]
@@ -125,19 +118,16 @@ async fn run(
 ) -> Result<(), Error> {
     let cwd = std::env::current_dir().map_err(Error::CurrentDirectory)?;
     let (repository, sources) = sources_from_cwd_with_remote(&cwd, remote_url).await?;
-    let data_dir = repository_data_dir(&repository.git_dir)?;
+    // This UUID leaf belongs to this app; shared data/config ancestors retain their modes.
+    let data_dir =
+        SessionRegistry::prepare_app_data_dir(&repository_data_dir(&repository.git_dir)?)?;
     let diagnostics = agent_launcher_runtime::Diagnostics::new(data_dir.join("diagnostics.log"));
     diagnostics.record("startup", None, None, "started");
     let result = async {
     let mut config = load_config().await?;
     config.prompt_profiles = load_prompt_profiles(&config_root()?).await?;
+    config.prompt_root = Some(config_root()?.join("agents"));
     validate_config(&config)?;
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|source| Error::CreateDataDirectory {
-            path: data_dir.clone(),
-            source,
-        })?;
 
     let store = Store::open(data_dir.join("state.sqlite3")).await?;
     let registry = SessionRegistry::load(Some(data_dir.join("runner-sessions.json"))).await?;
@@ -163,6 +153,10 @@ async fn run(
     ];
     let runner = Arc::new(Runner::new(backends));
     for deletion in registry.pending_deletions().await {
+        if registry.summary(&deletion.run_id).await?.confidential {
+            registry.cancel_deletion(&deletion.run_id).await?;
+            continue;
+        }
         if !deletion.completed {
             if deletion.backend == Some(BackendKind::Native) {
                 if registry.has_other_workspace_owner(&deletion.run_id).await {
@@ -229,9 +223,7 @@ async fn run(
         }
         registry.finalize_deletion(&deletion.run_id).await?;
     }
-    for run in registry.summaries().await {
-        store.upsert_run(&run).await?;
-    }
+    import_public_runs(&store, &registry).await?;
     let runtime = RuntimeService::start(repository, sources, store, runner, config);
     diagnostics.record("startup", None, None, "succeeded");
     let tui_result = agent_launcher_tui::run(runtime.clone(), layout).await;
@@ -251,6 +243,16 @@ async fn run(
         },
     );
     result
+}
+
+#[cfg(feature = "tui")]
+async fn import_public_runs(store: &Store, registry: &SessionRegistry) -> Result<(), StoreError> {
+    for run in registry.summaries().await {
+        if !run.confidential {
+            store.upsert_run(&run).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tui")]
@@ -434,13 +436,17 @@ fn config_root_from_home(home: &Path) -> PathBuf {
 
 #[cfg(feature = "tui")]
 async fn load_prompt_profiles(config_root: &Path) -> Result<Vec<PromptProfile>, Error> {
-    const DEFAULTS: [(&str, &str); 3] = [
+    const DEFAULTS: [(&str, &str); 4] = [
         ("designer", include_str!("../../../prompts/designer.md")),
         (
             "implementer",
             include_str!("../../../prompts/implementer.md"),
         ),
         ("reviewer", include_str!("../../../prompts/reviewer.md")),
+        (
+            "security reviewer",
+            include_str!("../../../prompts/security-reviewer.md"),
+        ),
     ];
 
     let agents_dir = config_root.join("agents");
@@ -491,67 +497,9 @@ async fn load_prompt_profiles(config_root: &Path) -> Result<Vec<PromptProfile>, 
         }
     }
 
-    let mut entries =
-        tokio::fs::read_dir(&agents_dir)
-            .await
-            .map_err(|source| Error::PromptProfiles {
-                operation: "read",
-                path: agents_dir.clone(),
-                source,
-            })?;
-    let mut profiles = Vec::new();
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|source| Error::PromptProfiles {
-            operation: "read",
-            path: agents_dir.clone(),
-            source,
-        })?
-    {
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|source| Error::PromptProfiles {
-                operation: "inspect",
-                path: entry.path(),
-                source,
-            })?;
-        let directory = entry.path();
-        let is_directory = file_type.is_dir()
-            || (file_type.is_symlink()
-                && tokio::fs::metadata(&directory)
-                    .await
-                    .is_ok_and(|metadata| metadata.is_dir()));
-        if !is_directory {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = directory.join("prompt.md");
-        let template = match tokio::fs::read_to_string(&path).await {
-            Ok(template) => template,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(Error::PromptProfiles {
-                    operation: "read",
-                    path,
-                    source,
-                });
-            },
-        };
-        if template.trim().is_empty() {
-            return Err(Error::EmptyPromptProfile { name, path });
-        }
-        profiles.push(PromptProfile { name, path });
-    }
-    profiles.sort_by(|left, right| {
-        let left_default = left.name != "implementer";
-        let right_default = right.name != "implementer";
-        left_default
-            .cmp(&right_default)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(profiles)
+    Ok(agent_launcher_runtime::discover_prompt_profiles(
+        &agents_dir,
+    )?)
 }
 
 #[cfg(feature = "tui")]
@@ -661,6 +609,55 @@ mod tests {
         let mut config = AppConfig::default();
         config.herdr_activity.xdg_config_home = Some("relative/path".into());
         assert!(validate_config(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_import_skips_persisted_private_runs_but_keeps_them_available_to_runner() {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let root = SessionRegistry::prepare_app_data_dir(
+            &std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("cli-private-restart-{}", Uuid::new_v4())),
+        )
+        .unwrap();
+        let path = root.join("runner-sessions.json");
+        let fixture = r#"[
+          {"summary":{"id":"private-run","issue_key":"github:example.com:acme/widgets:advisory/GHSA-test-test-test","confidential":true,"workspace":{"backend":"native","id":"private-workspace","branch":"private-0123456789abcdef0123456789abcdef"},"agent":"opencode","model":"provider/private-model","state":"running","started_at":"2026-09-13T00:00:00Z","updated_at":"2026-09-13T00:00:00Z"},"session":{"backend":"native","base_url":"http://127.0.0.1:1/","remote":false,"server_password":"fixture-credential"}},
+          {"summary":{"id":"public-run","issue_key":"github:example.com:acme/widgets:1","agent":"opencode","state":"completed","started_at":"2026-09-13T00:00:00Z","updated_at":"2026-09-13T00:00:00Z"},"session":{"backend":"native","base_url":"http://127.0.0.1:1/","remote":false}}
+        ]"#;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(fixture.as_bytes())
+            .unwrap();
+        let store = Store::in_memory().await.unwrap();
+        for _ in 0..2 {
+            let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+            import_public_runs(&store, &registry).await.unwrap();
+            let backends: Vec<Arc<dyn Backend>> =
+                vec![Arc::new(NativeBackend::new(Default::default(), registry))];
+            let restored = Runner::new(backends).confidential_runs().await;
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].id, "private-run");
+            assert_eq!(restored[0].model.as_deref(), Some("provider/private-model"));
+            assert!(restored[0].message.is_none());
+            assert_eq!(
+                store
+                    .load_runs()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|run| run.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["public-run"]
+            );
+            assert!(store.load_events("private-run").await.unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -777,8 +774,16 @@ mod tests {
                 .iter()
                 .map(|profile| profile.name.as_str())
                 .collect::<Vec<_>>(),
-            ["implementer", "designer", "reviewer"]
+            ["implementer", "designer", "reviewer", "security reviewer"]
         );
+        let security = root.join("agents/security reviewer/prompt.md");
+        assert_eq!(
+            tokio::fs::read_to_string(&security).await.unwrap(),
+            include_str!("../../../prompts/security-reviewer.md")
+        );
+        tokio::fs::write(&security, "Custom audit {{ issue_text }}")
+            .await
+            .unwrap();
         let reviewer = root.join("agents/reviewer/prompt.md");
         tokio::fs::write(&reviewer, "Custom {{ issue_title }}")
             .await
@@ -799,12 +804,26 @@ mod tests {
                 .iter()
                 .map(|profile| profile.name.as_str())
                 .collect::<Vec<_>>(),
-            ["implementer", "reviewer", "security"]
+            ["implementer", "reviewer", "security", "security reviewer"]
         );
         assert_eq!(
             tokio::fs::read_to_string(reviewer).await.unwrap(),
             "Custom {{ issue_title }}"
         );
+        assert_eq!(
+            tokio::fs::read_to_string(&security).await.unwrap(),
+            "Custom audit {{ issue_text }}"
+        );
+        for name in ["implementer", "reviewer", "security reviewer"] {
+            tokio::fs::remove_dir_all(root.join("agents").join(name))
+                .await
+                .unwrap();
+        }
+        let custom_only = load_prompt_profiles(&root).await.unwrap();
+        assert_eq!(custom_only.len(), 1);
+        assert_eq!(custom_only[0].name, "security");
+        tokio::fs::remove_dir_all(custom).await.unwrap();
+        assert!(load_prompt_profiles(&root).await.unwrap().is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

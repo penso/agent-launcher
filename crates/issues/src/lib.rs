@@ -3,6 +3,7 @@
 mod beads;
 mod error;
 mod github;
+mod github_security;
 mod gitlab;
 mod repository;
 mod source;
@@ -13,6 +14,7 @@ use agent_launcher_core::{IssueProvider, Repository, RepositoryRemote};
 pub use beads::BeadsSource;
 pub use error::Error;
 pub use github::GitHubSource;
+pub use github_security::GitHubSecuritySource;
 pub use gitlab::GitLabSource;
 pub use repository::{RemoteCoordinates, detect_repository, parse_remote_url};
 pub use source::{IssueSource, SourceKey, SyncCheckpoint, SyncMode, SyncResult};
@@ -57,6 +59,7 @@ pub fn build_sources(repository: &Repository) -> Result<Vec<Box<dyn IssueSource>
         match remote.provider {
             IssueProvider::Github => {
                 sources.push(Box::new(GitHubSource::from_remote(remote.clone())?));
+                sources.push(Box::new(GitHubSecuritySource::from_remote(remote.clone())));
             },
             IssueProvider::Gitlab => {
                 sources.push(Box::new(GitLabSource::from_remote(remote.clone())?));
@@ -93,6 +96,12 @@ mod tests {
                 native_id: "1".into(),
             };
             assert!(!source.supports_delete());
+            assert!(!source.is_confidential());
+            assert_eq!(source.cache_key(), scope.canonical());
+            assert!(matches!(
+                source.prepare_security(&key, true).await,
+                Err(super::Error::SecurityUnsupported)
+            ));
             assert!(matches!(
                 source.delete_issue(&key).await,
                 Err(super::Error::DeleteUnsupported)

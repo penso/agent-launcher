@@ -69,7 +69,7 @@ pub(crate) fn handle_mouse(
                 if hover || *tab == app.tab {
                     return false;
                 }
-                app.switch_tab();
+                app.set_tab(*tab);
                 app.status_message = None;
             } else if let Some((_, index, key)) =
                 hit.rows.iter().find(|(rect, ..)| rect.contains(position))

@@ -87,6 +87,8 @@ pub struct Issue {
     #[serde(default)]
     pub pull_request: Option<PullRequestMetadata>,
     #[serde(default)]
+    pub security_advisory: Option<crate::SecurityAdvisoryMetadata>,
+    #[serde(default)]
     pub activity: Option<ItemActivity>,
     pub url: Option<String>,
     pub author: Option<String>,
@@ -115,6 +117,10 @@ impl ItemActivity {
 }
 
 impl Issue {
+    pub fn is_security_advisory(&self) -> bool {
+        self.security_advisory.is_some()
+    }
+
     pub fn is_blocked(&self) -> bool {
         !self.blocked_by.is_empty()
     }
@@ -123,6 +129,35 @@ impl Issue {
 #[cfg(test)]
 mod tests {
     use super::{IssueKey, IssueProvider};
+
+    #[test]
+    fn legacy_issues_default_to_non_security_and_metadata_round_trips() {
+        let mut issue: super::Issue = toml::from_str(
+            r##"
+            identifier = "#1"
+            title = "Fixture"
+            state = "open"
+            labels = []
+            blocked_by = []
+            [key]
+            provider = "github"
+            host = "github.com"
+            repository = "acme/app"
+            native_id = "1"
+        "##,
+        )
+        .unwrap();
+        assert!(!issue.is_security_advisory());
+        assert!(issue.security_advisory.is_none());
+        issue.security_advisory = Some(crate::SecurityAdvisoryMetadata {
+            ghsa_id: "GHSA-2345-cfgh-jmpq".into(),
+            cve_id: None,
+            severity: Some("high".into()),
+        });
+        assert!(issue.is_security_advisory());
+        let restored: super::Issue = toml::from_str(&toml::to_string(&issue).unwrap()).unwrap();
+        assert_eq!(restored, issue);
+    }
 
     #[test]
     fn canonical_issue_keys_are_injective_across_components() {

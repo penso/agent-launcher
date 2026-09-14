@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "backend", rename_all = "snake_case")]
 pub(crate) enum BackendSession {
     Superset {
@@ -63,6 +63,12 @@ pub(crate) enum BackendSession {
     },
 }
 
+impl std::fmt::Debug for BackendSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackendSession([redacted])")
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RunRecord {
     pub summary: RunSummary,
@@ -102,6 +108,98 @@ pub struct SessionRegistry {
 }
 
 impl SessionRegistry {
+    /// Secure only an application-owned data leaf, never shared ancestors.
+    /// Callers must supply their derived app-data path, not a user-selected directory.
+    pub fn prepare_app_data_dir(path: &std::path::Path) -> Result<PathBuf> {
+        let parent = path.parent().ok_or(Error::PrivateSecurity)?;
+        std::fs::create_dir_all(parent)?;
+        let path =
+            std::fs::canonicalize(parent)?.join(path.file_name().ok_or(Error::PrivateSecurity)?);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+
+            use rustix::fs::{Mode, OFlags, fchmod, fstat, open};
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error.into()),
+            }
+            // Pin the leaf before checking ownership/chmod so a path replacement
+            // cannot redirect chmod to a symlink target. Same-user tampering is out of scope.
+            let directory = open(
+                &path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| Error::PrivateSecurity)?;
+            if fstat(&directory)
+                .map_err(|_| Error::PrivateSecurity)?
+                .st_uid
+                != rustix::process::getuid().as_raw()
+            {
+                return Err(Error::PrivateSecurity);
+            }
+            fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(|_| Error::PrivateSecurity)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(&path)?.is_dir()
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+        Ok(path)
+    }
+
+    /// Fail closed before private backend commands or prompt delivery.
+    /// Persistence repeats this check; caller-selected parents are never chmod'ed.
+    pub fn verify_private_storage(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            let parent = self.path.parent().ok_or(Error::PrivateSecurity)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+            let metadata = std::fs::symlink_metadata(parent)?;
+            if !metadata.is_dir()
+                || metadata.uid() != rustix::process::getuid().as_raw()
+                || metadata.mode() & 0o7777 != 0o700
+            {
+                return Err(Error::PrivateSecurity);
+            }
+            for ancestor in parent.ancestors() {
+                if std::fs::symlink_metadata(ancestor)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err(Error::PrivateSecurity);
+                }
+            }
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(metadata)
+                    if !metadata.is_file()
+                        || metadata.nlink() != 1
+                        || metadata.mode() & 0o7777 != 0o600
+                        || metadata.uid() != rustix::process::getuid().as_raw() =>
+                {
+                    return Err(Error::PrivateSecurity);
+                },
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(Error::PrivateSecurity)
+    }
+
     pub async fn load(path: Option<PathBuf>) -> Result<Arc<Self>> {
         let path = match path {
             Some(path) => path,
@@ -110,22 +208,69 @@ impl SessionRegistry {
                 .join("agent-launcher")
                 .join("runner-sessions.json"),
         };
-        let records = match fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice::<Vec<RunRecord>>(&bytes)?
+        // The registry contains credentials even for ordinary runs. Pin and
+        // validate the file before reading any bytes; never silently repair it.
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::fs::MetadataExt;
+
+            use rustix::fs::{Mode, OFlags, open};
+            use tokio::io::AsyncReadExt;
+            match open(
+                &path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    let file = std::fs::File::from(fd);
+                    let metadata = file.metadata().map_err(|_| Error::PrivateSecurity)?;
+                    if !metadata.is_file()
+                        || metadata.nlink() != 1
+                        || metadata.uid() != rustix::process::getuid().as_raw()
+                        || metadata.mode() & 0o7777 != 0o600
+                    {
+                        return Err(Error::PrivateSecurity);
+                    }
+                    let mut bytes = Vec::new();
+                    fs::File::from_std(file)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|_| Error::PrivateSecurity)?;
+                    Some(bytes)
+                },
+                Err(rustix::io::Errno::NOENT) => None,
+                Err(_) => return Err(Error::PrivateSecurity),
+            }
+        };
+        #[cfg(not(unix))]
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(Error::PrivateSecurity),
+        };
+        let records: HashMap<_, _> = match bytes {
+            Some(bytes) => serde_json::from_slice::<Vec<RunRecord>>(&bytes)
+                .map_err(|_| Error::PrivateSecurity)?
                 .into_iter()
                 .map(|record| (record.summary.id.clone(), record))
                 .collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(error) => return Err(error.into()),
+            None => HashMap::new(),
         };
-        Ok(Arc::new(Self {
+        let confidential = records.values().any(|record| record.summary.confidential);
+        let registry = Arc::new(Self {
             path,
             records: RwLock::new(records),
             persist_lock: Mutex::new(()),
             children: Mutex::new(HashMap::new()),
             provision_lock: Mutex::new(()),
             conductor_dispatch_lock: Mutex::new(()),
-        }))
+        });
+        if confidential {
+            registry
+                .verify_private_storage()
+                .map_err(|_| Error::PrivateSecurity)?;
+        }
+        Ok(registry)
     }
 
     pub async fn summaries(&self) -> Vec<RunSummary> {
@@ -202,9 +347,12 @@ impl SessionRegistry {
         self.remove(run_id).await.map(|_| ())
     }
 
-    pub(crate) async fn insert(&self, record: RunRecord) -> Result<()> {
+    pub(crate) async fn insert(&self, mut record: RunRecord) -> Result<()> {
         let run_id = record.summary.id.clone();
-        let previous = self.records.write().await.insert(run_id.clone(), record);
+        let mut records = self.records.write().await;
+        record.summary.confidential |= records.get(&run_id).is_some_and(|r| r.summary.confidential);
+        let previous = records.insert(run_id.clone(), record);
+        drop(records);
         if let Err(error) = self.persist().await {
             let mut records = self.records.write().await;
             if let Some(previous) = previous {
@@ -282,7 +430,7 @@ impl SessionRegistry {
             .count()
     }
 
-    pub(crate) async fn update_summary(&self, summary: RunSummary) -> Result<()> {
+    pub(crate) async fn update_summary(&self, mut summary: RunSummary) -> Result<()> {
         let mut records = self.records.write().await;
         let record = records
             .get_mut(&summary.id)
@@ -291,6 +439,7 @@ impl SessionRegistry {
             return Err(Error::RunNotFound(summary.id));
         }
         let previous = record.summary.clone();
+        summary.confidential |= previous.confidential;
         record.summary = summary;
         drop(records);
         if let Err(error) = self.persist().await {
@@ -302,7 +451,7 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub(crate) async fn update(&self, record: RunRecord) -> Result<()> {
+    pub(crate) async fn update(&self, mut record: RunRecord) -> Result<()> {
         let mut records = self.records.write().await;
         let Some(existing) = records.get(&record.summary.id) else {
             return Err(Error::RunNotFound(record.summary.id));
@@ -311,6 +460,7 @@ impl SessionRegistry {
             return Err(Error::RunNotFound(record.summary.id));
         }
         let run_id = record.summary.id.clone();
+        record.summary.confidential |= existing.summary.confidential;
         let previous = records.insert(run_id.clone(), record);
         drop(records);
         if let Err(error) = self.persist().await {
@@ -466,21 +616,67 @@ impl SessionRegistry {
             .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|left, right| left.summary.id.cmp(&right.summary.id));
+        // Confidential harness text is held in memory only; restart must not replay it.
+        for record in &mut records {
+            if record.summary.confidential {
+                record.summary.message = None;
+                if let BackendSession::Native {
+                    initial_prompt,
+                    pending_question_prompt,
+                    ..
+                } = &mut record.session
+                {
+                    *initial_prompt = None;
+                    *pending_question_prompt = None;
+                }
+                if let Some(inspection) = record
+                    .deletion
+                    .as_mut()
+                    .and_then(|d| d.expected_inspection.as_mut())
+                {
+                    inspection.warning = None;
+                }
+            }
+        }
         let bytes = serde_json::to_vec_pretty(&records)?;
         let parent = self
             .path
             .parent()
             .ok_or_else(|| Error::InvalidRequest("registry path has no parent".into()))?;
-        fs::create_dir_all(parent).await?;
-        let temporary = self.path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-        fs::write(&temporary, bytes).await?;
         #[cfg(unix)]
-        fs::set_permissions(&temporary, {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::Permissions::from_mode(0o600)
-        })
-        .await?;
-        fs::rename(&temporary, &self.path).await?;
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent).await?;
+        if records.iter().any(|record| record.summary.confidential) {
+            self.verify_private_storage()?;
+        }
+        let temporary = self.path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+        // Keep creation/write/rename in one non-yielding section: cancellation cannot
+        // leave a background tokio file write racing temporary-file cleanup.
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &self.path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
         Ok(())
     }
 }
@@ -496,6 +692,7 @@ mod tests {
         let now = Utc::now();
         RunRecord {
             summary: RunSummary {
+                confidential: false,
                 id: id.into(),
                 issue_key: format!("issue-{id}"),
                 workspace: Some(WorkspaceRef {
@@ -506,6 +703,7 @@ mod tests {
                     branch: format!("agent/{id}"),
                 }),
                 agent: "codex".into(),
+                model: None,
                 state,
                 message: None,
                 session_id: Some(format!("session-{id}")),
@@ -522,6 +720,46 @@ mod tests {
             },
             deletion: None,
         }
+    }
+
+    #[test]
+    fn model_round_trips_and_legacy_registry_defaults_to_none() {
+        let mut record = conductor_record("model", RunState::Running, "key");
+        record.summary.model = Some("sonnet".into());
+        let mut value = serde_json::to_value(&record).unwrap();
+        let restored: RunRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.summary.model, record.summary.model);
+        value["summary"].as_object_mut().unwrap().remove("model");
+        let legacy: RunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.summary.model, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_data_secures_only_leaf_and_refuses_symlinks_and_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("app-data-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let leaf = root.join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(SessionRegistry::prepare_app_data_dir(&leaf).unwrap(), leaf);
+        assert_eq!(std::fs::metadata(&leaf).unwrap().mode() & 0o7777, 0o700);
+        let fresh = root.join("fresh");
+        SessionRegistry::prepare_app_data_dir(&fresh).unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o7777, 0o700);
+        let link = root.join("link");
+        symlink(&root, &link).unwrap();
+        assert!(SessionRegistry::prepare_app_data_dir(&link).is_err());
+        let file = root.join("file");
+        std::fs::write(&file, "sentinel").unwrap();
+        assert!(SessionRegistry::prepare_app_data_dir(&file).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "sentinel");
+        assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o7777, 0o755);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn native_record(
@@ -557,6 +795,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confidential_harness_text_is_not_persisted() {
+        let parent = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("runner-registry-{}", Uuid::new_v4()));
+        let path = parent.join("sessions.json");
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        let mut record = native_record("private", RunState::Starting, None, "local");
+        record.summary.confidential = true;
+        record.summary.model = Some("provider/private-model".into());
+        record.summary.message = Some("confidential error body".into());
+        if let BackendSession::Native {
+            initial_prompt,
+            pending_question_prompt,
+            ..
+        } = &mut record.session
+        {
+            *initial_prompt = Some(serde_json::json!({"text": "confidential prompt body"}));
+            *pending_question_prompt = Some("confidential question body".into());
+        }
+        registry.insert(record).await.unwrap();
+        let persisted = fs::read_to_string(&path).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        }
+        for secret in [
+            "confidential error body",
+            "confidential prompt body",
+            "confidential question body",
+        ] {
+            assert!(!persisted.contains(secret));
+        }
+        let record = registry.get("private").await.unwrap();
+        assert!(matches!(record.session, BackendSession::Native {
+            initial_prompt: Some(_),
+            ..
+        }));
+        let reloaded = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        let native: Arc<dyn crate::Backend> = Arc::new(crate::NativeBackend::new(
+            Default::default(),
+            reloaded.clone(),
+        ));
+        let herdr: Arc<dyn crate::Backend> = Arc::new(crate::HerdrBackend::new(
+            Default::default(),
+            reloaded.clone(),
+        ));
+        let duplicate: Arc<dyn crate::Backend> =
+            Arc::new(crate::NativeBackend::new(Default::default(), reloaded));
+        let runner = crate::Runner::new([native, herdr, duplicate]);
+        let restored = runner.confidential_runs().await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "private");
+        assert_eq!(restored[0].model.as_deref(), Some("provider/private-model"));
+        assert!(restored[0].confidential);
+        assert!(restored[0].message.is_none());
+        fs::remove_dir_all(parent).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_read_rejects_insecure_modes_links_and_foreign_owners_before_decoding() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let root = SessionRegistry::prepare_app_data_dir(
+            &std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("registry-read-{}", Uuid::new_v4())),
+        )
+        .unwrap();
+        let path = root.join("sessions.json");
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        let mut record = native_record("private", RunState::Running, None, "local");
+        record.summary.confidential = true;
+        registry.insert(record).await.unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        for mode in [0o644, 0o640, 0o660, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(matches!(
+                SessionRegistry::load(Some(path.clone())).await,
+                Err(Error::PrivateSecurity)
+            ));
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = root.join("linked.json");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            SessionRegistry::load(Some(link.clone())).await,
+            Err(Error::PrivateSecurity)
+        ));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(matches!(
+            SessionRegistry::load(Some(path.clone())).await,
+            Err(Error::PrivateSecurity)
+        ));
+        std::fs::remove_file(&link).unwrap();
+        // Changing file ownership needs privilege; exercise it when available.
+        if rustix::process::getuid().is_root() {
+            rustix::fs::chown(&path, Some(rustix::process::Uid::from_raw(65534)), None).unwrap();
+            assert!(matches!(
+                SessionRegistry::load(Some(path.clone())).await,
+                Err(Error::PrivateSecurity)
+            ));
+            rustix::fs::chown(&path, Some(rustix::process::getuid()), None).unwrap();
+        }
+        assert_eq!(
+            SessionRegistry::load(Some(path.clone()))
+                .await
+                .unwrap()
+                .summaries()
+                .await
+                .len(),
+            1
+        );
+        // Invalid registry content must not echo credentials through a parse error.
+        std::fs::write(&path, b"PRIVATE CREDENTIAL SENTINEL").unwrap();
+        let error = SessionRegistry::load(Some(path)).await.err().unwrap();
+        assert!(matches!(error, Error::PrivateSecurity));
+        assert!(!error.to_string().contains("SENTINEL"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_restart_discovery_is_backend_owned_and_excludes_public_and_deleting_runs() {
+        let root = SessionRegistry::prepare_app_data_dir(
+            &std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("registry-restore-{}", Uuid::new_v4())),
+        )
+        .unwrap();
+        let path = root.join("sessions.json");
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        let mut private = native_record("native", RunState::Running, None, "local");
+        private.summary.confidential = true;
+        registry.insert(private.clone()).await.unwrap();
+        let mut herdr = private.clone();
+        herdr.summary.id = "herdr".into();
+        herdr.summary.agent = "claude".into();
+        herdr.summary.model = Some("sonnet".into());
+        herdr.summary.workspace.as_mut().unwrap().backend = BackendKind::Herdr;
+        herdr.session = BackendSession::Herdr {
+            workspace_id: "workspace-herdr".into(),
+            pane_id: "pane-herdr".into(),
+            agent_name: "claude".into(),
+        };
+        registry.insert(herdr).await.unwrap();
+        let mut wrong = private.clone();
+        wrong.summary.id = "mislabeled".into();
+        wrong.summary.workspace.as_mut().unwrap().backend = BackendKind::Herdr;
+        registry.insert(wrong).await.unwrap();
+        let mut deleting = private;
+        deleting.summary.id = "deleting".into();
+        deleting.deletion = Some(DeletionState {
+            force: false,
+            completed: false,
+            expected_inspection: None,
+        });
+        registry.insert(deleting).await.unwrap();
+        registry
+            .insert(native_record("public", RunState::Running, None, "local"))
+            .await
+            .unwrap();
+        drop(registry);
+        let registry = SessionRegistry::load(Some(path)).await.unwrap();
+        let backends: Vec<Arc<dyn crate::Backend>> = vec![
+            Arc::new(crate::NativeBackend::new(
+                Default::default(),
+                registry.clone(),
+            )),
+            Arc::new(crate::HerdrBackend::new(Default::default(), registry)),
+        ];
+        let runner = crate::Runner::new(backends);
+        let runs = runner.confidential_runs().await;
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["herdr", "native"].into_iter().collect()
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.id == "herdr")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("sonnet")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn conductor_dedupe_only_returns_active_runs() {
         let path = std::env::temp_dir().join(format!("runner-registry-{}.json", Uuid::new_v4()));
         let registry = SessionRegistry::load(Some(path.clone()))
@@ -581,6 +1020,39 @@ mod tests {
             "running"
         );
         let _ = fs::remove_file(path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_registry_rejects_shared_parents_and_symlink_targets_without_mutations() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("registry-safety-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = root.join("sessions.json");
+        let registry = SessionRegistry::load(Some(path.clone())).await.unwrap();
+        let mut record = native_record("private", RunState::Starting, None, "local");
+        record.summary.confidential = true;
+        assert!(matches!(
+            registry.verify_private_storage(),
+            Err(Error::PrivateSecurity)
+        ));
+        assert!(registry.insert(record.clone()).await.is_err());
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!path.exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.join("external");
+        std::fs::write(&target, "sentinel").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(registry.insert(record).await.is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "sentinel");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
