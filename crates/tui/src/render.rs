@@ -95,7 +95,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
 }
 
 fn draw_mode_button(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) -> Rect {
-    use agent_launcher_core::{AppMode, AwayPhase};
+    use agent_launcher_core::AppMode;
 
     let away = &snapshot.away;
     let active = away.mode == AppMode::Away;
@@ -104,34 +104,7 @@ fn draw_mode_button(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapsho
     } else {
         "Manual"
     };
-    let count = format!(
-        "{}/{}",
-        away.occupied_slots(&snapshot.runs),
-        away.max_agents
-    );
-    let phase = match away.phase {
-        AwayPhase::Inactive => "Inactive",
-        AwayPhase::Refreshing => "Refreshing",
-        AwayPhase::Prioritizing => "Prioritizing",
-        AwayPhase::Running => "Running",
-        AwayPhase::Paused => "Paused",
-        AwayPhase::Draining => "Draining",
-        AwayPhase::QueueEmpty => "Queue empty",
-        AwayPhase::Attention => "Attention",
-    };
-    let mut labels = Vec::new();
-    if active || away.phase == AwayPhase::Draining {
-        labels.push(format!(" {mode} {count} {phase} F2 "));
-        if matches!(
-            away.phase,
-            AwayPhase::Paused | AwayPhase::Attention | AwayPhase::Draining
-        ) {
-            labels.push(format!(" {mode} {phase} F2 "));
-        }
-        labels.push(format!(" {mode} {count} F2 "));
-    }
-    labels.extend([format!(" {mode} F2 "), format!("{mode} F2"), "F2".into()]);
-    let Some(label) = labels
+    let Some(label) = [format!(" {mode} "), mode.to_owned()]
         .into_iter()
         .find(|label| label.len() <= usize::from(area.width))
     else {
@@ -650,17 +623,8 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
             },
         ));
     }
-    // Keep complete tabs plus a compact mode label; otherwise use the footer.
-    let minimum = if snapshot.away.mode == agent_launcher_core::AppMode::Away {
-        format!(
-            " Away {}/{} F2 ",
-            snapshot.away.occupied_slots(&snapshot.runs),
-            snapshot.away.max_agents
-        )
-        .len()
-    } else {
-        " Manual F2 ".len()
-    };
+    // Reserve room for either mode so switching does not move the control.
+    let minimum = " Manual ".len();
     let available = inner.right().saturating_sub(x + 1);
     if usize::from(available) >= minimum {
         app.mouse.mode = draw_mode_button(frame, Rect::new(x + 1, inner.y, available, 1), snapshot);
@@ -1549,7 +1513,7 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if width < 48 || height < 12 {
         frame.render_widget(
             Paragraph::new(
-                "m mode (F2)\ng debug\nd dispatch/review\nr refresh\ns sort\nc clear search\nq quit\nEsc cancel",
+                "m mode\ng debug\nd dispatch/review\nr refresh\ns sort\nc clear search\nq quit\nEsc cancel",
             )
             .style(Style::new().bg(theme::element()).fg(theme::primary())),
             popup,
@@ -1585,7 +1549,7 @@ fn draw_command_overlay(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             },
         ),
         command_help_line("r", "refresh issue sources"),
-        command_help_line("m / F2", "Manual / Away mode and ranked queue"),
+        command_help_line("m", "Manual / Away mode and ranked queue"),
         command_help_line("s", "choose issue sorting"),
         command_help_line("g", "debug runtime status"),
         command_help_line("c", "clear search"),
@@ -3443,7 +3407,14 @@ mod tests {
                         let label: String = (button.x..button.right())
                             .map(|x| buffer[(x, button.y)].symbol())
                             .collect();
-                        assert!(label.contains("F2"));
+                        assert_eq!(
+                            label.trim(),
+                            if phase == AwayPhase::Inactive {
+                                "Manual"
+                            } else {
+                                "Away"
+                            }
+                        );
                         assert!(!render(width, height, &snapshot, &mut app).contains("MODE:"));
                         if route == Route::Inbox && width >= 80 {
                             assert_eq!(button.y, app.mouse.tabs[0].0.y);
@@ -3453,15 +3424,6 @@ mod tests {
                             } else {
                                 "Away"
                             }));
-                            if phase != AwayPhase::Inactive {
-                                assert!(label.contains("0/5"));
-                            }
-                            if phase == AwayPhase::Paused {
-                                assert!(label.contains("Paused"));
-                            }
-                            if phase == AwayPhase::Attention {
-                                assert!(label.contains("Attention"));
-                            }
                         } else {
                             assert_eq!(button.y, height - 1);
                             assert_eq!(button.right(), width);
@@ -3568,16 +3530,16 @@ mod tests {
     }
 
     #[test]
-    fn mode_button_uses_snapshot_slots_and_prioritizes_urgent_phases() {
+    fn mode_button_shows_only_mode_regardless_of_slots_or_phase() {
         use agent_launcher_core::{AppMode, AwayPhase};
         let mut snapshot = RuntimeSnapshot::default();
         snapshot.away.mode = AppMode::Away;
         snapshot.away.prioritizing = true;
         for (phase, width, expected) in [
-            (AwayPhase::Running, 13, " Away 1/5 F2 "),
-            (AwayPhase::Paused, 17, " Away Paused F2 "),
-            (AwayPhase::Attention, 20, " Away Attention F2 "),
-            (AwayPhase::Attention, 30, " Away 1/5 Attention F2 "),
+            (AwayPhase::Running, 13, " Away "),
+            (AwayPhase::Paused, 17, " Away "),
+            (AwayPhase::Attention, 20, " Away "),
+            (AwayPhase::Attention, 30, " Away "),
         ] {
             snapshot.away.phase = phase;
             let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
@@ -7374,7 +7336,7 @@ mod tests {
         let mut app = AppState::default();
         assert!(app.open_detail(&snapshot));
         let text = render(120, 60, &snapshot, &mut app);
-        assert!(text.contains(" Manual F2 "));
+        assert!(text.contains(" Manual "));
         assert!(text.contains("Implemented the fix."));
         assert!(text.contains("Tests passed."));
         assert!(text.contains("cd -- '/work/away tree' && opencode -s ses_real123"));

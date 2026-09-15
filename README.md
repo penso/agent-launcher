@@ -398,22 +398,26 @@ in retained worktrees as capacity becomes available. It currently requires the
 no fallback to another backend or harness. PRs, private security advisories, blocked
 issues, and closed items are excluded. The queue is independent of inbox search/sort.
 
-1. Press `F2`, click the compact mode button at the far right of the Issues/PRs/Security tabs row (in the footer on detail screens or narrow terminals), or press `Ctrl+G`, then `m` to open controls.
-2. Set **Max agents** by typing a number or using `+` / `-`: **1..64**, initially **5**.
+1. Click the compact mode button at the far right of the Issues/PRs/Security tabs row (in the footer on detail screens or narrow terminals), or press `Ctrl+G`, then `m` to open controls.
+2. Choose the **Away** tab by clicking it or using `Tab` / left-right arrows.
+   Tabs preview each mode's attributes without changing the active mode. Manual has
+   no global settings; Away has its own worker settings and queue. Away drafts survive
+   tab changes. Set **Max agents** by typing a number or using `+` / `-`: **1..64**, initially **5**.
    The first digit replaces the displayed value; Backspace edits it. Use `p` to
    cycle profiles. With no saved profile selection, the chooser prefers `implementer`,
    then the first available profile, then the built-in prompt. Ranking defaults to
    **Agent**; `r` toggles **Source priority** (numeric priority ascending, missing last;
    ties oldest first, then canonical issue key).
-3. Press `s` to Start. This captures the profile selection, ranking, and configured
+3. Press `Enter` (or `s`) to Start. This captures the profile selection, ranking, and configured
    model/effort; an unset model uses the harness default. While Away is enabled,
-   `l` applies an edited limit, `a` pauses/resumes, and `o` explicitly reprioritizes
-   using the selected ranking. `Esc` only closes controls. The strip shows progress;
-   controls show queue reasons and errors.
+   `l` applies an edited limit, `Enter` / `a` pauses/resumes, and `o` explicitly reprioritizes
+   using the selected ranking. `Esc` only closes controls. The button shows the active
+   mode; the modal shows progress, queue reasons, and errors.
 
 **Pause and drain:** Pause stops new automatic admissions, not existing workers or
-already-submitted launches. `m` switches to Manual and lets existing work drain while
-launcher continues recording results. Lowering the limit also leaves workers running.
+already-submitted launches. Select the **Manual** tab and press `Enter` to switch modes
+and let existing work drain while launcher continues recording results. Lowering the
+limit also leaves workers running.
 The limit covers launcher-managed/known runs, including the prioritizer, pending
 reservations, active runs, and disconnected/unknown outcomes. Ordinary tracked Herdr
 runs marked completed also count: Herdr's done status does not prove process exit.

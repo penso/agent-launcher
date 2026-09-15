@@ -2,7 +2,7 @@ use agent_launcher_core::{
     AppMode, AwayEntryState, AwayPhase, AwayRanking, BackendKind, RunState, RuntimeCommand,
     RuntimeSnapshot,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -14,6 +14,8 @@ use ratatui::{
 use crate::{app::AppState, theme};
 
 pub(crate) struct AwayOverlay {
+    pub tab: AppMode,
+    pub tabs: Vec<(Rect, AppMode)>,
     pub limit: String,
     pub profile: Option<String>,
     pub ranking: AwayRanking,
@@ -22,9 +24,36 @@ pub(crate) struct AwayOverlay {
     pub replace_limit: bool,
 }
 
+impl AwayOverlay {
+    fn scroll_key(&mut self, code: KeyCode) -> bool {
+        self.scroll = match code {
+            KeyCode::Up => self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll.saturating_add(1).min(self.scroll_max),
+            KeyCode::PageUp => self.scroll.saturating_sub(8),
+            KeyCode::PageDown => self.scroll.saturating_add(8).min(self.scroll_max),
+            KeyCode::Home => 0,
+            KeyCode::End => self.scroll_max,
+            _ => return false,
+        };
+        true
+    }
+
+    fn select_tab(&mut self, tab: AppMode) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.scroll = 0;
+            self.scroll_max = 0;
+            self.replace_limit = true;
+            self.tabs.clear();
+        }
+    }
+}
+
 pub(crate) fn open(app: &mut AppState, snapshot: &RuntimeSnapshot) {
     app.command_overlay = false;
     app.away_overlay = Some(AwayOverlay {
+        tab: snapshot.away.mode,
+        tabs: Vec::new(),
         limit: snapshot.away.max_agents.to_string(),
         profile: snapshot.away.profile.clone().or_else(|| {
             (snapshot.away.mode == AppMode::Manual)
@@ -75,6 +104,44 @@ pub(crate) fn prepare_command(
     if app.away_pending.is_some() {
         return None;
     }
+    if matches!(
+        key.code,
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+    ) {
+        overlay.select_tab(match overlay.tab {
+            AppMode::Manual => AppMode::Away,
+            AppMode::Away => AppMode::Manual,
+        });
+        return None;
+    }
+    if overlay.scroll_key(key.code) {
+        return None;
+    }
+    if overlay.tab == AppMode::Manual {
+        return if matches!(key.code, KeyCode::Enter | KeyCode::Char('m'))
+            && key.kind == KeyEventKind::Press
+            && snapshot.away.mode != AppMode::Manual
+        {
+            Some(RuntimeCommand::SetManual)
+        } else {
+            None
+        };
+    }
+    let key = if key.code == KeyCode::Enter {
+        KeyEvent {
+            code: KeyCode::Char(if snapshot.away.mode == AppMode::Manual {
+                's'
+            } else {
+                'a'
+            }),
+            ..key
+        }
+    } else {
+        key
+    };
+    if snapshot.away.mode == AppMode::Manual && matches!(key.code, KeyCode::Char('a' | 'l' | 'o')) {
+        return None;
+    }
     match key.code {
         KeyCode::Char(c @ '0'..='9') if overlay.replace_limit || overlay.limit.len() < 3 => {
             if overlay.replace_limit {
@@ -115,17 +182,12 @@ pub(crate) fn prepare_command(
                 AwayRanking::SourcePriority => AwayRanking::Agent,
             }
         },
-        KeyCode::Up => overlay.scroll = overlay.scroll.saturating_sub(1),
-        KeyCode::Down => overlay.scroll = overlay.scroll.saturating_add(1).min(overlay.scroll_max),
-        KeyCode::PageUp => overlay.scroll = overlay.scroll.saturating_sub(8),
-        KeyCode::PageDown => {
-            overlay.scroll = overlay.scroll.saturating_add(8).min(overlay.scroll_max)
-        },
-        KeyCode::Home => overlay.scroll = 0,
-        KeyCode::End => overlay.scroll = overlay.scroll_max,
         KeyCode::Char('s' | 'l' | 'a' | 'm' | 'o') if key.kind == KeyEventKind::Press => {
             let command = match key.code {
-                KeyCode::Char('m') => RuntimeCommand::SetManual,
+                KeyCode::Char('m') => {
+                    overlay.select_tab(AppMode::Manual);
+                    return None;
+                },
                 KeyCode::Char('a') => {
                     if matches!(
                         snapshot.away.phase,
@@ -183,6 +245,39 @@ pub(crate) fn prepare_command(
         _ => {},
     }
     None
+}
+
+pub(crate) fn handle_mouse(app: &mut AppState, event: MouseEvent, size: (u16, u16)) -> bool {
+    if app.away_pending.is_some()
+        || app.away_quit
+        || (app.mouse.screen.width, app.mouse.screen.height) != size
+    {
+        return false;
+    }
+    let Some(overlay) = app.away_overlay.as_mut() else {
+        return false;
+    };
+    if event.kind == MouseEventKind::Down(MouseButton::Left) {
+        if let Some((_, tab)) = overlay
+            .tabs
+            .iter()
+            .find(|(rect, _)| rect.contains((event.column, event.row).into()))
+        {
+            overlay.select_tab(*tab);
+            return true;
+        }
+    } else if matches!(
+        event.kind,
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+    ) {
+        overlay.scroll = if event.kind == MouseEventKind::ScrollDown {
+            overlay.scroll.saturating_add(3).min(overlay.scroll_max)
+        } else {
+            overlay.scroll.saturating_sub(3)
+        };
+        return true;
+    }
+    false
 }
 
 fn phase_label(phase: AwayPhase) -> &'static str {
@@ -268,6 +363,7 @@ pub(crate) fn draw(
     };
     let away = &snapshot.away;
     let active = away.mode == AppMode::Away;
+    let viewing_away = overlay.tab == AppMode::Away;
     let ready = snapshot.selected_backend == Some(BackendKind::Herdr)
         && snapshot.selected_agent == "opencode";
     let pending = app.away_pending.is_some();
@@ -285,90 +381,87 @@ pub(crate) fn draw(
             Span::styled(format!("  {hint}"), muted),
         ])
     };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                " MANUAL ",
-                if active {
-                    muted
-                } else {
-                    selected
-                },
-            ),
-            Span::raw("  "),
-            Span::styled(
-                " AWAY ",
-                if active {
-                    selected
-                } else {
-                    muted
-                },
-            ),
-            Span::styled(
-                format!(
-                    "    {}",
-                    if active {
-                        phase_label(away.phase)
-                    } else {
-                        "You choose what runs"
-                    }
+    let mut lines = if viewing_away {
+        vec![
+            Line::styled("WORKER SETTINGS", accent),
+            Line::from(vec![
+                Span::styled("Max agents      ", muted),
+                Span::styled(
+                    format!(" {:>2} ", overlay.limit),
+                    Style::new()
+                        .fg(theme::primary())
+                        .bg(theme::element())
+                        .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled("  +/- adjust, or type a number", muted),
+            ]),
+            field(
+                "Profile",
+                overlay
+                    .profile
+                    .as_deref()
+                    .unwrap_or("built-in prompt")
+                    .into(),
+                "[p]",
+            ),
+            field(
+                "Priority",
+                match overlay.ranking {
+                    AwayRanking::Agent => "Agent ranked",
+                    AwayRanking::SourcePriority => "Source priority",
+                }
+                .into(),
+                "[r]",
+            ),
+            field(
+                "Model",
+                if active {
+                    away.model.as_deref()
+                } else {
+                    snapshot.selected_model.as_deref()
+                }
+                .unwrap_or("harness default")
+                .into(),
+                "",
+            ),
+            Line::styled(
+                if active {
+                    "Apply limit / priority below. Profile applies on next start."
+                } else {
+                    "Ranks your backlog, then fills available agent slots."
+                },
                 muted,
             ),
-        ]),
-        Line::raw(""),
-        Line::styled("WORKER SETTINGS", accent),
-        Line::from(vec![
-            Span::styled("Max agents      ", muted),
-            Span::styled(
-                format!(" {:>2} ", overlay.limit),
-                Style::new()
-                    .fg(theme::primary())
-                    .bg(theme::element())
-                    .add_modifier(Modifier::BOLD),
+            Line::raw(""),
+        ]
+    } else {
+        vec![
+            Line::styled("YOU CHOOSE WHAT RUNS", accent),
+            Line::raw(""),
+            Line::raw("Pick an issue, choose an agent, and launch when you're ready."),
+            Line::styled("No automatic prioritization or queue refill.", muted),
+            Line::raw(""),
+            Line::styled("NO SETTINGS REQUIRED", accent),
+            Line::styled(
+                "Agent, model, and instructions are chosen for each launch.",
+                muted,
             ),
-            Span::styled("  +/- adjust, or type a number", muted),
-        ]),
-        field(
-            "Profile",
-            overlay
-                .profile
-                .as_deref()
-                .unwrap_or("built-in prompt")
-                .into(),
-            "[p]",
-        ),
-        field(
-            "Priority",
-            match overlay.ranking {
-                AwayRanking::Agent => "Agent ranked",
-                AwayRanking::SourcePriority => "Source priority",
-            }
-            .into(),
-            "[r]",
-        ),
-        field(
-            "Model",
-            if active {
-                away.model.as_deref()
-            } else {
-                snapshot.selected_model.as_deref()
-            }
-            .unwrap_or("harness default")
-            .into(),
-            "",
-        ),
-        Line::styled(
-            if active {
-                "Apply limit / priority below. Profile applies on next start."
-            } else {
-                "Ranks your backlog, then fills available agent slots."
-            },
-            muted,
-        ),
-        Line::raw(""),
-    ];
-    if active {
+            Line::raw(""),
+            Line::styled(
+                if active {
+                    "Switching to Manual stops new automatic launches."
+                } else {
+                    "Manual is your current mode."
+                },
+                muted,
+            ),
+            Line::styled(
+                "Existing workers finish normally. Their worktrees are retained.",
+                muted,
+            ),
+        ]
+    };
+    if active && viewing_away {
         let count = |state| {
             away.entries
                 .iter()
@@ -408,64 +501,66 @@ pub(crate) fn draw(
             muted,
         ));
     }
-    if !ready {
+    if viewing_away && !ready {
         lines.push(Line::styled(
             "Requires Herdr + OpenCode. Select them before starting.",
             Style::new().fg(theme::error()),
         ));
     }
-    if let Some(error) = &away.error {
+    if viewing_away && let Some(error) = &away.error {
         lines.push(Line::styled(error.clone(), Style::new().fg(theme::error())));
         lines.push(Line::raw(""));
     }
-    lines.push(Line::styled(
-        format!("WORK QUEUE  /  {}", away.entries.len()),
-        accent,
-    ));
-    if away.entries.is_empty() {
+    if viewing_away {
         lines.push(Line::styled(
-            "No work queued yet",
-            Style::new().fg(theme::text()).add_modifier(Modifier::BOLD),
+            format!("WORK QUEUE  /  {}", away.entries.len()),
+            accent,
         ));
-        lines.push(Line::styled(
-            "Start Away to prioritize eligible issues automatically.",
-            muted,
-        ));
-    }
-    for (i, entry) in snapshot.away.entries.iter().enumerate() {
-        let (label, color) = match entry.state {
-            AwayEntryState::Queued => ("QUEUED", theme::muted()),
-            AwayEntryState::Launching => ("STARTING", theme::primary()),
-            AwayEntryState::Running => ("RUNNING", theme::primary()),
-            AwayEntryState::Finished => ("FINISHED", theme::done()),
-            AwayEntryState::Attention => ("ATTENTION", theme::error()),
-            AwayEntryState::Skipped => ("SKIPPED", theme::secondary()),
-        };
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:>2}  ", i + 1), muted),
-            Span::styled(
-                format!("{label:<10}"),
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(entry.identifier.clone(), accent),
-        ]));
-        lines.push(Line::raw(format!("    {}", entry.title)));
-        lines.push(Line::styled(format!("    {}", entry.reason), muted));
-        if let Some(error) = &entry.error {
+        if away.entries.is_empty() {
             lines.push(Line::styled(
-                format!("    {error}"),
-                Style::new().fg(theme::error()),
+                "No work queued yet",
+                Style::new().fg(theme::text()).add_modifier(Modifier::BOLD),
             ));
+            lines.push(Line::styled(
+                "Start Away to prioritize eligible issues automatically.",
+                muted,
+            ));
+        }
+        for (i, entry) in snapshot.away.entries.iter().enumerate() {
+            let (label, color) = match entry.state {
+                AwayEntryState::Queued => ("QUEUED", theme::muted()),
+                AwayEntryState::Launching => ("STARTING", theme::primary()),
+                AwayEntryState::Running => ("RUNNING", theme::primary()),
+                AwayEntryState::Finished => ("FINISHED", theme::done()),
+                AwayEntryState::Attention => ("ATTENTION", theme::error()),
+                AwayEntryState::Skipped => ("SKIPPED", theme::secondary()),
+            };
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>2}  ", i + 1), muted),
+                Span::styled(
+                    format!("{label:<10}"),
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(entry.identifier.clone(), accent),
+            ]));
+            lines.push(Line::raw(format!("    {}", entry.title)));
+            lines.push(Line::styled(format!("    {}", entry.reason), muted));
+            if let Some(error) = &entry.error {
+                lines.push(Line::styled(
+                    format!("    {error}"),
+                    Style::new().fg(theme::error()),
+                ));
+            }
         }
     }
     let popup = dialog_area(
         area,
         if away.entries.is_empty() {
             if active {
-                24
+                26
             } else {
-                22
+                24
             }
         } else {
             34
@@ -485,17 +580,56 @@ pub(crate) fn draw(
         },
         1,
     ));
-    let title = Rect::new(inner.x, inner.y, inner.width, inner.height.min(2));
+    let title = Rect::new(inner.x, inner.y, inner.width, inner.height.min(4));
     frame.render_widget(
         Paragraph::new(vec![
-            Line::styled("Work while you're away", accent),
+            Line::styled("Operating mode", accent),
+            Line::raw(""),
             Line::styled(
-                "Herdr / OpenCode   -   Branches and sessions stay yours.",
+                format!(
+                    "Active: {}{}",
+                    if active {
+                        "Away"
+                    } else {
+                        "Manual"
+                    },
+                    if active {
+                        format!(" / {}", phase_label(away.phase))
+                    } else {
+                        String::new()
+                    }
+                ),
                 muted,
             ),
         ]),
         title,
     );
+    overlay.tabs.clear();
+    if title.height >= 2 {
+        let mut x = inner.x;
+        for (mode, label) in [(AppMode::Manual, " Manual "), (AppMode::Away, " Away ")] {
+            let width = (label.len() as u16).min(inner.right().saturating_sub(x));
+            let rect = Rect::new(x, inner.y + 1, width, 1);
+            if width > 0 {
+                frame.render_widget(
+                    Paragraph::new(label).style(if overlay.tab == mode {
+                        selected
+                    } else {
+                        Style::new().fg(theme::text()).bg(theme::element())
+                    }),
+                    rect,
+                );
+                overlay.tabs.push((rect, mode));
+            }
+            x = x.saturating_add(width + 2);
+        }
+        if inner.right().saturating_sub(x) >= 20 {
+            frame.render_widget(
+                Paragraph::new("Tab / arrows to choose").style(muted),
+                Rect::new(x, inner.y + 1, inner.right() - x, 1),
+            );
+        }
+    }
     let footer_height = inner.height.saturating_sub(title.height).min(4);
     let body = Rect::new(
         inner.x,
@@ -514,22 +648,29 @@ pub(crate) fn draw(
     frame.render_widget(paragraph.scroll((overlay.scroll, 0)), body);
     let primary = if pending {
         " Working... "
+    } else if !viewing_away {
+        if active {
+            " Enter  Use Manual "
+        } else {
+            " Manual is active "
+        }
     } else if !active {
-        " s  Start away "
+        " Enter  Start Away "
     } else if matches!(away.phase, AwayPhase::Paused | AwayPhase::Attention) {
-        " a  Resume shift "
+        " Enter  Resume Away "
     } else {
-        " a  Pause shift "
+        " Enter  Pause Away "
     };
     let footer = Rect::new(inner.x, body.bottom(), inner.width, footer_height);
-    let message = app
-        .status_message
-        .as_deref()
-        .unwrap_or("Keep launcher open. Finished agents exit; worktrees remain.");
-    let controls = if active {
+    let message = app.status_message.as_deref().unwrap_or(if viewing_away {
+        "Keep launcher open. Finished agents exit; worktrees remain."
+    } else {
+        "Browsing tabs does not change the active mode."
+    });
+    let controls = if viewing_away && active {
         "l Apply limit   o Reprioritize   Esc Close"
     } else {
-        "Esc Close   Up/Down Scroll"
+        "Tab Choose mode   Esc Close"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -537,17 +678,17 @@ pub(crate) fn draw(
             Line::from(vec![
                 Span::styled(
                     primary,
-                    if pending || (!active && !ready) {
+                    if pending || (!active && (!viewing_away || !ready)) {
                         Style::new().fg(theme::muted()).bg(theme::element())
                     } else {
                         selected
                     },
                 ),
                 Span::styled(
-                    if active {
-                        "   m Return to Manual"
-                    } else {
+                    if viewing_away {
                         "   Herdr + OpenCode"
+                    } else {
+                        ""
                     },
                     muted,
                 ),
@@ -598,6 +739,142 @@ mod tests {
     }
 
     #[test]
+    fn tabs_preview_modes_without_launching_and_preserve_away_draft() {
+        let snapshot = RuntimeSnapshot {
+            selected_backend: Some(BackendKind::Herdr),
+            selected_agent: "opencode".into(),
+            prompt_profiles: vec!["implementer".into()],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        open(&mut app, &snapshot);
+        assert_eq!(app.away_overlay.as_ref().unwrap().tab, AppMode::Manual);
+        for c in ['3', 'p', 'r', 's', 'a', 'o', 'l'] {
+            assert!(prepare_command(&mut app, key(c), &snapshot).is_none());
+        }
+        assert_eq!(app.away_overlay.as_ref().unwrap().limit, "5");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(prepare_command(&mut app, tab, &snapshot).is_none());
+        prepare_command(&mut app, key('3'), &snapshot);
+        prepare_command(&mut app, key('r'), &snapshot);
+        prepare_command(&mut app, tab, &snapshot);
+        assert_eq!(app.away_overlay.as_ref().unwrap().tab, AppMode::Manual);
+        assert!(
+            prepare_command(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &snapshot
+            )
+            .is_none()
+        );
+        prepare_command(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &snapshot,
+        );
+        assert_eq!(app.away_overlay.as_ref().unwrap().limit, "3");
+        assert_eq!(
+            app.away_overlay.as_ref().unwrap().ranking,
+            AwayRanking::SourcePriority
+        );
+        assert!(matches!(
+            prepare_command(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &snapshot
+            ),
+            Some(RuntimeCommand::StartAway {
+                max_agents: 3,
+                ranking: AwayRanking::SourcePriority,
+                ..
+            })
+        ));
+        app.away_pending = Some(42);
+        assert!(prepare_command(&mut app, tab, &snapshot).is_none());
+        assert_eq!(app.away_overlay.as_ref().unwrap().tab, AppMode::Away);
+    }
+
+    #[test]
+    fn mode_tabs_are_clickable_sticky_and_show_distinct_attributes() {
+        let snapshot = RuntimeSnapshot::default();
+        let mut app = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        open(&mut app, &snapshot);
+        terminal
+            .draw(|f| crate::render::draw(f, &snapshot, &mut app))
+            .unwrap();
+        let text = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(text(&terminal).contains("NO SETTINGS REQUIRED"));
+        assert!(!text(&terminal).contains("Max agents"));
+        let initial_tabs = app.away_overlay.as_ref().unwrap().tabs.clone();
+        let rect = initial_tabs[1].0;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(!crate::mouse::handle_mouse(
+            &mut app,
+            click,
+            &snapshot,
+            (99, 30)
+        ));
+        assert!(crate::mouse::handle_mouse(
+            &mut app,
+            click,
+            &snapshot,
+            (100, 30)
+        ));
+        assert_eq!(app.away_overlay.as_ref().unwrap().tab, AppMode::Away);
+        assert_eq!(snapshot.away.mode, AppMode::Manual);
+        terminal
+            .draw(|f| crate::render::draw(f, &snapshot, &mut app))
+            .unwrap();
+        assert!(text(&terminal).contains("Max agents"));
+        assert!(text(&terminal).contains("Active: Manual"));
+        assert!(!text(&terminal).contains("NO SETTINGS REQUIRED"));
+        let tabs = app.away_overlay.as_ref().unwrap().tabs.clone();
+        assert_eq!(
+            tabs, initial_tabs,
+            "switching tabs must not move the tab strip"
+        );
+        prepare_command(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            &snapshot,
+        );
+        terminal
+            .draw(|f| crate::render::draw(f, &snapshot, &mut app))
+            .unwrap();
+        assert_eq!(app.away_overlay.as_ref().unwrap().tabs, tabs);
+        let manual = tabs[0].0;
+        assert!(crate::mouse::handle_mouse(
+            &mut app,
+            MouseEvent {
+                column: manual.x,
+                row: manual.y,
+                ..click
+            },
+            &snapshot,
+            (100, 30)
+        ));
+        assert_eq!(app.away_overlay.as_ref().unwrap().scroll, 0);
+        assert!(
+            !crate::mouse::handle_mouse(&mut app, click, &snapshot, (100, 30)),
+            "old hitboxes must be invalidated until redraw"
+        );
+    }
+
+    #[test]
     fn dialog_is_compact_and_closing_restores_every_color() {
         let snapshot = RuntimeSnapshot {
             selected_backend: Some(BackendKind::Herdr),
@@ -623,7 +900,7 @@ mod tests {
             terminal
                 .draw(|frame| crate::render::draw(frame, &snapshot, &mut app))
                 .unwrap();
-            let popup = dialog_area(Rect::new(0, 0, width, height - 1), 22);
+            let popup = dialog_area(Rect::new(0, 0, width, height - 1), 24);
             let title_x = popup.x
                 + if popup.width >= 40 {
                     3
@@ -659,6 +936,7 @@ mod tests {
         let mut app = AppState::default();
         let snapshot = RuntimeSnapshot::default();
         open(&mut app, &snapshot);
+        app.away_overlay.as_mut().unwrap().select_tab(AppMode::Away);
         prepare_command(&mut app, key('3'), &snapshot);
         assert_eq!(app.away_overlay.as_ref().unwrap().limit, "3");
         prepare_command(&mut app, key('+'), &snapshot);
@@ -675,7 +953,7 @@ mod tests {
 
     #[test]
     fn defaults_validation_and_explicit_commands() {
-        let snapshot = RuntimeSnapshot {
+        let mut snapshot = RuntimeSnapshot {
             selected_backend: Some(BackendKind::Herdr),
             selected_agent: "opencode".into(),
             prompt_profiles: vec!["implement".into()],
@@ -686,6 +964,7 @@ mod tests {
             ..Default::default()
         };
         open(&mut app, &snapshot);
+        app.away_overlay.as_mut().unwrap().select_tab(AppMode::Away);
         assert!(matches!(
             prepare_command(&mut app, key('s'), &snapshot),
             Some(RuntimeCommand::StartAway {
@@ -699,11 +978,13 @@ mod tests {
             assert!(prepare_command(&mut app, key('s'), &snapshot).is_none());
         }
         for limit in [1, 64] {
+            snapshot.away.mode = AppMode::Away;
             app.away_overlay.as_mut().unwrap().limit = limit.to_string();
             assert!(
                 matches!(prepare_command(&mut app, key('l'), &snapshot), Some(RuntimeCommand::SetAwayConcurrency { max_agents }) if max_agents == limit)
             );
         }
+        snapshot.away.mode = AppMode::Manual;
         assert!(prepare_command(&mut app, key('p'), &snapshot).is_none());
         assert!(app.away_overlay.as_ref().unwrap().profile.is_none());
         assert!(prepare_command(&mut app, key('p'), &snapshot).is_none());
@@ -711,6 +992,8 @@ mod tests {
         assert!(
             matches!(prepare_command(&mut app, key('s'), &snapshot), Some(RuntimeCommand::StartAway { profile: Some(p), ranking: AwayRanking::SourcePriority, .. }) if p == "implement")
         );
+        assert!(prepare_command(&mut app, key('o'), &snapshot).is_none());
+        snapshot.away.mode = AppMode::Away;
         assert!(matches!(
             prepare_command(&mut app, key('o'), &snapshot),
             Some(RuntimeCommand::ReprioritizeAway {
@@ -733,6 +1016,7 @@ mod tests {
         let mut snapshot = RuntimeSnapshot::default();
         let mut app = AppState::default();
         open(&mut app, &snapshot);
+        app.away_overlay.as_mut().unwrap().select_tab(AppMode::Away);
         assert!(prepare_command(&mut app, key('s'), &snapshot).is_none());
         assert!(
             app.status_message
@@ -740,6 +1024,7 @@ mod tests {
                 .unwrap()
                 .contains("Herdr + OpenCode")
         );
+        snapshot.away.mode = AppMode::Away;
         assert!(matches!(
             prepare_command(&mut app, key('a'), &snapshot),
             Some(RuntimeCommand::PauseAway)
@@ -754,8 +1039,14 @@ mod tests {
             prepare_command(&mut app, key('a'), &snapshot),
             Some(RuntimeCommand::ResumeAway)
         ));
+        assert!(prepare_command(&mut app, key('m'), &snapshot).is_none());
+        assert_eq!(app.away_overlay.as_ref().unwrap().tab, AppMode::Manual);
         assert!(matches!(
-            prepare_command(&mut app, key('m'), &snapshot),
+            prepare_command(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &snapshot
+            ),
             Some(RuntimeCommand::SetManual)
         ));
     }

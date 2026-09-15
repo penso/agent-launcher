@@ -26,7 +26,10 @@ pub(crate) fn handle_mouse(
     snapshot: &RuntimeSnapshot,
     size: (u16, u16),
 ) -> bool {
-    if app.issue_delete_overlay.is_some() || app.away_overlay.is_some() || app.away_quit {
+    if app.away_overlay.is_some() && !app.away_quit {
+        return crate::away::handle_mouse(app, event, size);
+    }
+    if app.issue_delete_overlay.is_some() || app.away_quit {
         return false;
     }
     let hit = &app.mouse;

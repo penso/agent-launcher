@@ -345,11 +345,6 @@ fn handle_key(
         return handle_inbox_command_key(app, key, snapshot, runtime, actions);
     }
 
-    if key.code == KeyCode::F(2) {
-        crate::away::open(app, snapshot);
-        return false;
-    }
-
     if app.route == Route::Inbox {
         return handle_list_key(app, key, snapshot) && request_quit(app, snapshot);
     }
@@ -524,7 +519,7 @@ fn handle_inbox_command_key(
 ) -> bool {
     match key.code {
         KeyCode::Char('?') => return false,
-        KeyCode::Char('m') | KeyCode::F(2) => crate::away::open(app, snapshot),
+        KeyCode::Char('m') => crate::away::open(app, snapshot),
         KeyCode::Char('d') => {
             app.command_overlay = false;
             dispatch_selected(app, snapshot, runtime, actions);
@@ -757,11 +752,13 @@ fn handle_paste(app: &mut AppState, text: &str) -> bool {
         return false;
     }
     if let Some(overlay) = app.away_overlay.as_mut() {
-        if app.away_pending.is_none()
+        if overlay.tab == agent_launcher_core::AppMode::Away
+            && app.away_pending.is_none()
             && text.trim().bytes().all(|c| c.is_ascii_digit())
             && text.trim().len() <= 3
         {
             overlay.limit = text.trim().into();
+            overlay.replace_limit = false;
             return true;
         }
         return false;
@@ -2030,6 +2027,12 @@ mod tests {
         );
         assert_eq!(app.search_query, "m");
         crate::away::open(&mut app, &snapshot);
+        assert!(!handle_paste(&mut app, "64"));
+        crate::away::prepare_command(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &snapshot,
+        );
         assert!(handle_paste(&mut app, "64"));
         assert_eq!(app.away_overlay.as_ref().unwrap().limit, "64");
         app.away_pending = Some(2);
