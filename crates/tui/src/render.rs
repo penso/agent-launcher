@@ -1630,6 +1630,19 @@ fn draw_security_confirmation(frame: &mut Frame<'_>, area: Rect, app: &mut AppSt
             )
         )),
         Line::raw(settings.model_label()),
+        Line::raw(format!(
+            "Profile: {} | Additional instructions: {} characters",
+            match &overlay.stage {
+                DispatchStage::Settings { profile, .. } => profile
+                    .as_deref()
+                    .unwrap_or(settings.builtin_prompt_label()),
+                _ => settings.builtin_prompt_label(),
+            },
+            settings
+                .instructions_editor
+                .as_ref()
+                .map_or(0, |editor| editor.text.chars().count())
+        )),
         Line::raw(""),
         Line::raw(
             "This sends the confidential advisory AND private repository code to the chosen harness/model provider, which may be a cloud service. Review that provider's data retention and privacy policy before consenting.",
@@ -1683,7 +1696,7 @@ fn draw_dispatch_overlay(
         return;
     };
     let item_count = match &overlay.stage {
-        DispatchStage::Prompt => snapshot.prompt_profiles.len().max(1),
+        DispatchStage::Prompt => overlay.settings.prompt_choices(snapshot).len(),
         DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
         DispatchStage::Settings { .. } => 17,
     };
@@ -1740,6 +1753,9 @@ fn draw_dispatch_overlay(
     }
 
     if let DispatchStage::Settings { profile, target } = &overlay.stage {
+        let profile_label = profile
+            .as_deref()
+            .unwrap_or(overlay.settings.builtin_prompt_label());
         let settings = &mut overlay.settings;
         let backend = settings
             .backend
@@ -1759,16 +1775,7 @@ fn draw_dispatch_overlay(
         let mut lines = vec![
             Line::styled("Launch settings", Style::new().fg(theme::primary()).bold()),
             Line::raw(format!("Issue: {}", overlay.issue_key.canonical())),
-            Line::raw(format!(
-                "Profile: {}",
-                if settings.security {
-                    "Private security review (fixed; no custom prompt)"
-                } else if settings.review {
-                    "PR review (no issue profile)"
-                } else {
-                    profile.as_deref().unwrap_or("Built-in default")
-                }
-            )),
+            Line::raw(format!("Profile: {}", profile_label)),
             Line::raw(format!("Backend: {backend}")),
             Line::raw(format!(
                 "Target: {}",
@@ -1939,10 +1946,12 @@ fn draw_prompt_view(
         layout::{Constraint, Layout},
         widgets::Wrap,
     };
+    let names = overlay.settings.prompt_choices(snapshot);
+    let builtin_label = overlay.settings.builtin_prompt_label();
     let view = &mut overlay.prompt;
     let style = Style::new().fg(theme::text()).bg(theme::element());
     let name = if view.name.is_empty() {
-        "Built-in default"
+        builtin_label
     } else {
         &view.name
     };
@@ -1951,7 +1960,14 @@ fn draw_prompt_view(
     } else if view.loading_source && view.request.is_some() {
         format!("Loading source: {name}")
     } else {
-        format!("Choose prompt: {name}")
+        let kind = if overlay.settings.security {
+            "private prompt"
+        } else if overlay.settings.review {
+            "PR prompt"
+        } else {
+            "prompt"
+        };
+        format!("Choose {kind}: {name}")
     };
     let editor_footer = view.editor.as_ref().map(|editor| {
         let help = if editor.busy {
@@ -2020,7 +2036,11 @@ fn draw_prompt_view(
         sections[0],
     );
     frame.render_widget(
-        Paragraph::new("Shared user config: changes affect ALL repositories.")
+        Paragraph::new(if overlay.settings.security {
+            "Private preview only; no fork or clone until explicit confirmation. Profile edits are shared across ALL repositories; never save private advisory text."
+        } else {
+            "Shared user config: changes affect ALL repositories."
+        })
             .wrap(Wrap { trim: false })
             .style(style.fg(theme::muted())),
         sections[1],
@@ -2100,13 +2120,7 @@ fn draw_prompt_view(
             .spacing(u16::from(sections[2].height > 4))
             .split(sections[2])
     };
-    let names = if snapshot.prompt_profiles.is_empty() {
-        vec!["Built-in default".to_owned()]
-    } else {
-        snapshot.prompt_profiles.clone()
-    };
-    let cursor = snapshot
-        .prompt_profiles
+    let cursor = names
         .iter()
         .position(|n| *n == view.name)
         .unwrap_or(overlay.cursor);
@@ -2115,7 +2129,19 @@ fn draw_prompt_view(
         .iter()
         .enumerate()
         .skip(start)
-        .map(|(i, name)| dispatch_choice_line(i, cursor, true, name.clone()))
+        .map(|(i, name)| {
+            dispatch_choice_line(
+                i,
+                cursor,
+                true,
+                if name.is_empty() {
+                    builtin_label
+                } else {
+                    name
+                }
+                .to_string(),
+            )
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines)
@@ -5953,6 +5979,63 @@ mod tests {
         assert!(text.contains("implementer"));
         assert!(text.contains("reviewer"));
         assert!(text.contains("Enter next"));
+    }
+
+    #[test]
+    fn review_and_private_choosers_show_builtin_profiles_and_launch_instructions() {
+        let mut snapshot = normal_snapshot();
+        snapshot.prompt_profiles = vec!["custom-review".into()];
+        for security in [false, true] {
+            let settings = crate::app::LaunchSettings {
+                review: !security,
+                security,
+                instructions_editor: Some(crate::widgets::editor::Editor::new(
+                    "Literal {{ extra }}\nsecond line".into(),
+                )),
+                instructions_focused: true,
+                ..Default::default()
+            };
+            let builtin = settings.builtin_prompt_label();
+            let mut app = AppState {
+                dispatch_overlay: Some(crate::app::DispatchOverlay {
+                    settings,
+                    issue_key: snapshot.issues[0].key.clone(),
+                    cursor: 0,
+                    prompt: crate::app::PromptView {
+                        preview: Some(Ok("Context preview".into())),
+                        ..Default::default()
+                    },
+                    stage: DispatchStage::Prompt,
+                }),
+                ..Default::default()
+            };
+            let text = render(140, 40, &snapshot, &mut app);
+            assert!(text.contains(builtin));
+            assert!(text.contains("custom-review"));
+            assert!(text.contains(if security {
+                "Choose private prompt"
+            } else {
+                "Choose PR prompt"
+            }));
+            if security {
+                assert!(text.contains("no fork or clone until explicit confirmation"));
+            }
+            for profile in [None, Some("custom-review".to_owned())] {
+                app.dispatch_overlay.as_mut().unwrap().stage = DispatchStage::Settings {
+                    profile: profile.clone(),
+                    target: None,
+                };
+                let text = render(140, 40, &snapshot, &mut app);
+                assert!(text.contains(&format!(
+                    "Profile: {}",
+                    profile.as_deref().unwrap_or(builtin)
+                )));
+                assert!(text.contains("Literal {{ extra }}"));
+                assert!(text.contains("second line"));
+                assert!(!text.contains("no issue profile"));
+                assert!(!text.contains("no custom prompt"));
+            }
+        }
     }
 
     #[test]

@@ -109,7 +109,30 @@ pub(crate) struct LaunchSettings {
 }
 
 impl LaunchSettings {
+    // Empty name is the runtime's built-in prompt, not a saved profile.
+    pub fn prompt_choices<'a>(&self, snapshot: &'a RuntimeSnapshot) -> Vec<&'a str> {
+        let mut names = Vec::new();
+        if self.review || self.security || snapshot.prompt_profiles.is_empty() {
+            names.push("");
+        }
+        names.extend(snapshot.prompt_profiles.iter().map(String::as_str));
+        names
+    }
+
+    pub fn builtin_prompt_label(&self) -> &'static str {
+        if self.security {
+            "Built-in private security review"
+        } else if self.review {
+            "Built-in PR review"
+        } else {
+            "Built-in default"
+        }
+    }
+
     pub fn harness_choices(&self) -> &'static [&'static str] {
+        if self.security && self.backend == Some(BackendKind::Herdr) {
+            return &["opencode", "claude", "codex"];
+        }
         match self.backend {
             Some(BackendKind::Herdr) => &["opencode", "claude", "pi"],
             Some(BackendKind::Native) => &["opencode"],
@@ -148,7 +171,7 @@ pub(crate) struct PromptView {
     pub name: String,
     pub request: Option<u64>,
     pub loading_source: bool,
-    /// Unrendered template source, including literal MiniJinja placeholders.
+    /// Issue template source or a contextual PR/private preview; never editor input.
     pub preview: Option<Result<String, String>>,
     pub scroll: u16,
     pub scroll_max: u16,
@@ -349,7 +372,7 @@ impl AppState {
             return true;
         }
         let (count, unavailable) = match &overlay.stage {
-            DispatchStage::Prompt => (snapshot.prompt_profiles.len().max(1), None),
+            DispatchStage::Prompt => (overlay.settings.prompt_choices(snapshot).len(), None),
             DispatchStage::Target { .. }
                 if snapshot.selected_backend != Some(BackendKind::Native)
                     || snapshot.compute_targets.is_empty() =>
@@ -391,13 +414,11 @@ impl AppState {
                 .collect();
             overlay.settings.target_cursor = overlay.cursor;
         }
-        if overlay.stage == DispatchStage::Prompt
-            && let Some(index) = snapshot
-                .prompt_profiles
-                .iter()
-                .position(|name| *name == overlay.prompt.name)
-        {
-            overlay.cursor = index;
+        if overlay.stage == DispatchStage::Prompt {
+            let choices = overlay.settings.prompt_choices(snapshot);
+            if let Some(index) = choices.iter().position(|name| *name == overlay.prompt.name) {
+                overlay.cursor = index;
+            }
         }
         overlay.cursor = overlay.cursor.min(count - 1);
         false

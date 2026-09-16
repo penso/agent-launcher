@@ -872,11 +872,13 @@ async fn away_persistent_owner_denies_second_runtime_admission_and_mode_commands
         },
         RuntimeCommand::Review {
             issue: issue(1).key,
+            profile: None,
             target: None,
             options: Default::default(),
         },
         RuntimeCommand::DispatchSecurity {
             issue: issue(1).key,
+            profile: None,
             options: Default::default(),
             consent: true,
         },

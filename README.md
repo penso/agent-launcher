@@ -275,38 +275,47 @@ On first launch, agent-launcher creates editable prompt profiles at:
 ~/.config/agent-launcher/agents/reviewer/prompt.md
 ```
 
-Regular issue dispatch always opens the prompt chooser, even with one profile or no saved
-profiles (the latter offers the built-in default). PR reviews still bypass issue profiles.
-Use Up/Down or 1-9 to select a template and see its raw source, including literal
+All dispatches open the prompt chooser, including PR reviews and private security advisories.
+PR and security choosers include their built-in default alongside saved profiles.
+Use Up/Down or 1-9 to select a template. Ordinary issues show raw source, including literal
 placeholders such as `{{ issue_text }}` rather than the issue body;
 PgUp/PgDn scroll the preview. Wide terminals show list and preview side by side, narrow ones
 stack them. Enter advances to compute target selection (when applicable), then launch settings, and is blocked
 while the template is loading or has a read error. `r` re-reads the template source; Esc closes
-the chooser. MiniJinja variables are expanded only for dispatch, not template selection.
+the chooser. PR and security previews expand the selected profile within their contextual
+review prompt. Private previews stay local and use placeholders for the private checkout
+and branch that will be prepared only after consent. Editing always loads raw template
+source, never the rendered advisory or PR preview.
 
 ### Dispatch Selection
 
-Every issue dispatch and PR review ends at **Launch settings**. Issues follow
-Prompt -> optional compute target -> Launch settings; PR reviews skip the issue prompt.
-The summary shows the captured issue, profile (or PR review), backend, target, harness, and
+Issues, PR reviews, and private security dispatches follow **Prompt -> optional compute
+target -> Launch settings**, with harness/model selection and optional appended instructions.
+Private security never offers a compute-target chooser and requires a final privacy confirmation.
+The summary shows the captured item, profile, backend, target, harness, and
 model before an explicit Enter launches. Esc goes back without losing per-dispatch choices
 (or closes the first stage); PgUp/PgDn scroll the settings summary on smaller terminals.
 Selecting a target never launches immediately.
 
-For ordinary issues, **Additional instructions (this dispatch only)** is automatically focused
+For every dispatch, **Additional instructions (this dispatch only)** is automatically focused
 on first entering settings. Type or paste multiline text (including Unicode and code blocks);
 it is appended after the rendered agent prompt, without editing the shared profile. Enter
 inserts a newline; arrows, Home/End, Backspace and Delete edit the text. Tab, Esc, Ctrl+S or
 Ctrl+Enter leave the field without launching and preserve its draft. From settings controls,
 Tab returns to instructions and an explicit Enter launches. Harness/model shortcuts only
 apply outside the field. Back navigation and refresh retain the draft; a new dispatch starts
-empty. PR reviews and private security dispatches do not offer this field.
+empty. Text is appended literally after the composed prompt, including for PRs and security;
+it is not interpreted as MiniJinja or saved into the shared profile. The limit is 16 KiB.
 
 Press `h` to cycle the configured default and supported harness kinds: Herdr offers
 `opencode`, `claude`, and `pi`; Native offers only `opencode`; Conductor offers `claude`,
 `codex`, `cursor`, and `acp`; Superset keeps its configured preset only. The configured
 default preserves custom configuration, including Native's OpenCode custom agent. These
-are backend-supported kinds, **not an installed harness or model catalog**.
+are backend-supported kinds, **not an installed harness or model catalog**. Private Herdr
+dispatch restricts harness choices to `opencode`, `claude`, and `codex`; private Native
+still permits only `opencode`. Herdr's Codex adapter requires **Harness default** for
+the model; overrides are rejected before private preparation. Runtime model/backend
+validation remains authoritative.
 
 Choose `1` **Configured default**, `2` **Harness default**, or `3` / `m` **Custom model**.
 Custom model entry supports Unicode, arrows, Home/End, Backspace/Delete, and paste.
@@ -353,8 +362,9 @@ New installations seed it as the fourth default at
 `~/.config/agent-launcher/agents/security reviewer/prompt.md`. Seeding happens only
 when the `agents` directory is absent: existing, edited, deleted, or custom profiles
 are never automatically replaced or replenished. Existing installations can add a
-profile named exactly `security reviewer` using the bundled template. PR Review
-dispatch still uses its separate prompt, not this issue profile.
+profile named exactly `security reviewer` using the bundled template. It can also be
+selected for PR or private security dispatch, where it supplements the contextual
+review prompt rather than replacing PR verification or private-workspace safeguards.
 
 The profile establishes issue/diff scope, researches full-file context and existing
 controls, and traces attacker-controlled inputs to sensitive operations. It includes
@@ -525,12 +535,16 @@ independent of ordinary issue-source health.
 The list includes **triage and draft** advisories, even when ordinary issue loading is
 empty; closed/published advisory history is excluded. Triage reports are read-only here:
 accept them manually on GitHub before preparing a draft. To dispatch a draft, open its
-details and press `d`, or use `Ctrl+G`, then `d` from Security. Choose only the harness
-and model, then press Enter to review the privacy warning. There is no custom-prompt
-or compute-target chooser. **Enter never grants privacy consent.** The entire warning
+details and press `d`, or use `Ctrl+G`, then `d` from Security. Choose a saved prompt or
+the built-in private review, then choose the harness/model and optionally append text.
+Leave the instructions field with Tab, then press Enter to review the privacy warning.
+There is no compute-target chooser. **Enter never grants privacy consent.** The entire warning
 and captured target must fit on screen before `y` can explicitly confirm. Resize or
 cancel with Esc if it does not fit. Duplicate dispatches are blocked while preparation
-is pending, and the runtime revalidates the captured backend and advisory.
+is pending, and the runtime revalidates the captured backend and advisory. Custom profiles
+are rendered against the freshly revalidated advisory after checkout; private content is
+not saved into profile files, diagnostic logs, or ordinary run history. The fixed private
+workflow safeguards remain in the prompt and backend regardless of profile selection.
 
 Initially, private dispatch supports only **local Native with no configured compute
 targets, or Herdr**. Other backends and Native configurations with any compute targets
@@ -625,8 +639,10 @@ from these widths. Titles retain the flexible space beyond the bounded metadata 
 ### Review Dispatch
 
 Use **Review PR** on the selected PR to launch the configured agent and, for native workspaces,
-choose a compute target. Reviews bypass issue prompt profiles and use a dedicated prompt with
+choose a compute target. Select the built-in review or a saved profile, choose the
+harness/model, and optionally append instructions. The built-in PR context is retained:
 repository identity, base/head refs and SHAs, and explicit GitHub CLI/Git diff instructions.
+Selected profiles supplement that context; additional text is appended literally afterward.
 The agent must verify the PR revision rather than review the workspace's default branch. It is
 instructed to report findings only, without implementing changes, posting comments/reviews,
 approving, merging, committing, or pushing. These are prompt constraints, not a read-only sandbox.

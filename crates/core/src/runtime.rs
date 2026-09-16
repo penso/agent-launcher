@@ -13,7 +13,7 @@ pub struct DispatchOptions {
     pub expected_backend: Option<BackendKind>,
     pub harness: Option<String>,
     pub model: ModelSelection,
-    /// Per-issue literal text appended after rendering; not supported for review or security.
+    /// Literal text appended after prompt rendering for issue, review, and security launches.
     /// At most 16 KiB; controls other than CR, LF, and tab are forbidden.
     pub additional_instructions: String,
 }
@@ -138,6 +138,7 @@ pub enum RuntimeCommand {
     },
     DispatchSecurity {
         issue: IssueKey,
+        profile: Option<String>,
         options: DispatchOptions,
         consent: bool,
     },
@@ -153,6 +154,7 @@ pub enum RuntimeCommand {
     },
     Review {
         issue: IssueKey,
+        profile: Option<String>,
         target: Option<String>,
         options: DispatchOptions,
     },
