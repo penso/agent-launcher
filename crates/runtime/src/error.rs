@@ -137,3 +137,19 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Whether the run has nothing left to open: its agent, workspace and
+    /// worktree are gone, or the backend no longer knows the run.
+    pub fn is_gone(&self) -> bool {
+        matches!(
+            self,
+            Self::RunNotFound(_)
+                | Self::WorkspaceUnavailable(_)
+                | Self::Runner(
+                    agent_launcher_runner::Error::Disconnected(_)
+                        | agent_launcher_runner::Error::RunNotFound(_)
+                )
+        )
+    }
+}

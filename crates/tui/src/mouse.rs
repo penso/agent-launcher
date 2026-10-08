@@ -18,6 +18,11 @@ pub(crate) struct MouseGeometry {
     pub debug: Rect,
     pub blocked: bool,
     pub mode: Rect,
+    /// Launch settings harness and model chips, and the picker open under one.
+    pub launch_chips: Vec<(Rect, crate::app::PickerKind)>,
+    pub launch_picker: Rect,
+    pub launch_picker_rows: Vec<(Rect, usize)>,
+    pub launch_instructions: Rect,
 }
 
 pub(crate) fn handle_mouse(
@@ -48,6 +53,16 @@ pub(crate) fn handle_mouse(
             _ => return false,
         }
         return previous != app.debug_scroll;
+    }
+    if app
+        .dispatch_overlay
+        .as_ref()
+        .is_some_and(|o| matches!(o.stage, crate::app::DispatchStage::Settings { .. }))
+    {
+        if (hit.screen.width, hit.screen.height) != size {
+            return false;
+        }
+        return handle_launch_settings(app, event);
     }
     if hit.blocked
         || app.input_overlay.is_some()
@@ -140,4 +155,79 @@ pub(crate) fn handle_mouse(
     // Wait for the resulting frame before accepting another hit on this geometry.
     app.mouse = MouseGeometry::default();
     true
+}
+
+/// Chips open their picker, picker rows choose, the wheel moves through the
+/// list, and a click elsewhere closes it.
+fn handle_launch_settings(app: &mut AppState, event: MouseEvent) -> bool {
+    let position = Position::new(event.column, event.row);
+    let hit = &app.mouse;
+    let Some(overlay) = app.dispatch_overlay.as_mut() else {
+        return false;
+    };
+    let settings = &mut overlay.settings;
+    let mut closed = false;
+    if let Some(picker) = &settings.picker {
+        let items = settings.picker_items(picker.kind, &app.harness_catalog, &picker.filter);
+        let picker = settings.picker.as_mut().unwrap();
+        let row = hit
+            .launch_picker_rows
+            .iter()
+            .find(|(rect, _)| rect.contains(position))
+            .map(|(_, index)| *index);
+        let inside = hit.launch_picker.contains(position);
+        match event.kind {
+            MouseEventKind::Moved => {
+                return match row {
+                    Some(index) if index != picker.cursor => {
+                        picker.cursor = index;
+                        true
+                    },
+                    _ => false,
+                };
+            },
+            MouseEventKind::ScrollUp if inside => {
+                picker.cursor = picker.cursor.saturating_sub(1);
+                return true;
+            },
+            MouseEventKind::ScrollDown if inside => {
+                picker.cursor = (picker.cursor + 1).min(items.len().saturating_sub(1));
+                return true;
+            },
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = row {
+                    if let Some(item) = items.into_iter().nth(index) {
+                        settings.choose(item.action);
+                        app.status_message = None;
+                    }
+                    return true;
+                }
+                if inside {
+                    return false;
+                }
+                // Close, then let the click land on whatever is under it.
+                settings.picker = None;
+                closed = true;
+            },
+            _ => return false,
+        }
+    }
+    if event.kind != MouseEventKind::Down(MouseButton::Left) {
+        return false;
+    }
+    if let Some((_, kind)) = hit
+        .launch_chips
+        .iter()
+        .find(|(rect, _)| rect.contains(position))
+    {
+        settings.open_picker(*kind, &app.harness_catalog);
+        return true;
+    }
+    if settings.instructions_editor.is_some() && hit.launch_instructions.contains(position) {
+        settings.model_editor = None;
+        settings.instructions_focused = true;
+        return true;
+    }
+    // A click that only closed the picker still needs a redraw.
+    closed
 }

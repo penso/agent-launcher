@@ -2,8 +2,10 @@ use agent_launcher_core::{
     BackendKind, DispatchOptions, Issue, IssueKey, LogEntry, LogLevel, ModelSelection, RunSummary,
     RuntimeSnapshot, WorktreeDeletePreview,
 };
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
 use crate::{
+    catalog::{HarnessCatalog, Models},
     metrics::HostMetrics,
     rows::{IssueSort, display_rows_matching},
 };
@@ -109,6 +111,40 @@ pub(crate) struct LaunchSettings {
     pub privacy_confirmation: bool,
     pub scroll: u16,
     pub scroll_max: u16,
+    pub picker: Option<Picker>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PickerKind {
+    Harness,
+    Model,
+}
+
+/// The dropdown opened from a launch settings chip.
+#[derive(Clone, Debug)]
+pub(crate) struct Picker {
+    pub kind: PickerKind,
+    pub cursor: usize,
+    pub filter: String,
+    pub scroll: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PickerAction {
+    Harness(Option<String>),
+    Model(ModelSelection),
+    /// Opens the custom model field.
+    CustomModel,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PickerItem {
+    pub label: String,
+    pub detail: String,
+    pub current: bool,
+    /// False for a harness not found on this machine; still selectable.
+    pub available: bool,
+    pub action: PickerAction,
 }
 
 impl LaunchSettings {
@@ -141,6 +177,197 @@ impl LaunchSettings {
             Some(BackendKind::Native) => &["opencode"],
             Some(BackendKind::Conductor) => &["claude", "codex", "cursor", "acp"],
             Some(BackendKind::Superset) | None => &[],
+        }
+    }
+
+    /// The harness this launch runs, or empty when the backend picks it.
+    pub fn effective_harness(&self) -> &str {
+        if let Some(harness) = &self.options.harness {
+            harness
+        } else if self.backend == Some(BackendKind::Native) {
+            // Native's configured name is an OpenCode subagent.
+            "opencode"
+        } else {
+            &self.default_harness
+        }
+    }
+
+    pub fn open_picker(&mut self, kind: PickerKind, catalog: &HarnessCatalog) {
+        let cursor = self
+            .picker_items(kind, catalog, "")
+            .iter()
+            .position(|item| item.current)
+            .unwrap_or(0);
+        self.picker = Some(Picker {
+            kind,
+            cursor,
+            filter: String::new(),
+            scroll: 0,
+        });
+        self.model_editor = None;
+        self.instructions_focused = false;
+    }
+
+    /// Choices for a picker, fuzzy-filtered by `filter` and best match first.
+    pub fn picker_items(
+        &self,
+        kind: PickerKind,
+        catalog: &HarnessCatalog,
+        filter: &str,
+    ) -> Vec<PickerItem> {
+        let mut items = match kind {
+            PickerKind::Harness => self.harness_items(catalog),
+            PickerKind::Model => self.model_items(catalog),
+        };
+        let filter = filter.trim();
+        if !filter.is_empty() {
+            let matcher = SkimMatcherV2::default().smart_case();
+            let mut scored: Vec<_> = items
+                .into_iter()
+                .filter_map(|item| Some((matcher.fuzzy_match(&item.label, filter)?, item)))
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            items = scored.into_iter().map(|(_, item)| item).collect();
+            if kind == PickerKind::Model && !items.iter().any(|item| item.label == filter) {
+                items.push(PickerItem {
+                    label: format!("Use \"{filter}\""),
+                    detail: "custom model".into(),
+                    current: false,
+                    available: true,
+                    action: PickerAction::Model(ModelSelection::Explicit(filter.into())),
+                });
+            }
+        } else if kind == PickerKind::Model {
+            items.push(PickerItem {
+                label: "Custom model…".into(),
+                detail: "type a model ID".into(),
+                current: false,
+                available: true,
+                action: PickerAction::CustomModel,
+            });
+        }
+        items
+    }
+
+    fn harness_items(&self, catalog: &HarnessCatalog) -> Vec<PickerItem> {
+        let default = if self.security && self.backend == Some(BackendKind::Native) {
+            "opencode"
+        } else if self.default_harness.is_empty() {
+            "backend default"
+        } else {
+            &self.default_harness
+        };
+        let mut items = vec![PickerItem {
+            label: "Configured default".into(),
+            detail: default.into(),
+            current: self.options.harness.is_none(),
+            available: true,
+            action: PickerAction::Harness(None),
+        }];
+        items.extend(self.harness_choices().iter().map(|harness| {
+            let found = catalog.installed(harness);
+            PickerItem {
+                label: (*harness).into(),
+                detail: match found {
+                    Some(true) => "installed",
+                    Some(false) => "not found",
+                    None => "",
+                }
+                .into(),
+                current: self.options.harness.as_deref() == Some(*harness),
+                available: found != Some(false),
+                action: PickerAction::Harness(Some((*harness).into())),
+            }
+        }));
+        items
+    }
+
+    fn model_items(&self, catalog: &HarnessCatalog) -> Vec<PickerItem> {
+        let configured = self.model_label();
+        let mut items = vec![
+            PickerItem {
+                label: "Configured default".into(),
+                detail: configured
+                    .strip_prefix("Configured default: ")
+                    .unwrap_or(&configured)
+                    .into(),
+                current: self.options.model == ModelSelection::Inherit,
+                available: true,
+                action: PickerAction::Model(ModelSelection::Inherit),
+            },
+            PickerItem {
+                label: "Harness default".into(),
+                detail: self.effective_harness().into(),
+                current: self.options.model == ModelSelection::HarnessDefault,
+                available: true,
+                action: PickerAction::Model(ModelSelection::HarnessDefault),
+            },
+        ];
+        let explicit = match &self.options.model {
+            ModelSelection::Explicit(model) => Some(model.as_str()),
+            _ => None,
+        };
+        let detected = match catalog.models.get(self.effective_harness()) {
+            Some(Models::Ready(models)) => models.as_slice(),
+            _ => &[],
+        };
+        if let Some(model) = explicit.filter(|model| !detected.iter().any(|m| m == model)) {
+            items.push(PickerItem {
+                label: model.into(),
+                detail: "custom".into(),
+                current: true,
+                available: true,
+                action: PickerAction::Model(ModelSelection::Explicit(model.into())),
+            });
+        }
+        items.extend(detected.iter().map(|model| PickerItem {
+            label: model.clone(),
+            detail: String::new(),
+            current: explicit == Some(model.as_str()),
+            available: true,
+            action: PickerAction::Model(ModelSelection::Explicit(model.clone())),
+        }));
+        items
+    }
+
+    /// Why the model list is short, shown under the picker's items.
+    pub fn picker_status(&self, kind: PickerKind, catalog: &HarnessCatalog) -> Option<String> {
+        if kind != PickerKind::Model {
+            return None;
+        }
+        let harness = self.effective_harness();
+        if harness.is_empty() {
+            return Some("The backend picks the harness; type a custom model ID".into());
+        }
+        match catalog.models.get(harness) {
+            None | Some(Models::Loading) => Some(format!("Detecting {harness} models…")),
+            Some(Models::Failed(error)) => Some(error.clone()),
+            Some(Models::Ready(models)) if models.is_empty() => Some(format!(
+                "{harness} has no model list; type a custom model ID"
+            )),
+            Some(Models::Ready(_)) => None,
+        }
+    }
+
+    /// Applies a picker choice and closes the picker.
+    pub fn choose(&mut self, action: PickerAction) {
+        self.picker = None;
+        match action {
+            PickerAction::Harness(harness) => {
+                if harness != self.options.harness {
+                    self.options.harness = harness;
+                    self.options.model = ModelSelection::HarnessDefault;
+                }
+            },
+            PickerAction::Model(model) => self.options.model = model,
+            PickerAction::CustomModel => {
+                let text = match &self.options.model {
+                    ModelSelection::Explicit(model) => model.clone(),
+                    _ => String::new(),
+                };
+                let cursor = text.len();
+                self.model_editor = Some(crate::widgets::editor::Editor { text, cursor });
+            },
         }
     }
 
@@ -229,6 +456,10 @@ pub(crate) struct AppState {
     pub issue_delete_overlay: Option<IssueDeleteOverlay>,
     pub issue_delete_confirmation_visible: bool,
     pub dispatch_overlay: Option<DispatchOverlay>,
+    /// A one-line dialog any key dismisses, e.g. no agent to jump to.
+    pub notice: Option<String>,
+    /// Harnesses and models detected on this machine, cached for the session.
+    pub harness_catalog: HarnessCatalog,
     pub security_confirmation_visible: bool,
     pub security_launch_pending: Option<u64>,
     pub delete_preview_request: Option<u64>,

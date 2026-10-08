@@ -50,7 +50,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
             || app.debug_overlay
             || app.sort_overlay
             || app.away_overlay.is_some()
-            || app.away_quit,
+            || app.away_quit
+            || app.notice.is_some(),
         ..Default::default()
     };
     app.visible_rows = 0;
@@ -95,7 +96,57 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
     if app.away_overlay.is_some() || app.away_quit {
         crate::away::draw(frame, overlay_area, snapshot, app);
     }
+    if let Some(notice) = &app.notice {
+        draw_notice(frame, overlay_area, notice);
+    }
     app.mouse.scroll = app.scroll;
+}
+
+/// A small centered dialog with one message; any key closes it.
+fn draw_notice(frame: &mut Frame<'_>, area: Rect, message: &str) {
+    use ratatui::{style::Modifier, widgets::BorderType};
+    let width = (Line::raw(message).width() as u16 + 8)
+        .max(36)
+        .min(area.width);
+    let height = 5.min(area.height);
+    if width < 4 || height < 3 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::border()))
+        .style(Style::new().fg(theme::text()).bg(theme::panel()))
+        .padding(Padding::horizontal(2));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                message.to_owned(),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(
+                    "Enter",
+                    Style::new()
+                        .fg(theme::primary())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" close", Style::new().fg(theme::muted())),
+            ]),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: true }),
+        inner,
+    );
 }
 
 /// The mode is a setting, not a view: draw it as a picker (label, value and a
@@ -1937,6 +1988,7 @@ fn shortcut_line(width: u16) -> Line<'static> {
         &[
             ("↑/↓", " navigate   "),
             ("Enter", " open   "),
+            ("→", " agent   "),
             ("Ctrl+G", " commands   "),
             ("Esc", " quit"),
         ][..]
@@ -2170,11 +2222,16 @@ fn draw_dispatch_overlay(
         DispatchStage::Settings { .. } => 96,
         DispatchStage::Target { .. } => 86,
     });
-    let wanted_height = if overlay.stage == DispatchStage::Prompt
-        || (matches!(overlay.stage, DispatchStage::Settings { .. })
-            && overlay.settings.instructions_editor.is_some())
-    {
+    let wanted_height = if overlay.stage == DispatchStage::Prompt {
         area.height.saturating_sub(2)
+    } else if matches!(overlay.stage, DispatchStage::Settings { .. }) {
+        launch_settings_height(
+            snapshot,
+            app.status_message.as_deref(),
+            &overlay.settings,
+            width.saturating_sub(4),
+            true,
+        ) + 2
     } else {
         item_count.saturating_add(6) as u16
     };
@@ -2222,6 +2279,8 @@ fn draw_dispatch_overlay(
             snapshot,
             app.status_message.as_deref(),
             overlay,
+            &app.harness_catalog,
+            &mut app.mouse,
             profile.as_deref(),
             target.as_deref(),
         );
@@ -2259,15 +2318,135 @@ fn draw_dispatch_overlay(
     );
 }
 
+/// Label column of the launch settings form.
+const LAUNCH_LABEL: u16 = 10;
+/// Rows of text in the additional instructions box; it scrolls past that.
+const INSTRUCTION_ROWS: u16 = 4;
+/// Form rows: issue, profile, backend, target, harness, model.
+const LAUNCH_FORM_ROWS: u16 = 6;
+/// Tallest harness or model picker, borders included.
+const LAUNCH_PICKER_ROWS: u16 = 16;
+
+fn launch_notes<'a>(snapshot: &RuntimeSnapshot, status: Option<&str>) -> Paragraph<'a> {
+    let muted = Style::new().fg(theme::muted());
+    let mut notes: Vec<Line> = snapshot
+        .warnings
+        .iter()
+        .map(|warning| Line::styled(format!("▲ {warning}"), Style::new().fg(theme::warning())))
+        .collect();
+    if let Some(status) = status {
+        notes.push(Line::styled(
+            status.to_owned(),
+            Style::new().fg(theme::error()),
+        ));
+    }
+    notes.push(Line::styled(
+        "Models are passed to the harness as typed; availability depends on the harness on the selected host. This launch only: no config changes, installs or permission changes.",
+        muted,
+    ));
+    Paragraph::new(notes).wrap(ratatui::widgets::Wrap { trim: false })
+}
+
+/// The keys that act on whichever part of launch settings has focus.
+fn launch_footer<'a>(settings: &crate::app::LaunchSettings) -> Paragraph<'a> {
+    let instructions = settings.instructions_editor.is_some();
+    let hints: &[(&str, &str)] = if settings.picker.is_some() {
+        &[
+            ("↑↓", "choose"),
+            ("Enter", "select"),
+            ("type", "to filter"),
+            ("Esc", "close"),
+        ]
+    } else if settings.model_editor.is_some() {
+        &[
+            ("Enter", "confirm field (does not launch)"),
+            ("Esc", "cancel field"),
+        ]
+    } else if instructions && settings.instructions_focused {
+        &[
+            ("Enter", "newline"),
+            ("Tab", "settings"),
+            ("Ctrl+S", "done"),
+            ("Esc", "settings"),
+        ]
+    } else if settings.security {
+        &[
+            ("Enter", "review privacy warning (does not launch)"),
+            ("h", "harness"),
+            ("m", "model"),
+            ("Esc", "cancel"),
+        ]
+    } else if instructions {
+        &[
+            ("Enter", "launch"),
+            ("h", "harness"),
+            ("m", "model"),
+            ("Tab", "instructions"),
+            ("Esc", "back"),
+        ]
+    } else {
+        &[
+            ("Enter", "launch"),
+            ("h", "harness"),
+            ("m", "model"),
+            ("Esc", "back"),
+        ]
+    };
+    let accent = Style::new()
+        .fg(theme::primary())
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let mut spans = Vec::new();
+    let scroll = (settings.scroll_max > 0).then_some(("PgUp/PgDn", "scroll notes"));
+    for (index, (name, action)) in hints.iter().copied().chain(scroll).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(name, accent));
+        spans.push(Span::styled(
+            format!(" {action}"),
+            Style::new().fg(theme::muted()),
+        ));
+    }
+    Paragraph::new(Line::from(spans)).wrap(ratatui::widgets::Wrap { trim: true })
+}
+
+/// Rows launch settings need inside the popup's padding at `width`.
+fn launch_settings_height(
+    snapshot: &RuntimeSnapshot,
+    status: Option<&str>,
+    settings: &crate::app::LaunchSettings,
+    width: u16,
+    with_picker_room: bool,
+) -> u16 {
+    let notes = launch_notes(snapshot, status).line_count(width) as u16;
+    let footer = launch_footer(settings).line_count(width) as u16;
+    let instructions = if settings.instructions_editor.is_some() {
+        INSTRUCTION_ROWS + 3
+    } else {
+        0
+    };
+    let content = 3 + LAUNCH_FORM_ROWS + 1 + notes + instructions + footer;
+    if !with_picker_room {
+        return content;
+    }
+    // Leave room under the model chip for a full picker, so opening one
+    // never resizes or moves the popup.
+    content.max(2 + LAUNCH_FORM_ROWS + LAUNCH_PICKER_ROWS + 1 + footer)
+}
+
 /// Launch settings as an aligned form: muted labels in one column, values in
-/// text, toggleable fields as `value ▾` chips over their choices, and the keys
-/// for the focused part listed at the bottom.
+/// text, and harness and model as `value ▾` chips that open a filterable
+/// picker of what is installed here. The keys for the focused part are listed
+/// at the bottom.
+#[allow(clippy::too_many_arguments)]
 fn draw_launch_settings(
     frame: &mut Frame<'_>,
     inner: Rect,
     snapshot: &RuntimeSnapshot,
     status: Option<&str>,
     overlay: &mut crate::app::DispatchOverlay,
+    catalog: &crate::catalog::HarnessCatalog,
+    mouse: &mut crate::mouse::MouseGeometry,
     profile: Option<&str>,
     target: Option<&str>,
 ) {
@@ -2275,9 +2454,9 @@ fn draw_launch_settings(
     use ratatui::{
         layout::{Constraint, Layout},
         style::Modifier,
-        widgets::{BorderType, Wrap},
+        widgets::BorderType,
     };
-    const LABEL: usize = 10;
+    let label_width = usize::from(LAUNCH_LABEL);
     let issue_title = snapshot
         .issues
         .iter()
@@ -2295,43 +2474,20 @@ fn draw_launch_settings(
     let instructions = settings.instructions_editor.is_some() && !editing;
     let form_active = !(editing || instructions && settings.instructions_focused);
     // The chips light up only while their keys act, so focus is visible.
-    let chip = if form_active {
-        Style::new()
-            .fg(theme::bg())
-            .bg(theme::primary())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(theme::text()).bg(theme::panel())
+    let chip = |open: bool| {
+        if open || form_active {
+            Style::new()
+                .fg(theme::bg())
+                .bg(theme::primary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme::text()).bg(theme::panel())
+        }
     };
-    let key = if form_active {
-        accent
-    } else {
-        muted
-    };
-    let label = |name: &str| Span::styled(format!("{name:<LABEL$}"), muted);
+    let open = settings.picker.as_ref().map(|picker| picker.kind);
+    let label = |name: &str| Span::styled(format!("{name:<label_width$}"), muted);
     let field =
         |name: &str, value: String| Line::from(vec![label(name), Span::styled(value, strong)]);
-    // "h  default · opencode · claude" with the current choice bright.
-    let choices = |hint: &str, items: Vec<(String, bool)>| {
-        let mut spans = vec![
-            Span::raw(" ".repeat(LABEL + 1)),
-            Span::styled(format!("{hint}  "), key),
-        ];
-        for (index, (item, current)) in items.into_iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::styled(" · ", muted));
-            }
-            spans.push(Span::styled(
-                item,
-                if current {
-                    strong
-                } else {
-                    muted
-                },
-            ));
-        }
-        Line::from(spans)
-    };
 
     let default = if settings.security && settings.backend == Some(BackendKind::Native) {
         "opencode"
@@ -2340,35 +2496,20 @@ fn draw_launch_settings(
     } else {
         &settings.default_harness
     };
-    let kinds = settings.harness_choices();
     let harness_value = settings
         .options
         .harness
         .clone()
         .unwrap_or_else(|| format!("Configured default ({default})"));
-    let harness_line = if kinds.is_empty() {
-        Line::from(vec![
-            label("Harness"),
-            Span::styled(harness_value, strong),
-            Span::styled("  configured preset only", muted),
-        ])
-    } else {
-        Line::from(vec![
-            label("Harness"),
-            Span::styled(format!(" {harness_value} ▾ "), chip),
-        ])
+    let harness_chip = format!(" {harness_value} ▾ ");
+    let harness = settings.effective_harness();
+    let harness_note = match catalog.installed(harness) {
+        Some(false) => Span::styled(
+            format!("  {harness} not found on PATH"),
+            Style::new().fg(theme::warning()),
+        ),
+        _ => Span::raw(""),
     };
-    let harness_choices = choices(
-        "h",
-        std::iter::once(("default".to_owned(), settings.options.harness.is_none()))
-            .chain(kinds.iter().map(|kind| {
-                (
-                    (*kind).to_owned(),
-                    settings.options.harness.as_deref() == Some(*kind),
-                )
-            }))
-            .collect(),
-    );
     let (model_value, model_detail) = match &settings.options.model {
         ModelSelection::Inherit => {
             let label = settings.model_label();
@@ -2381,32 +2522,7 @@ fn draw_launch_settings(
         ModelSelection::HarnessDefault => ("Harness default".to_owned(), String::new()),
         ModelSelection::Explicit(model) => (model.clone(), "custom".to_owned()),
     };
-    let model_line = Line::from(vec![
-        label("Model"),
-        Span::styled(format!(" {model_value} ▾ "), chip),
-        Span::styled(
-            if model_detail.is_empty() {
-                String::new()
-            } else {
-                format!("  {model_detail}")
-            },
-            muted,
-        ),
-    ]);
-    let model_choices = choices("1-3", vec![
-        (
-            "1 configured".to_owned(),
-            settings.options.model == ModelSelection::Inherit,
-        ),
-        (
-            "2 harness default".to_owned(),
-            settings.options.model == ModelSelection::HarnessDefault,
-        ),
-        (
-            "3 custom".to_owned(),
-            matches!(settings.options.model, ModelSelection::Explicit(_)),
-        ),
-    ]);
+    let model_chip = format!(" {model_value} ▾ ");
     let form = vec![
         field("Issue", issue_title.to_owned()),
         field(
@@ -2433,103 +2549,38 @@ fn draw_launch_settings(
                 })
                 .to_owned(),
         ),
-        harness_line,
-        harness_choices,
-        model_line,
-        model_choices,
+        Line::from(vec![
+            label("Harness"),
+            Span::styled(
+                harness_chip.clone(),
+                chip(open == Some(crate::app::PickerKind::Harness)),
+            ),
+            harness_note,
+        ]),
+        Line::from(vec![
+            label("Model"),
+            Span::styled(
+                model_chip.clone(),
+                chip(open == Some(crate::app::PickerKind::Model)),
+            ),
+            Span::styled(
+                if model_detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {model_detail}")
+                },
+                muted,
+            ),
+        ]),
     ];
-    let model_row = form.len() - 2;
 
-    let mut notes: Vec<Line> = snapshot
-        .warnings
-        .iter()
-        .map(|warning| Line::styled(format!("▲ {warning}"), Style::new().fg(theme::warning())))
-        .collect();
-    if let Some(status) = status {
-        notes.push(Line::styled(
-            status.to_owned(),
-            Style::new().fg(theme::error()),
-        ));
-    }
-    notes.extend([
-        Line::styled(
-            "Custom model is a manual ID, not a discovered or installed catalog: Claude sonnet, OpenCode/Pi openai/gpt-5.4. Availability is determined by the harness on the selected host.",
-            muted,
-        ),
-        Line::styled(
-            "This launch only; no config changes, installs or permission changes.",
-            muted,
-        ),
-    ]);
-
-    let hints: &[(&str, &str)] = if editing {
-        &[
-            ("Enter", "confirm field (does not launch)"),
-            ("Esc", "cancel field"),
-            ("PgUp/PgDn", "scroll"),
-        ]
-    } else if instructions && settings.instructions_focused {
-        &[
-            ("Enter", "newline"),
-            ("Tab", "settings"),
-            ("Ctrl+S", "done"),
-            ("Esc", "settings"),
-        ]
-    } else if settings.security {
-        &[
-            ("Enter", "review privacy warning (does not launch)"),
-            ("h", "harness"),
-            ("1-3", "model"),
-            ("m", "custom model"),
-            ("Esc", "cancel"),
-        ]
-    } else if instructions {
-        &[
-            ("Enter", "launch"),
-            ("h", "harness"),
-            ("1-3", "model"),
-            ("m", "custom model"),
-            ("Tab", "instructions"),
-            ("Esc", "back"),
-            ("PgUp/PgDn", "scroll notes"),
-        ]
-    } else {
-        &[
-            ("Enter", "launch"),
-            ("h", "harness"),
-            ("1-3", "model"),
-            ("m", "custom model"),
-            ("Esc", "back"),
-            ("PgUp/PgDn", "scroll"),
-        ]
-    };
-    let scrollable = settings.scroll_max > 0;
-    let mut footer = Vec::new();
-    let hints = hints
-        .iter()
-        .filter(|(name, _)| scrollable || *name != "PgUp/PgDn");
-    for (index, (name, action)) in hints.enumerate() {
-        if index > 0 {
-            footer.push(Span::raw("   "));
-        }
-        footer.push(Span::styled(*name, accent));
-        footer.push(Span::styled(format!(" {action}"), muted));
-    }
-    let footer = Paragraph::new(Line::from(footer)).wrap(Wrap { trim: true });
+    let footer = launch_footer(settings);
     let footer_height = footer.line_count(inner.width).min(u16::MAX as usize) as u16;
-    let notes = Paragraph::new(notes).wrap(Wrap { trim: false });
+    let notes = launch_notes(snapshot, status);
     let note_lines = notes.line_count(inner.width).min(u16::MAX as usize) as u16;
     // Breathing room between sections only when everything else fits.
-    let form_height = form.len() as u16;
     let gap = u16::from(
-        inner.height
-            >= 4 + form_height
-                + footer_height
-                + if instructions {
-                    note_lines.min(4) + 4
-                } else {
-                    note_lines
-                },
+        inner.height >= launch_settings_height(snapshot, status, settings, inner.width, false),
     );
     let [
         header,
@@ -2537,25 +2588,23 @@ fn draw_launch_settings(
         form_area,
         _,
         notes_area,
+        _,
         field_area,
         _,
         footer_area,
     ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(gap),
-        Constraint::Length(form_height),
+        Constraint::Length(LAUNCH_FORM_ROWS),
         Constraint::Length(gap),
-        if instructions {
-            Constraint::Length(note_lines.min(4))
-        } else {
-            Constraint::Min(0)
-        },
-        if instructions {
-            Constraint::Min(3)
-        } else {
-            Constraint::Length(0)
-        },
+        Constraint::Min(note_lines.min(2)),
         Constraint::Length(gap.min(u16::from(instructions))),
+        Constraint::Length(if instructions {
+            INSTRUCTION_ROWS + 2
+        } else {
+            0
+        }),
+        Constraint::Length(gap),
         Constraint::Length(footer_height),
     ])
     .areas(inner);
@@ -2573,17 +2622,35 @@ fn draw_launch_settings(
     frame.render_widget(notes.scroll((settings.scroll, 0)), notes_area);
     frame.render_widget(footer, footer_area);
 
+    // Chips are click targets; they are clipped like the form row they sit on.
+    let chip_rect = |row: u16, chip: &str| {
+        let x = form_area.x + LAUNCH_LABEL;
+        let y = form_area.y + row;
+        (y < form_area.bottom() && x < form_area.right()).then(|| {
+            Rect::new(
+                x,
+                y,
+                (Line::raw(chip).width() as u16).min(form_area.right() - x),
+                1,
+            )
+        })
+    };
+    let harness_rect = chip_rect(4, &harness_chip);
+    let model_rect = chip_rect(5, &model_chip);
+    mouse.launch_chips = [
+        harness_rect.map(|rect| (rect, crate::app::PickerKind::Harness)),
+        model_rect.map(|rect| (rect, crate::app::PickerKind::Model)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
     if let Some(editor) = &settings.model_editor
-        && form_area.height > model_row as u16
-        && form_area.width > LABEL as u16 + 2
+        && let Some(model) = model_rect
+        && form_area.width > LAUNCH_LABEL + 2
     {
         // Edit the model in place of its chip.
-        let field = Rect::new(
-            form_area.x + LABEL as u16,
-            form_area.y + model_row as u16,
-            form_area.width - LABEL as u16,
-            1,
-        );
+        let field = Rect::new(model.x, model.y, form_area.width - LAUNCH_LABEL, 1);
         let input = Rect {
             x: field.x + 2,
             width: field.width - 2,
@@ -2608,6 +2675,7 @@ fn draw_launch_settings(
         && !field_area.is_empty()
         && let Some(editor) = &settings.instructions_editor
     {
+        mouse.launch_instructions = field_area;
         let focused = settings.instructions_focused;
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -2656,6 +2724,184 @@ fn draw_launch_settings(
                 body.y + (row - top) as u16,
             ));
         }
+    }
+
+    let anchor = match open {
+        Some(crate::app::PickerKind::Harness) => harness_rect,
+        Some(crate::app::PickerKind::Model) => model_rect,
+        None => None,
+    };
+    if let Some(anchor) = anchor {
+        // Stop above the footer so its keys stay readable.
+        let bounds = Rect {
+            height: footer_area.y.saturating_sub(inner.y + 1),
+            ..inner
+        };
+        draw_launch_picker(frame, bounds, anchor, settings, catalog, mouse);
+    }
+}
+
+/// The dropdown under a harness or model chip: a filter line, the choices
+/// with the current one marked, and why a model list is short.
+fn draw_launch_picker(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    anchor: Rect,
+    settings: &mut crate::app::LaunchSettings,
+    catalog: &crate::catalog::HarnessCatalog,
+    mouse: &mut crate::mouse::MouseGeometry,
+) {
+    use ratatui::{style::Modifier, widgets::BorderType};
+    let Some(picker) = &settings.picker else {
+        return;
+    };
+    let kind = picker.kind;
+    let items = settings.picker_items(kind, catalog, &picker.filter);
+    let status = settings.picker_status(kind, catalog);
+    let harness = settings.effective_harness().to_owned();
+    let picker = settings.picker.as_mut().unwrap();
+    picker.cursor = picker.cursor.min(items.len().saturating_sub(1));
+    let muted = Style::new().fg(theme::muted());
+    let widest = items
+        .iter()
+        .map(|item| Line::raw(&item.label).width() + Line::raw(&item.detail).width() + 4)
+        .chain(status.iter().map(|s| Line::raw(s.as_str()).width()))
+        .max()
+        .unwrap_or(0);
+    let x = anchor.x.saturating_sub(1).max(inner.x);
+    let width = (widest as u16 + 4)
+        .clamp(34, 64)
+        .min(inner.right().saturating_sub(x));
+    let y = anchor.bottom();
+    let wanted = 3 + items.len() as u16 + u16::from(status.is_some());
+    let height = wanted
+        .min(LAUNCH_PICKER_ROWS)
+        .min(inner.bottom().saturating_sub(y));
+    if width < 8 || height < 4 {
+        return;
+    }
+    let area = Rect::new(x, y, width, height);
+    mouse.launch_picker = area;
+    frame.render_widget(Clear, area);
+    let title = match kind {
+        crate::app::PickerKind::Harness => " Harness ".to_owned(),
+        crate::app::PickerKind::Model if harness.is_empty() => " Model ".to_owned(),
+        crate::app::PickerKind::Model => format!(" Model · {harness} "),
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::primary()))
+        .title(Line::styled(
+            title,
+            Style::new()
+                .fg(theme::primary())
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().fg(theme::text()).bg(theme::panel()));
+    let block = if items.len() > usize::from(height.saturating_sub(3)) {
+        block.title_bottom(
+            Line::styled(format!(" {}/{} ", picker.cursor + 1, items.len()), muted).right_aligned(),
+        )
+    } else {
+        block
+    };
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+
+    let filter_line = if picker.filter.is_empty() {
+        Line::from(vec![
+            Span::styled("› ", Style::new().fg(theme::primary())),
+            Span::styled("type to filter", muted.add_modifier(Modifier::ITALIC)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("› ", Style::new().fg(theme::primary())),
+            Span::raw(picker.filter.clone()),
+        ])
+    };
+    frame.render_widget(Paragraph::new(filter_line), Rect { height: 1, ..body });
+    let cursor_x = body.x + 2 + Line::raw(picker.filter.as_str()).width() as u16;
+    if cursor_x < body.right() {
+        frame.set_cursor_position((cursor_x, body.y));
+    }
+
+    let status_height = u16::from(status.is_some() && body.height > 2);
+    let list = Rect::new(
+        body.x,
+        body.y + 1,
+        body.width,
+        body.height.saturating_sub(1 + status_height),
+    );
+    let rows = usize::from(list.height);
+    if picker.cursor < picker.scroll {
+        picker.scroll = picker.cursor;
+    } else if rows > 0 && picker.cursor >= picker.scroll + rows {
+        picker.scroll = picker.cursor + 1 - rows;
+    }
+    picker.scroll = picker.scroll.min(items.len().saturating_sub(rows));
+    mouse.launch_picker_rows.clear();
+    for (offset, (index, item)) in items
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(rows)
+        .enumerate()
+    {
+        let row = Rect::new(list.x, list.y + offset as u16, list.width, 1);
+        let selected = index == picker.cursor;
+        let base = if selected {
+            Style::new()
+                .fg(theme::bg())
+                .bg(theme::primary())
+                .add_modifier(Modifier::BOLD)
+        } else if item.available {
+            Style::new().fg(theme::text())
+        } else {
+            muted
+        };
+        let detail_style = if selected {
+            base.remove_modifier(Modifier::BOLD)
+        } else if !item.available {
+            Style::new().fg(theme::warning())
+        } else {
+            muted
+        };
+        let marker = if item.current {
+            "● "
+        } else {
+            "  "
+        };
+        let detail_width = Line::raw(&item.detail).width();
+        let label_width = usize::from(row.width).saturating_sub(detail_width + 4);
+        let label = truncate(&item.label, label_width);
+        let pad = usize::from(row.width)
+            .saturating_sub(2 + Line::raw(label.as_str()).width() + detail_width + 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(marker, base),
+                Span::styled(label, base),
+                Span::styled(" ".repeat(pad), base),
+                Span::styled(item.detail.clone(), detail_style),
+                Span::styled(" ", base),
+            ]))
+            .style(base),
+            row,
+        );
+        mouse.launch_picker_rows.push((row, index));
+    }
+    if items.is_empty() && rows > 0 {
+        frame.render_widget(Paragraph::new(Span::styled("  No matches", muted)), Rect {
+            height: 1,
+            ..list
+        });
+    }
+    if let Some(status) = status
+        && status_height > 0
+    {
+        frame.render_widget(
+            Paragraph::new(Span::styled(status, muted.add_modifier(Modifier::ITALIC))),
+            Rect::new(body.x, body.bottom() - 1, body.width, 1),
+        );
     }
 }
 
@@ -7297,13 +7543,11 @@ mod tests {
             "Target    host-42",
             "Backend   herdr",
             " Configured default (claude) ▾ ",
-            "h  default · opencode · claude · pi",
             " Configured default ▾   uses harness default",
-            "1-3  1 configured · 2 harness default · 3 custom",
-            "sonnet",
-            "openai/gpt-5.4",
-            "not a discovered",
+            "passed to the harness as typed",
             "Enter launch",
+            "h harness",
+            "m model",
             "Esc back",
         ] {
             assert!(text.contains(expected), "missing {expected}");
@@ -7326,6 +7570,125 @@ mod tests {
         for (width, height) in [(60, 24), (30, 12), (10, 6), (1, 1)] {
             render(width, height, &snapshot, &mut app);
         }
+
+        // The harness chip opens a picker of installed harnesses.
+        app.harness_catalog.installed = [("opencode", true), ("claude", true), ("pi", false)]
+            .into_iter()
+            .map(|(name, found)| (name.to_owned(), found))
+            .collect();
+        let chip = |app: &AppState, kind| {
+            app.mouse
+                .launch_chips
+                .iter()
+                .find(|(_, k)| *k == kind)
+                .unwrap()
+                .0
+        };
+        let click = |app: &mut AppState, rect: Rect| {
+            crate::mouse::handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &snapshot,
+                (120, 40),
+            )
+        };
+        render(120, 40, &snapshot, &mut app);
+        assert!({
+            let rect = chip(&app, crate::app::PickerKind::Harness);
+            click(&mut app, rect)
+        });
+        let text = render(120, 40, &snapshot, &mut app);
+        for expected in [
+            "Harness",
+            "type to filter",
+            "● Configured default",
+            "claude",
+            "installed",
+            "not found",
+            "Enter select",
+        ] {
+            assert!(text.contains(expected), "missing {expected}:\n{text}");
+        }
+        let row = app
+            .mouse
+            .launch_picker_rows
+            .iter()
+            .find(|(_, index)| *index == 2)
+            .unwrap()
+            .0;
+        assert!(click(&mut app, row));
+        let settings = &app.dispatch_overlay.as_ref().unwrap().settings;
+        assert!(settings.picker.is_none());
+        assert_eq!(settings.options.harness.as_deref(), Some("claude"));
+        assert_eq!(
+            settings.options.model,
+            agent_launcher_core::ModelSelection::HarnessDefault
+        );
+
+        // The model picker lists the harness's models, filtered as you type.
+        app.harness_catalog.models.insert(
+            "claude".into(),
+            crate::catalog::Models::Ready(vec!["sonnet".into(), "opus".into()]),
+        );
+        render(120, 40, &snapshot, &mut app);
+        assert!({
+            let rect = chip(&app, crate::app::PickerKind::Model);
+            click(&mut app, rect)
+        });
+        let text = render(120, 40, &snapshot, &mut app);
+        for expected in [
+            "Model · claude",
+            "● Harness default",
+            "sonnet",
+            "opus",
+            "Custom model…",
+        ] {
+            assert!(text.contains(expected), "missing {expected}:\n{text}");
+        }
+        app.dispatch_overlay
+            .as_mut()
+            .unwrap()
+            .settings
+            .picker
+            .as_mut()
+            .unwrap()
+            .filter = "opu".into();
+        let text = render(120, 40, &snapshot, &mut app);
+        assert!(text.contains("opus") && !text.contains("sonnet"), "{text}");
+        assert!(text.contains("Use \"opu\""));
+        let row = app.mouse.launch_picker_rows[0].0;
+        assert!(click(&mut app, row));
+        assert_eq!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .options
+                .model,
+            agent_launcher_core::ModelSelection::Explicit("opus".into())
+        );
+        // A click outside closes the picker without choosing.
+        render(120, 40, &snapshot, &mut app);
+        {
+            let rect = chip(&app, crate::app::PickerKind::Model);
+            click(&mut app, rect)
+        };
+        render(120, 40, &snapshot, &mut app);
+        assert!(click(&mut app, Rect::new(0, 0, 1, 1)));
+        assert!(
+            app.dispatch_overlay
+                .as_ref()
+                .unwrap()
+                .settings
+                .picker
+                .is_none()
+        );
+
         let settings = &mut app.dispatch_overlay.as_mut().unwrap().settings;
         settings.model_editor = Some(crate::widgets::editor::Editor {
             text: "界é".repeat(100),

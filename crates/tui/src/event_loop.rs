@@ -74,6 +74,13 @@ enum UiActionResult {
         request_id: u64,
         result: agent_launcher_runtime::Result<Box<WorktreeDeletePreview>>,
     },
+    Models {
+        harness: String,
+        result: Result<Vec<String>, String>,
+    },
+    GoToAgent {
+        result: agent_launcher_runtime::Result<()>,
+    },
 }
 
 enum PromptReply {
@@ -136,6 +143,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
 
     loop {
         ensure_prompt_preview(&mut app, &runtime, &action_tx);
+        ensure_harness_catalog(&mut app, &action_tx);
         if needs_draw {
             terminal.draw(|frame| draw(frame, &snapshot, &mut app))?;
             needs_draw = false;
@@ -312,6 +320,10 @@ fn handle_key(
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return request_quit(app, snapshot);
     }
+    if app.notice.is_some() {
+        app.notice = None;
+        return false;
+    }
     if app.away_overlay.is_some() {
         if let Some(command) = crate::away::prepare_command(app, key, snapshot) {
             send_away(app, command, runtime, actions);
@@ -355,6 +367,13 @@ fn handle_key(
         return handle_inbox_command_key(app, key, snapshot, runtime, actions);
     }
 
+    if key.code == KeyCode::Right
+        && key.modifiers.is_empty()
+        && app.tab != crate::app::InboxTab::Logs
+    {
+        go_to_agent(app, snapshot, runtime, actions);
+        return false;
+    }
     if app.route == Route::Inbox {
         return handle_list_key(app, key, snapshot) && request_quit(app, snapshot);
     }
@@ -745,6 +764,40 @@ fn handle_input_key(
         _ => {},
     }
     false
+}
+
+/// Checks which harnesses are installed and lists the chosen harness's models
+/// in the background once launch settings are open, so the pickers are ready.
+fn ensure_harness_catalog(app: &mut AppState, actions: &UiActionSender) {
+    let Some(overlay) = &app.dispatch_overlay else {
+        return;
+    };
+    if !matches!(overlay.stage, DispatchStage::Settings { .. }) {
+        return;
+    }
+    let settings = &overlay.settings;
+    let catalog = &mut app.harness_catalog;
+    catalog.detect(settings.harness_choices().iter().copied());
+    let harness = settings.effective_harness().to_owned();
+    if harness.is_empty() || catalog.models.contains_key(&harness) {
+        return;
+    }
+    catalog.detect([harness.as_str()]);
+    if catalog.installed(&harness) == Some(false) {
+        catalog.models.insert(
+            harness.clone(),
+            Models::Failed(format!(
+                "{harness} not found on PATH; type a custom model ID"
+            )),
+        );
+        return;
+    }
+    catalog.models.insert(harness.clone(), Models::Loading);
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let result = crate::catalog::list_models(&harness).await;
+        let _ = actions.send(UiActionResult::Models { harness, result });
+    });
 }
 
 fn ensure_prompt_preview(app: &mut AppState, runtime: &RuntimeHandle, actions: &UiActionSender) {
@@ -1236,9 +1289,47 @@ fn dispatch_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot) -
     DispatchEffect::None
 }
 
+use crate::{app::PickerKind, catalog::Models};
+
 fn settings_key(app: &mut AppState, key: KeyEvent) -> DispatchEffect {
     let overlay = app.dispatch_overlay.as_mut().unwrap();
     let settings = &mut overlay.settings;
+    if let Some(picker) = &settings.picker {
+        let items = settings.picker_items(picker.kind, &app.harness_catalog, &picker.filter);
+        let last = items.len().saturating_sub(1);
+        let picker = settings.picker.as_mut().unwrap();
+        match key.code {
+            KeyCode::Esc => settings.picker = None,
+            KeyCode::Up => picker.cursor = picker.cursor.checked_sub(1).unwrap_or(last),
+            KeyCode::Down => {
+                picker.cursor = if picker.cursor >= last {
+                    0
+                } else {
+                    picker.cursor + 1
+                }
+            },
+            KeyCode::PageUp => picker.cursor = picker.cursor.saturating_sub(8),
+            KeyCode::PageDown => picker.cursor = (picker.cursor + 8).min(last),
+            KeyCode::Home => picker.cursor = 0,
+            KeyCode::End => picker.cursor = last,
+            KeyCode::Enter => {
+                if let Some(item) = items.into_iter().nth(picker.cursor) {
+                    settings.choose(item.action);
+                    app.status_message = None;
+                }
+            },
+            KeyCode::Backspace => {
+                picker.filter.pop();
+                picker.cursor = 0;
+            },
+            KeyCode::Char(c) if printable(c, key.modifiers) => {
+                picker.filter.push(c);
+                picker.cursor = 0;
+            },
+            _ => {},
+        }
+        return DispatchEffect::None;
+    }
     if let Some(editor) = &mut settings.model_editor {
         match key.code {
             KeyCode::PageUp => settings.scroll = settings.scroll.saturating_sub(8),
@@ -1281,30 +1372,11 @@ fn settings_key(app: &mut AppState, key: KeyEvent) -> DispatchEffect {
         KeyCode::PageDown => {
             settings.scroll = settings.scroll.saturating_add(8).min(settings.scroll_max)
         },
-        KeyCode::Char('h') => {
-            let choices = settings.harness_choices();
-            if !choices.is_empty() {
-                settings.options.harness = match settings.options.harness.as_deref() {
-                    None => Some(choices[0].into()),
-                    Some(current) => choices
-                        .iter()
-                        .position(|h| *h == current)
-                        .and_then(|i| choices.get(i + 1))
-                        .map(|h| (*h).into()),
-                };
-                settings.options.model = ModelSelection::HarnessDefault;
-            }
-        },
+        KeyCode::Char('h') => settings.open_picker(PickerKind::Harness, &app.harness_catalog),
+        KeyCode::Char('m') => settings.open_picker(PickerKind::Model, &app.harness_catalog),
         KeyCode::Char('1') => settings.options.model = ModelSelection::Inherit,
         KeyCode::Char('2') => settings.options.model = ModelSelection::HarnessDefault,
-        KeyCode::Char('3') | KeyCode::Char('m') => {
-            let text = match &settings.options.model {
-                ModelSelection::Explicit(model) => model.clone(),
-                _ => String::new(),
-            };
-            let cursor = text.len();
-            settings.model_editor = Some(crate::widgets::editor::Editor { text, cursor });
-        },
+        KeyCode::Char('3') => settings.choose(crate::app::PickerAction::CustomModel),
         KeyCode::Tab | KeyCode::BackTab if settings.instructions_editor.is_some() => {
             settings.instructions_focused = true;
         },
@@ -1659,6 +1731,7 @@ fn start_launch(
             app.status_message = Some("starting private security review...".into());
             let issue_key = issue.canonical();
             app.launching.insert(issue_key.clone());
+            app.reset_detail();
             let runtime = runtime.clone();
             let actions = actions.clone();
             tokio::spawn(async move {
@@ -1733,6 +1806,8 @@ fn spawn_launch(
 ) {
     let issue_key = issue.canonical();
     app.launching.insert(issue_key.clone());
+    // Back to the list, as Esc would, where the row's spinner shows progress.
+    app.reset_detail();
     let actions = actions.clone();
     tokio::spawn(async move {
         let _ = actions.send(UiActionResult::Launch {
@@ -1768,6 +1843,61 @@ fn open_selected(
     spawn_runtime_action(actions, "workspace opened", None, async move {
         runtime.open(run_id).await
     });
+}
+
+/// Focuses the selected item's agent, worktree or workspace in its backend,
+/// or explains in a dialog that nothing has been dispatched for it.
+fn go_to_agent(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    runtime: &RuntimeHandle,
+    actions: &UiActionSender,
+) {
+    if !has_agent(app, snapshot) {
+        return;
+    }
+    let Some(run_id) = selected_action_issue(app, snapshot)
+        .and_then(|issue| app.latest_run(snapshot, issue))
+        .map(|run| run.id.clone())
+    else {
+        return;
+    };
+    app.status_message = Some("opening agent...".to_owned());
+    let runtime = runtime.clone();
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let result = runtime.open(run_id).await;
+        let _ = actions.send(UiActionResult::GoToAgent { result });
+    });
+}
+
+/// Failures to reach an agent get a dialog: the jump was explicit, and a
+/// status-line message is easy to miss.
+fn apply_go_to_agent(app: &mut AppState, result: agent_launcher_runtime::Result<()>) {
+    match result {
+        Ok(()) => app.status_message = Some("agent focused".to_owned()),
+        Err(error) => {
+            app.status_message = None;
+            app.notice = Some(if error.is_gone() {
+                "This task's agent is gone: its Herdr workspace and worktree were closed. Dispatch it again to start a new agent.".to_owned()
+            } else {
+                format!("Could not open this task's agent: {error}")
+            });
+        },
+    }
+}
+
+/// Whether the selected item has a run to jump to; raises the "no agent"
+/// dialog when an item is selected but nothing was dispatched for it.
+fn has_agent(app: &mut AppState, snapshot: &RuntimeSnapshot) -> bool {
+    let Some(issue) = selected_action_issue(app, snapshot) else {
+        return false;
+    };
+    if app.latest_run(snapshot, issue).is_none() {
+        app.notice = Some("No agent has been assigned for this task".to_owned());
+        return false;
+    }
+    true
 }
 
 fn stop_selected(
@@ -1902,6 +2032,13 @@ fn spawn_runtime_action(
 
 fn apply_ui_action_result(app: &mut AppState, result: UiActionResult) {
     match result {
+        UiActionResult::GoToAgent { result } => apply_go_to_agent(app, result),
+        UiActionResult::Models { harness, result } => {
+            app.harness_catalog.models.insert(harness, match result {
+                Ok(models) => Models::Ready(models),
+                Err(error) => Models::Failed(error),
+            });
+        },
         UiActionResult::Away { request_id, result } => {
             if app.away_pending == Some(request_id) {
                 app.away_pending = None;
@@ -2128,6 +2265,19 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
+
+    /// Picks the harness after the current one, wrapping like the old `h` cycle.
+    fn cycle_harness(app: &mut AppState, snapshot: &RuntimeSnapshot) -> DispatchEffect {
+        dispatch_key(app, KeyCode::Char('h').into(), snapshot);
+        dispatch_key(app, KeyCode::Down.into(), snapshot);
+        dispatch_key(app, KeyCode::Enter.into(), snapshot)
+    }
+
+    fn cycle_harness_settings(app: &mut AppState) {
+        for code in [KeyCode::Char('h'), KeyCode::Down, KeyCode::Enter] {
+            settings_key(app, code.into());
+        }
+    }
 
     #[test]
     fn away_pending_results_paste_and_search_are_isolated() {
@@ -4111,10 +4261,7 @@ mod tests {
                 "Configured default: provider/old-model"
             );
             for harness in &expected {
-                assert_eq!(
-                    dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot),
-                    DispatchEffect::None
-                );
+                assert_eq!(cycle_harness(&mut app, &snapshot), DispatchEffect::None);
                 let settings = &app.dispatch_overlay.as_ref().unwrap().settings;
                 assert_eq!(settings.options.harness.as_deref(), Some(*harness));
                 assert_eq!(settings.options.model, ModelSelection::HarnessDefault);
@@ -4132,7 +4279,7 @@ mod tests {
                     }
                 );
             }
-            dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+            cycle_harness(&mut app, &snapshot);
             assert_eq!(
                 app.dispatch_overlay
                     .as_ref()
@@ -4196,7 +4343,7 @@ mod tests {
             app.dispatch_overlay.as_mut().unwrap().prompt.preview = Some(Ok("source".into()));
             assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
             dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
-            dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+            cycle_harness(&mut app, &snapshot);
             assert_eq!(
                 app.dispatch_overlay
                     .as_ref()
@@ -4351,8 +4498,8 @@ mod tests {
             dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
         }
         dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
-        dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
-        dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+        cycle_harness(&mut app, &snapshot);
+        dispatch_key(&mut app, KeyCode::Char('3').into(), &snapshot);
         assert!(handle_paste(&mut app, "openai/gpt-5.4\n"));
         assert_eq!(
             dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot),
@@ -4479,8 +4626,8 @@ mod tests {
             );
             assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
             settings_key(&mut app, KeyCode::Tab.into());
-            settings_key(&mut app, KeyCode::Char('h').into());
-            settings_key(&mut app, KeyCode::Char('m').into());
+            cycle_harness_settings(&mut app);
+            settings_key(&mut app, KeyCode::Char('3').into());
             assert!(handle_paste(&mut app, "provider/model"));
             settings_key(&mut app, KeyCode::Enter.into());
             settings_key(&mut app, KeyCode::Esc.into());
@@ -4599,7 +4746,7 @@ mod tests {
                 DispatchOptions::default()
             );
             loop {
-                dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+                cycle_harness(&mut app, &snapshot);
                 if app
                     .dispatch_overlay
                     .as_ref()
@@ -4613,7 +4760,7 @@ mod tests {
                     break;
                 }
             }
-            dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+            dispatch_key(&mut app, KeyCode::Char('3').into(), &snapshot);
             assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
             assert_eq!(
                 dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot),
@@ -4661,7 +4808,7 @@ mod tests {
                 app.dispatch_overlay.as_ref().unwrap().settings.options,
                 options
             );
-            dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+            dispatch_key(&mut app, KeyCode::Char('3').into(), &snapshot);
             handle_paste(&mut app, "cancelled");
             dispatch_key(&mut app, KeyCode::Esc.into(), &snapshot);
             assert_eq!(
@@ -4716,7 +4863,7 @@ mod tests {
             "Keep this draft\n```rust\n// unchanged\n```"
         ));
         dispatch_key(&mut app, KeyCode::Tab.into(), &snapshot);
-        dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+        dispatch_key(&mut app, KeyCode::Char('3').into(), &snapshot);
         handle_paste(&mut app, "openai/gpt-5.4");
         dispatch_key(&mut app, KeyCode::Enter.into(), &snapshot);
         snapshot.prompt_profiles = vec!["replacement".into(), "reviewer".into()];
@@ -4769,7 +4916,7 @@ mod tests {
         prepare_dispatch(&mut app, &snapshot);
         assert!(select_dispatch(&mut app, &snapshot, 0).is_none());
         settings_key(&mut app, KeyCode::Tab.into());
-        dispatch_key(&mut app, KeyCode::Char('m').into(), &snapshot);
+        dispatch_key(&mut app, KeyCode::Char('3').into(), &snapshot);
         handle_paste(&mut app, "custom");
         snapshot.selected_model = Some("changed".into());
         app.reconcile_dispatch(&snapshot);
@@ -4787,7 +4934,7 @@ mod tests {
             settings.options.model,
             ModelSelection::Explicit("custom".into())
         );
-        dispatch_key(&mut app, KeyCode::Char('h').into(), &snapshot);
+        cycle_harness(&mut app, &snapshot);
         assert_eq!(
             app.dispatch_overlay
                 .as_ref()
@@ -4797,6 +4944,85 @@ mod tests {
                 .model,
             ModelSelection::HarnessDefault
         );
+    }
+
+    #[test]
+    fn going_to_an_unassigned_item_explains_there_is_no_agent() {
+        let mut snapshot = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::zero())],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        assert!(!has_agent(&mut app, &snapshot));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("No agent has been assigned for this task")
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &snapshot, &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("No agent has been assigned for this task"));
+        assert!(app.mouse.blocked);
+
+        app.notice = None;
+        let now = chrono::Utc::now();
+        snapshot.runs.push(agent_launcher_core::RunSummary {
+            confidential: false,
+            model: None,
+            id: "run-1".into(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: None,
+            agent: "claude".into(),
+            state: agent_launcher_core::RunState::Idle,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        assert!(has_agent(&mut app, &snapshot));
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn a_gone_agent_explains_itself_in_a_dialog() {
+        let mut app = AppState::default();
+        apply_go_to_agent(
+            &mut app,
+            Err(agent_launcher_runtime::Error::RunNotFound("run".into())),
+        );
+        assert!(app.notice.as_deref().unwrap().contains("agent is gone"));
+        app.notice = None;
+        apply_go_to_agent(&mut app, Ok(()));
+        assert!(app.notice.is_none());
+        assert_eq!(app.status_message.as_deref(), Some("agent focused"));
+    }
+
+    #[tokio::test]
+    async fn launching_returns_from_the_detail_view_to_the_list() {
+        let (actions, _results) = tokio::sync::mpsc::unbounded_channel();
+        let issue = issue("1", Duration::zero());
+        let mut app = AppState {
+            route: Route::Detail,
+            detail_issue_key: Some(issue.key.clone()),
+            ..Default::default()
+        };
+
+        spawn_launch(&mut app, &actions, &issue.key, "agent dispatched", async {
+            Ok(())
+        });
+
+        assert_eq!(app.route, Route::Inbox);
+        assert!(app.detail_issue_key.is_none());
+        assert!(app.dispatch_overlay.is_none());
+        assert!(app.launching.contains(&issue.key.canonical()));
     }
 
     #[tokio::test]

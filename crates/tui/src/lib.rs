@@ -1,6 +1,7 @@
 mod activity;
 mod app;
 mod away;
+mod catalog;
 mod detail;
 mod error;
 mod event_loop;

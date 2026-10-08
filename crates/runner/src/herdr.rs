@@ -731,21 +731,54 @@ impl Backend for HerdrBackend {
             });
         }
         crate::private::redact_errors(record.summary.confidential, async {
-            let BackendSession::Herdr { agent_name, .. } = record.session else {
+            let BackendSession::Herdr {
+                agent_name,
+                workspace_id,
+                ..
+            } = &record.session
+            else {
                 unreachable!()
             };
-            self.command(vec![
-                "agent".into(),
-                "focus".into(),
-                agent_name.clone().into(),
-            ])
-            .await?;
-            let uri = Url::parse(&format!("herdr://agent/{agent_name}"))
-                .map_err(|error| Error::InvalidResponse(error.to_string()))?;
-            Ok(OpenResult {
-                uri,
-                launched: true,
-            })
+            // The agent may have exited, or its workspace been closed, since
+            // dispatch: fall back to the workspace, then reopen the worktree.
+            match self
+                .command(vec![
+                    "agent".into(),
+                    "focus".into(),
+                    agent_name.clone().into(),
+                ])
+                .await
+            {
+                Ok(_) => return opened(&format!("herdr://agent/{agent_name}")),
+                Err(error) if !is_not_found(&error) => return Err(error),
+                Err(_) => {},
+            }
+            match self
+                .command(vec![
+                    "workspace".into(),
+                    "focus".into(),
+                    workspace_id.clone().into(),
+                ])
+                .await
+            {
+                Ok(_) => return opened(&format!("herdr://workspace/{workspace_id}")),
+                Err(error) if !is_not_found(&error) => return Err(error),
+                Err(_) => {},
+            }
+            let worktree = record
+                .summary
+                .workspace
+                .as_ref()
+                .filter(|workspace| workspace.host.is_none())
+                .and_then(|workspace| workspace.path.as_deref())
+                .filter(|path| path.is_dir());
+            let Some(path) = worktree else {
+                return Err(Error::Disconnected(
+                    "its Herdr agent, workspace and worktree are gone".into(),
+                ));
+            };
+            let reopened = parse_worktree(&self.command(worktree_open_args(path)).await?)?;
+            opened(&format!("herdr://workspace/{}", reopened.workspace_id))
         })
         .await
     }
@@ -911,6 +944,32 @@ fn version_at_least(actual: &str, required: &str) -> bool {
             .ok()
     }
     matches!((parts(actual), parts(required)), (Some(actual), Some(required)) if actual >= required)
+}
+
+fn opened(uri: &str) -> Result<OpenResult> {
+    Ok(OpenResult {
+        uri: Url::parse(uri).map_err(|error| Error::InvalidResponse(error.to_string()))?,
+        launched: true,
+    })
+}
+
+/// Herdr reports a missing agent or workspace as `[agent_not_found]` or
+/// `[workspace_not_found]` after the message.
+fn is_not_found(error: &Error) -> bool {
+    matches!(error, Error::CommandFailed { stderr, .. } if stderr.ends_with("_not_found]"))
+}
+
+/// Reopens an existing worktree checkout as a focused Herdr workspace.
+fn worktree_open_args(path: &std::path::Path) -> Vec<OsString> {
+    vec![
+        "worktree".into(),
+        "open".into(),
+        "--cwd".into(),
+        path.into(),
+        "--path".into(),
+        path.into(),
+        "--focus".into(),
+    ]
 }
 
 fn parse_worktree(value: &Value) -> Result<WorktreeResult> {
@@ -1291,6 +1350,103 @@ mod tests {
         assert!(matches!(
             verify_private_herdr_transport(&crate::Runner::new([])).await,
             Err(Error::PrivateSecurity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_falls_back_from_a_gone_agent_to_its_workspace_then_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestRepository::new();
+        let executable = temp.0.join("cli");
+        let calls = temp.0.join("calls");
+        let worktree = temp.0.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        // `workspace` names what is still open: "" (nothing), "w1" or "agent".
+        let state = temp.0.join("state");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{calls}'
+open=$(cat '{state}')
+case "$1 $2" in
+'agent focus')
+  [ "$open" = agent ] && {{ printf '{{}}'; exit 0; }}
+  printf '%s' '{{"error":{{"code":"agent_not_found","message":"agent target x not found"}}}}' >&2; exit 1;;
+'workspace focus')
+  [ "$open" = w1 ] && {{ printf '{{}}'; exit 0; }}
+  printf '%s' '{{"error":{{"code":"workspace_not_found","message":"workspace w1 not found"}}}}' >&2; exit 1;;
+'worktree open')
+  printf '%s' '{{"result":{{"workspace":{{"workspace_id":"w9"}},"root_pane":{{"pane_id":"w9:p1"}}}}}}';;
+esac
+"#,
+                calls = calls.display(),
+                state = state.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = SessionRegistry::load(Some(temp.0.join("registry/sessions.json")))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        registry
+            .insert(RunRecord {
+                summary: RunSummary {
+                    confidential: false,
+                    id: "run".into(),
+                    issue_key: "issue".into(),
+                    workspace: Some(agent_launcher_core::WorkspaceRef {
+                        backend: BackendKind::Herdr,
+                        id: "w1".into(),
+                        host: None,
+                        path: Some(worktree.clone()),
+                        branch: "agent/fix".into(),
+                    }),
+                    agent: "claude".into(),
+                    model: None,
+                    state: RunState::Disconnected,
+                    message: None,
+                    session_id: None,
+                    started_at: now,
+                    updated_at: now,
+                },
+                session: BackendSession::Herdr {
+                    workspace_id: "w1".into(),
+                    pane_id: "w1:p1".into(),
+                    agent_name: "launcher-fixture".into(),
+                },
+                deletion: None,
+            })
+            .await
+            .unwrap();
+        let backend = HerdrBackend::new(HerdrConfig { executable }, registry);
+        let open = |what: &str| {
+            std::fs::write(&state, what).unwrap();
+            let _ = std::fs::remove_file(&calls);
+            async { backend.open("run").await }
+        };
+
+        let result = open("agent").await.unwrap();
+        assert_eq!(result.uri.as_str(), "herdr://agent/launcher-fixture");
+        let result = open("w1").await.unwrap();
+        assert_eq!(result.uri.as_str(), "herdr://workspace/w1");
+        let result = open("").await.unwrap();
+        assert_eq!(result.uri.as_str(), "herdr://workspace/w9");
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            log.ends_with(&format!(
+                "worktree open --cwd {path} --path {path} --focus\n",
+                path = worktree.display()
+            )),
+            "{log}"
+        );
+
+        std::fs::remove_dir(&worktree).unwrap();
+        assert!(matches!(
+            open("").await,
+            Err(Error::Disconnected(message)) if message.contains("gone")
         ));
     }
 
