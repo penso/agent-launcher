@@ -2165,14 +2165,11 @@ fn draw_dispatch_overlay(
         DispatchStage::Target { .. } => snapshot.compute_targets.len() + 1,
         DispatchStage::Settings { .. } => 17,
     };
-    let width = area
-        .width
-        .saturating_sub(2)
-        .min(if overlay.stage == DispatchStage::Prompt {
-            140
-        } else {
-            86
-        });
+    let width = area.width.saturating_sub(2).min(match overlay.stage {
+        DispatchStage::Prompt => 140,
+        DispatchStage::Settings { .. } => 96,
+        DispatchStage::Target { .. } => 86,
+    });
     let wanted_height = if overlay.stage == DispatchStage::Prompt
         || (matches!(overlay.stage, DispatchStage::Settings { .. })
             && overlay.settings.instructions_editor.is_some())
@@ -2218,161 +2215,16 @@ fn draw_dispatch_overlay(
     }
 
     if let DispatchStage::Settings { profile, target } = &overlay.stage {
-        let profile_label = profile
-            .as_deref()
-            .unwrap_or(overlay.settings.builtin_prompt_label());
-        let settings = &mut overlay.settings;
-        let backend = settings
-            .backend
-            .map_or_else(|| "unavailable".into(), |b| b.to_string());
-        let default = if settings.security && settings.backend == Some(BackendKind::Native) {
-            "opencode"
-        } else if settings.default_harness.is_empty() {
-            "backend default"
-        } else {
-            &settings.default_harness
-        };
-        let harness = settings.options.harness.as_deref().map_or_else(
-            || format!("Configured default ({default})"),
-            |h| h.to_owned(),
+        let (profile, target) = (profile.clone(), target.clone());
+        draw_launch_settings(
+            frame,
+            inner,
+            snapshot,
+            app.status_message.as_deref(),
+            overlay,
+            profile.as_deref(),
+            target.as_deref(),
         );
-        let kinds = settings.harness_choices().join(", ");
-        let mut lines = vec![
-            Line::styled("Launch settings", Style::new().fg(theme::primary()).bold()),
-            Line::raw(format!("Issue: {}", overlay.issue_key.canonical())),
-            Line::raw(format!("Profile: {}", profile_label)),
-            Line::raw(format!("Backend: {backend}")),
-            Line::raw(format!(
-                "Target: {}",
-                target.as_deref().unwrap_or(if settings.security {
-                    "Local isolated private clone only"
-                } else if settings.had_targets {
-                    "Automatic"
-                } else {
-                    "Backend-managed"
-                })
-            )),
-            Line::raw(format!("Harness: {harness}")),
-            Line::raw(if kinds.is_empty() {
-                "Harness choices: configured preset only".into()
-            } else {
-                format!("h cycle: Configured default, {kinds} (supported kinds)")
-            }),
-            Line::raw(settings.model_label()),
-            Line::raw("1 Configured default / 2 Harness default / 3 Custom model"),
-            Line::raw("m edit custom model; h resets model to Harness default"),
-            Line::raw("Examples: Claude sonnet; OpenCode/Pi openai/gpt-5.4"),
-            Line::raw("Manual model ID, not a discovered or installed catalog."),
-            Line::raw("Availability is determined by the harness on the selected host."),
-            Line::raw("This launch only; no config changes, installs or permission changes."),
-        ];
-        lines.splice(
-            4..4,
-            snapshot.warnings.iter().map(|warning| {
-                Line::styled(format!("▲ {warning}"), Style::new().fg(theme::warning()))
-            }),
-        );
-        if let Some(status) = &app.status_message {
-            lines.push(Line::styled(
-                status.clone(),
-                Style::new().fg(theme::error()),
-            ));
-        }
-        let editing = settings.model_editor.is_some();
-        let instructions = settings.instructions_editor.is_some() && !editing;
-        let footer = if editing {
-            "Enter confirm field (does not launch)\nEsc cancel field / PgUp/PgDn scroll"
-        } else if instructions && settings.instructions_focused {
-            "Enter newline | Tab settings | Ctrl+S done | Esc settings"
-        } else if instructions {
-            "Enter launch | Tab instructions | Esc back | PgUp/PgDn summary"
-        } else if settings.security {
-            "Enter review privacy warning (does not launch) / Esc cancel / PgUp/PgDn scroll"
-        } else {
-            "Enter launch / Esc back / PgUp/PgDn scroll"
-        };
-        let footer = Paragraph::new(footer)
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .style(Style::new().fg(theme::primary()));
-        let footer_height = footer
-            .line_count(inner.width)
-            .min(usize::from(inner.height)) as u16;
-        let available_height = inner
-            .height
-            .saturating_sub(footer_height + u16::from(editing));
-        let body = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
-        let body_height = if instructions {
-            (body.line_count(inner.width).min(u16::MAX as usize) as u16).min(available_height / 2)
-        } else {
-            available_height
-        };
-        settings.scroll_max = body
-            .line_count(inner.width)
-            .saturating_sub(usize::from(body_height))
-            .min(u16::MAX as usize) as u16;
-        settings.scroll = settings.scroll.min(settings.scroll_max);
-        frame.render_widget(body.scroll((settings.scroll, 0)), Rect {
-            height: body_height,
-            ..inner
-        });
-        frame.render_widget(
-            footer,
-            Rect::new(
-                inner.x,
-                inner.bottom() - footer_height,
-                inner.width,
-                footer_height,
-            ),
-        );
-        if instructions && let Some(editor) = &settings.instructions_editor {
-            let field = Rect::new(
-                inner.x,
-                inner.y + body_height,
-                inner.width,
-                available_height.saturating_sub(body_height),
-            );
-            let block = Block::bordered()
-                .title("Additional instructions (this dispatch only)")
-                .title_bottom("Appended after prompt; profile unchanged")
-                .border_style(Style::new().fg(if settings.instructions_focused {
-                    theme::primary()
-                } else {
-                    theme::muted()
-                }));
-            let body = block.inner(field);
-            frame.render_widget(block, field);
-            let (row, _) = editor.position();
-            let top = row.saturating_sub(usize::from(body.height.saturating_sub(1)));
-            let before = &editor.text[..editor.cursor];
-            let column = Line::raw(before.rsplit('\n').next().unwrap_or("")).width();
-            let left = column.saturating_sub(usize::from(body.width.saturating_sub(1)));
-            frame.render_widget(
-                Paragraph::new(editor.text.as_str()).scroll((
-                    top.min(u16::MAX as usize) as u16,
-                    left.min(u16::MAX as usize) as u16,
-                )),
-                body,
-            );
-            if settings.instructions_focused && !body.is_empty() {
-                frame.set_cursor_position((
-                    body.x + (column - left) as u16,
-                    body.y + (row - top) as u16,
-                ));
-            }
-        }
-        if let Some(editor) = &settings.model_editor
-            && body_height + footer_height < inner.height
-        {
-            let field = Rect::new(inner.x, inner.y + body_height, inner.width, 1);
-            let column = Line::raw(&editor.text[..editor.cursor]).width();
-            let left = column.saturating_sub(usize::from(field.width.saturating_sub(1)));
-            frame.render_widget(
-                Paragraph::new(editor.text.as_str())
-                    .scroll((0, left.min(u16::MAX as usize) as u16)),
-                field,
-            );
-            frame.set_cursor_position((field.x + (column - left) as u16, field.y));
-        }
         return;
     }
 
@@ -2405,6 +2257,406 @@ fn draw_dispatch_overlay(
         Paragraph::new(lines).style(Style::new().bg(theme::element())),
         inner,
     );
+}
+
+/// Launch settings as an aligned form: muted labels in one column, values in
+/// text, toggleable fields as `value ▾` chips over their choices, and the keys
+/// for the focused part listed at the bottom.
+fn draw_launch_settings(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    snapshot: &RuntimeSnapshot,
+    status: Option<&str>,
+    overlay: &mut crate::app::DispatchOverlay,
+    profile: Option<&str>,
+    target: Option<&str>,
+) {
+    use agent_launcher_core::ModelSelection;
+    use ratatui::{
+        layout::{Constraint, Layout},
+        style::Modifier,
+        widgets::{BorderType, Wrap},
+    };
+    const LABEL: usize = 10;
+    let issue_title = snapshot
+        .issues
+        .iter()
+        .find(|issue| issue.key == overlay.issue_key)
+        .map_or("Selected issue", |issue| issue.title.as_str());
+    let issue_key = overlay.issue_key.canonical();
+    let settings = &mut overlay.settings;
+    let text = Style::new().fg(theme::text());
+    let strong = text.add_modifier(Modifier::BOLD);
+    let muted = Style::new().fg(theme::muted());
+    let accent = Style::new()
+        .fg(theme::primary())
+        .add_modifier(Modifier::BOLD);
+    let editing = settings.model_editor.is_some();
+    let instructions = settings.instructions_editor.is_some() && !editing;
+    let form_active = !(editing || instructions && settings.instructions_focused);
+    // The chips light up only while their keys act, so focus is visible.
+    let chip = if form_active {
+        Style::new()
+            .fg(theme::bg())
+            .bg(theme::primary())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(theme::text()).bg(theme::panel())
+    };
+    let key = if form_active {
+        accent
+    } else {
+        muted
+    };
+    let label = |name: &str| Span::styled(format!("{name:<LABEL$}"), muted);
+    let field =
+        |name: &str, value: String| Line::from(vec![label(name), Span::styled(value, strong)]);
+    // "h  default · opencode · claude" with the current choice bright.
+    let choices = |hint: &str, items: Vec<(String, bool)>| {
+        let mut spans = vec![
+            Span::raw(" ".repeat(LABEL + 1)),
+            Span::styled(format!("{hint}  "), key),
+        ];
+        for (index, (item, current)) in items.into_iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" · ", muted));
+            }
+            spans.push(Span::styled(
+                item,
+                if current {
+                    strong
+                } else {
+                    muted
+                },
+            ));
+        }
+        Line::from(spans)
+    };
+
+    let default = if settings.security && settings.backend == Some(BackendKind::Native) {
+        "opencode"
+    } else if settings.default_harness.is_empty() {
+        "backend default"
+    } else {
+        &settings.default_harness
+    };
+    let kinds = settings.harness_choices();
+    let harness_value = settings
+        .options
+        .harness
+        .clone()
+        .unwrap_or_else(|| format!("Configured default ({default})"));
+    let harness_line = if kinds.is_empty() {
+        Line::from(vec![
+            label("Harness"),
+            Span::styled(harness_value, strong),
+            Span::styled("  configured preset only", muted),
+        ])
+    } else {
+        Line::from(vec![
+            label("Harness"),
+            Span::styled(format!(" {harness_value} ▾ "), chip),
+        ])
+    };
+    let harness_choices = choices(
+        "h",
+        std::iter::once(("default".to_owned(), settings.options.harness.is_none()))
+            .chain(kinds.iter().map(|kind| {
+                (
+                    (*kind).to_owned(),
+                    settings.options.harness.as_deref() == Some(*kind),
+                )
+            }))
+            .collect(),
+    );
+    let (model_value, model_detail) = match &settings.options.model {
+        ModelSelection::Inherit => {
+            let label = settings.model_label();
+            let detail = label
+                .strip_prefix("Configured default: ")
+                .unwrap_or(&label)
+                .to_owned();
+            ("Configured default".to_owned(), detail)
+        },
+        ModelSelection::HarnessDefault => ("Harness default".to_owned(), String::new()),
+        ModelSelection::Explicit(model) => (model.clone(), "custom".to_owned()),
+    };
+    let model_line = Line::from(vec![
+        label("Model"),
+        Span::styled(format!(" {model_value} ▾ "), chip),
+        Span::styled(
+            if model_detail.is_empty() {
+                String::new()
+            } else {
+                format!("  {model_detail}")
+            },
+            muted,
+        ),
+    ]);
+    let model_choices = choices("1-3", vec![
+        (
+            "1 configured".to_owned(),
+            settings.options.model == ModelSelection::Inherit,
+        ),
+        (
+            "2 harness default".to_owned(),
+            settings.options.model == ModelSelection::HarnessDefault,
+        ),
+        (
+            "3 custom".to_owned(),
+            matches!(settings.options.model, ModelSelection::Explicit(_)),
+        ),
+    ]);
+    let form = vec![
+        field("Issue", issue_title.to_owned()),
+        field(
+            "Profile",
+            profile
+                .unwrap_or(settings.builtin_prompt_label())
+                .to_owned(),
+        ),
+        field(
+            "Backend",
+            settings
+                .backend
+                .map_or_else(|| "unavailable".into(), |b| b.to_string()),
+        ),
+        field(
+            "Target",
+            target
+                .unwrap_or(if settings.security {
+                    "Local isolated private clone only"
+                } else if settings.had_targets {
+                    "Automatic"
+                } else {
+                    "Backend-managed"
+                })
+                .to_owned(),
+        ),
+        harness_line,
+        harness_choices,
+        model_line,
+        model_choices,
+    ];
+    let model_row = form.len() - 2;
+
+    let mut notes: Vec<Line> = snapshot
+        .warnings
+        .iter()
+        .map(|warning| Line::styled(format!("▲ {warning}"), Style::new().fg(theme::warning())))
+        .collect();
+    if let Some(status) = status {
+        notes.push(Line::styled(
+            status.to_owned(),
+            Style::new().fg(theme::error()),
+        ));
+    }
+    notes.extend([
+        Line::styled(
+            "Custom model is a manual ID, not a discovered or installed catalog: Claude sonnet, OpenCode/Pi openai/gpt-5.4. Availability is determined by the harness on the selected host.",
+            muted,
+        ),
+        Line::styled(
+            "This launch only; no config changes, installs or permission changes.",
+            muted,
+        ),
+    ]);
+
+    let hints: &[(&str, &str)] = if editing {
+        &[
+            ("Enter", "confirm field (does not launch)"),
+            ("Esc", "cancel field"),
+            ("PgUp/PgDn", "scroll"),
+        ]
+    } else if instructions && settings.instructions_focused {
+        &[
+            ("Enter", "newline"),
+            ("Tab", "settings"),
+            ("Ctrl+S", "done"),
+            ("Esc", "settings"),
+        ]
+    } else if settings.security {
+        &[
+            ("Enter", "review privacy warning (does not launch)"),
+            ("h", "harness"),
+            ("1-3", "model"),
+            ("m", "custom model"),
+            ("Esc", "cancel"),
+        ]
+    } else if instructions {
+        &[
+            ("Enter", "launch"),
+            ("h", "harness"),
+            ("1-3", "model"),
+            ("m", "custom model"),
+            ("Tab", "instructions"),
+            ("Esc", "back"),
+            ("PgUp/PgDn", "scroll notes"),
+        ]
+    } else {
+        &[
+            ("Enter", "launch"),
+            ("h", "harness"),
+            ("1-3", "model"),
+            ("m", "custom model"),
+            ("Esc", "back"),
+            ("PgUp/PgDn", "scroll"),
+        ]
+    };
+    let scrollable = settings.scroll_max > 0;
+    let mut footer = Vec::new();
+    let hints = hints
+        .iter()
+        .filter(|(name, _)| scrollable || *name != "PgUp/PgDn");
+    for (index, (name, action)) in hints.enumerate() {
+        if index > 0 {
+            footer.push(Span::raw("   "));
+        }
+        footer.push(Span::styled(*name, accent));
+        footer.push(Span::styled(format!(" {action}"), muted));
+    }
+    let footer = Paragraph::new(Line::from(footer)).wrap(Wrap { trim: true });
+    let footer_height = footer.line_count(inner.width).min(u16::MAX as usize) as u16;
+    let notes = Paragraph::new(notes).wrap(Wrap { trim: false });
+    let note_lines = notes.line_count(inner.width).min(u16::MAX as usize) as u16;
+    // Breathing room between sections only when everything else fits.
+    let form_height = form.len() as u16;
+    let gap = u16::from(
+        inner.height
+            >= 4 + form_height
+                + footer_height
+                + if instructions {
+                    note_lines.min(4) + 4
+                } else {
+                    note_lines
+                },
+    );
+    let [
+        header,
+        _,
+        form_area,
+        _,
+        notes_area,
+        field_area,
+        _,
+        footer_area,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(gap),
+        Constraint::Length(form_height),
+        Constraint::Length(gap),
+        if instructions {
+            Constraint::Length(note_lines.min(4))
+        } else {
+            Constraint::Min(0)
+        },
+        if instructions {
+            Constraint::Min(3)
+        } else {
+            Constraint::Length(0)
+        },
+        Constraint::Length(gap.min(u16::from(instructions))),
+        Constraint::Length(footer_height),
+    ])
+    .areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Launch settings", accent),
+            Span::styled(format!("  {issue_key}"), muted),
+        ])),
+        header,
+    );
+    frame.render_widget(Paragraph::new(form), form_area);
+    settings.scroll_max = note_lines.saturating_sub(notes_area.height);
+    settings.scroll = settings.scroll.min(settings.scroll_max);
+    frame.render_widget(notes.scroll((settings.scroll, 0)), notes_area);
+    frame.render_widget(footer, footer_area);
+
+    if let Some(editor) = &settings.model_editor
+        && form_area.height > model_row as u16
+        && form_area.width > LABEL as u16 + 2
+    {
+        // Edit the model in place of its chip.
+        let field = Rect::new(
+            form_area.x + LABEL as u16,
+            form_area.y + model_row as u16,
+            form_area.width - LABEL as u16,
+            1,
+        );
+        let input = Rect {
+            x: field.x + 2,
+            width: field.width - 2,
+            ..field
+        };
+        let column = Line::raw(&editor.text[..editor.cursor]).width();
+        let left = column.saturating_sub(usize::from(input.width.saturating_sub(1)));
+        frame.render_widget(Clear, field);
+        frame.render_widget(
+            Block::new().style(Style::new().fg(theme::text()).bg(theme::panel())),
+            field,
+        );
+        frame.render_widget(Paragraph::new(Span::styled("›", accent)), field);
+        frame.render_widget(
+            Paragraph::new(editor.text.as_str()).scroll((0, left.min(u16::MAX as usize) as u16)),
+            input,
+        );
+        frame.set_cursor_position((input.x + (column - left) as u16, input.y));
+    }
+
+    if instructions
+        && !field_area.is_empty()
+        && let Some(editor) = &settings.instructions_editor
+    {
+        let focused = settings.instructions_focused;
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(Line::from(vec![
+                Span::styled(
+                    " Additional instructions",
+                    if focused {
+                        accent
+                    } else {
+                        strong
+                    },
+                ),
+                Span::styled(" (this dispatch only) ", muted),
+            ]))
+            .title_bottom(Line::styled(
+                " Appended after prompt; profile unchanged ",
+                muted,
+            ))
+            .border_style(Style::new().fg(if focused {
+                theme::primary()
+            } else {
+                theme::border()
+            }));
+        let body = block.inner(field_area);
+        frame.render_widget(block, field_area);
+        let (row, _) = editor.position();
+        let top = row.saturating_sub(usize::from(body.height.saturating_sub(1)));
+        let before = &editor.text[..editor.cursor];
+        let column = Line::raw(before.rsplit('\n').next().unwrap_or("")).width();
+        let left = column.saturating_sub(usize::from(body.width.saturating_sub(1)));
+        let content = if editor.text.is_empty() {
+            Paragraph::new(Line::styled(
+                "Optional notes for this run, appended after the prompt",
+                muted.add_modifier(Modifier::ITALIC),
+            ))
+        } else {
+            Paragraph::new(editor.text.as_str()).style(text).scroll((
+                top.min(u16::MAX as usize) as u16,
+                left.min(u16::MAX as usize) as u16,
+            ))
+        };
+        frame.render_widget(content, body);
+        if focused && !body.is_empty() {
+            frame.set_cursor_position((
+                body.x + (column - left) as u16,
+                body.y + (row - top) as u16,
+            ));
+        }
+    }
 }
 
 fn draw_prompt_view(
@@ -6825,7 +7077,7 @@ mod tests {
                 };
                 let text = render(140, 40, &snapshot, &mut app);
                 assert!(text.contains(&format!(
-                    "Profile: {}",
+                    "Profile   {}",
                     profile.as_deref().unwrap_or(builtin)
                 )));
                 assert!(text.contains("Literal {{ extra }}"));
@@ -7041,13 +7293,13 @@ mod tests {
         let text = render(120, 40, &snapshot, &mut app);
         for expected in [
             "Launch settings",
-            "Profile: reviewer",
-            "Target: host-42",
-            "Backend: herdr",
-            "Configured default (claude)",
-            "uses harness default",
-            "opencode, claude, pi",
-            "supported kinds",
+            "Profile   reviewer",
+            "Target    host-42",
+            "Backend   herdr",
+            " Configured default (claude) ▾ ",
+            "h  default · opencode · claude · pi",
+            " Configured default ▾   uses harness default",
+            "1-3  1 configured · 2 harness default · 3 custom",
             "sonnet",
             "openai/gpt-5.4",
             "not a discovered",
@@ -7056,6 +7308,21 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected}");
         }
+        // Labels are muted; toggleable values are highlighted chips.
+        let buffer = render_buffer(120, 40, &snapshot, &mut app);
+        let find = |needle: &str| {
+            let lines: Vec<String> = (0..40)
+                .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            lines.iter().enumerate().find_map(|(y, line)| {
+                line.find(needle)
+                    .map(|byte| (line[..byte].chars().count() as u16, y as u16))
+            })
+        };
+        let (x, y) = find("Harness").unwrap();
+        assert_eq!(buffer[(x, y)].fg, theme::muted());
+        let (x, y) = find("Configured default (claude) ▾").unwrap();
+        assert_eq!(buffer[(x, y)].bg, theme::primary());
         for (width, height) in [(60, 24), (30, 12), (10, 6), (1, 1)] {
             render(width, height, &snapshot, &mut app);
         }
@@ -7103,8 +7370,8 @@ mod tests {
         };
         let text = render(120, 40, &snapshot, &mut app);
         for expected in [
-            "Profile: reviewer",
-            "Configured default (claude)",
+            "Profile   reviewer",
+            "Configured default (claude) ▾",
             "Additional instructions (this dispatch only)",
             "profile unchanged",
             "Enter newline",

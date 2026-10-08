@@ -4226,7 +4226,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            assert!(text.contains("Configured default: openai/gpt-5.4"));
+            assert!(text.contains("Configured default ▾   openai/gpt-5.4"));
             assert!(!text.contains("different harness"));
 
             let mut changed = snapshot.clone();
