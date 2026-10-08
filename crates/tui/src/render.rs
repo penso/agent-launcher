@@ -22,7 +22,7 @@ use crate::{
     format::{age_label, truncate},
     metrics::HostMetrics,
     rows::{DisplayRow, IssueSort, hierarchy_prefix},
-    status::{issue_color, issue_icon, run_color, run_label, run_short_label},
+    status::{agent_glyph, issue_color, issue_icon, run_color, run_short_label},
     theme,
     widgets::{BrailleSparkline, SparklineSample, SparklineVariant, render_bottom_edge},
 };
@@ -1108,6 +1108,18 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
                 ])
                 .enumerate()
             {
+                if index == 3 {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(title_with_agent(
+                            text,
+                            column.width as usize,
+                            latest_run,
+                            style.fg(color),
+                        ))),
+                        column,
+                    );
+                    continue;
+                }
                 frame.render_widget(
                     Paragraph::new(truncate(text, column.width as usize))
                         .style(style.fg(color))
@@ -1334,7 +1346,7 @@ fn draw_table_row(
         " "
     };
     let run_state = launch_state(launching, latest_run);
-    let state_text = run_state.map_or(issue.state.as_str(), |state| run_label(state));
+    let state_text = run_state.map_or(issue.state.as_str(), |state| run_short_label(state));
     let state_color = run_state.map_or_else(|| issue_color(&issue.state), run_color);
     let state = if columns.state <= 2 {
         latest_run.map_or_else(
@@ -1398,11 +1410,14 @@ fn draw_table_row(
                 })
                 .bg(bg),
         ),
-        Span::styled(
-            truncate(&title, title_width),
-            Style::new().fg(text_color).bg(bg),
-        ),
     ]);
+    let mut line = line;
+    line.spans.extend(title_with_agent(
+        &title,
+        title_width,
+        latest_run,
+        Style::new().fg(text_color).bg(bg),
+    ));
     // Keep state independent of the terminal-cell width of the title.
     let state_width = (columns.state as u16).min(area.width);
     let activity_width = columns.activity as u16;
@@ -1607,6 +1622,37 @@ fn pr_change_indicator(
     )
 }
 
+/// A title cut to `width` cells, ending with the dispatched agent ("✳ claude")
+/// when the row has a run, like Herdr's agent list. The glyph takes the run's
+/// status color so agent and state read together.
+fn title_with_agent(
+    title: &str,
+    width: usize,
+    run: Option<&agent_launcher_core::RunSummary>,
+    style: Style,
+) -> Vec<Span<'static>> {
+    let Some(run) = run.filter(|_| width >= 24) else {
+        return vec![Span::styled(truncate(title, width), style)];
+    };
+    let agent = truncate(&run.agent, 10);
+    let tag_width = 3 + agent.chars().count();
+    let title_width = width - tag_width;
+    vec![
+        Span::styled(
+            format!(
+                "{:<title_width$}",
+                truncate(title, title_width.saturating_sub(1))
+            ),
+            style,
+        ),
+        Span::styled(
+            format!("{} ", agent_glyph(&run.agent)),
+            style.fg(run_color(run.state)),
+        ),
+        Span::styled(format!("{agent} "), style.fg(theme::muted())),
+    ]
+}
+
 /// The run state a row shows: `Starting` while a just-submitted dispatch has
 /// no active run yet, so feedback is immediate; otherwise the latest run's.
 fn launch_state(
@@ -1665,10 +1711,12 @@ fn draw_pr_row(
     );
     let lines = [
         Line::styled(format!("#{}", pr.number), Style::new().fg(theme::primary())),
-        Line::styled(
-            truncate(&issue.title, columns[1].width as usize),
+        Line::from(title_with_agent(
+            &issue.title,
+            columns[1].width as usize,
+            latest_run,
             Style::new().fg(theme::text()),
-        ),
+        )),
         Line::styled(
             truncate(
                 issue.author.as_deref().unwrap_or("unknown"),
@@ -5223,7 +5271,7 @@ mod tests {
                                 )
                                 .to_owned()
                         } else {
-                            truncate(run_state.map_or("open", run_label), columns.state)
+                            truncate(run_state.map_or("open", run_short_label), columns.state)
                         };
                         let start = right - Line::raw(expected.as_str()).width() as u16;
                         let actual: String = (start..right)
@@ -5591,7 +5639,7 @@ mod tests {
             .lines()
             .find(|line| line.contains(&pr.title))
             .expect("PR row visible");
-        assert!(line.contains("running"), "{line}");
+        assert!(line.contains("working"), "{line}");
         assert!(
             theme::BRAILLE_SPINNER
                 .iter()
@@ -5633,7 +5681,7 @@ mod tests {
             .find(|line| line.contains("Confidential advisory title"))
             .expect("advisory row visible");
         assert!(
-            line.contains("running") && !line.contains("draft"),
+            line.contains("working") && !line.contains("draft"),
             "{line}"
         );
         assert!(
@@ -5689,7 +5737,7 @@ mod tests {
             .lines()
             .find(|line| line.contains("Repair runtime dispatch"))
             .unwrap();
-        assert!(line.contains("running"), "{line}");
+        assert!(line.contains("working"), "{line}");
     }
 
     #[test]
@@ -5713,6 +5761,48 @@ mod tests {
         );
         let text = render(80, 24, &snapshot, &mut app);
         assert!(!text.contains("author") && !text.contains("facepunch"));
+    }
+
+    #[test]
+    fn rows_name_the_dispatched_agent_with_herdr_status_colors() {
+        let mut snapshot = normal_snapshot();
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: None,
+            id: "run-oc".to_owned(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: None,
+            agent: "opencode".to_owned(),
+            state: RunState::Idle,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        let mut app = AppState {
+            selected: 99,
+            ..Default::default()
+        };
+        let buffer = render_buffer(130, 24, &snapshot, &mut app);
+        let row = app.mouse.rows[0].0;
+        let line: String = (row.x..row.right())
+            .map(|x| buffer[(x, row.y)].symbol())
+            .collect();
+        assert!(
+            line.contains("▯ opencode") && line.contains("idle"),
+            "{line}"
+        );
+        let glyph_x = row.x + line.chars().position(|c| c == '▯').unwrap() as u16;
+        assert_eq!(buffer[(glyph_x, row.y)].fg, theme::status_idle());
+        // The state column is right-aligned: "idle" ends at the row's edge.
+        let idle_x = row.right() - 4;
+        assert_eq!(buffer[(idle_x, row.y)].fg, theme::status_idle());
+
+        assert_eq!(run_color(RunState::Running), theme::status_working());
+        assert_eq!(run_color(RunState::NeedsInput), theme::status_blocked());
+        assert_eq!(run_color(RunState::Completed), theme::done());
+        assert_eq!(run_short_label(RunState::NeedsInput), "blocked");
     }
 
     #[test]

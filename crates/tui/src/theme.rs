@@ -40,6 +40,20 @@ pub(crate) const fn error() -> Color {
     Color::Rgb(224, 108, 117)
 }
 
+/// Agent status colors, from Herdr GPUI's gruvbox palette so a run reads the
+/// same here as in Herdr's agent list.
+pub(crate) const fn status_working() -> Color {
+    Color::Rgb(250, 189, 47)
+}
+
+pub(crate) const fn status_idle() -> Color {
+    Color::Rgb(184, 187, 38)
+}
+
+pub(crate) const fn status_blocked() -> Color {
+    Color::Rgb(251, 73, 52)
+}
+
 pub(crate) const fn warning() -> Color {
     Color::Rgb(250, 189, 47)
 }

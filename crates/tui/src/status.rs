@@ -41,24 +41,39 @@ pub(crate) const fn run_label(state: RunState) -> &'static str {
 
 pub(crate) const fn run_color(state: RunState) -> Color {
     match state {
+        RunState::Provisioning | RunState::Starting | RunState::Running => theme::status_working(),
+        RunState::NeedsInput => theme::status_blocked(),
+        RunState::Idle => theme::status_idle(),
         RunState::Completed => theme::done(),
-        RunState::NeedsInput | RunState::Failed | RunState::Disconnected => theme::error(),
-        RunState::Provisioning | RunState::Starting | RunState::Running => theme::primary(),
-        RunState::Idle | RunState::Cancelled => theme::muted(),
+        RunState::Failed | RunState::Disconnected => theme::error(),
+        RunState::Cancelled => theme::muted(),
     }
 }
 
-/// Run state in at most eight cells, for narrow status columns.
+/// Run state in at most eight cells for list rows, in Herdr's vocabulary
+/// (working / idle / blocked / done).
 pub(crate) const fn run_short_label(state: RunState) -> &'static str {
     match state {
         RunState::Provisioning => "setup",
         RunState::Starting => "starting",
-        RunState::Running => "running",
-        RunState::NeedsInput => "input",
+        RunState::Running => "working",
+        RunState::NeedsInput => "blocked",
         RunState::Idle => "idle",
         RunState::Completed => "done",
         RunState::Failed => "failed",
         RunState::Cancelled => "stopped",
         RunState::Disconnected => "offline",
+    }
+}
+
+/// One-cell mark for the harness that runs a dispatch, after Herdr's agent list.
+pub(crate) fn agent_glyph(agent: &str) -> &'static str {
+    match agent.to_ascii_lowercase().as_str() {
+        "claude" => "✳",
+        "opencode" => "▯",
+        "codex" => "◎",
+        "gemini" => "✦",
+        "pi" => "π",
+        _ => "◆",
     }
 }
