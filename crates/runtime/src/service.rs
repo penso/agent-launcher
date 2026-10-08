@@ -1056,8 +1056,8 @@ impl RuntimeService {
             },
         );
         self.record_command_result(name, &result);
-        if let Some((level, toast, message)) = log_line {
-            self.log(level, toast, message);
+        if let Some((level, toast, summary, detail)) = log_line {
+            self.log_detailed(level, toast, summary, detail);
         }
         let _ = acknowledge.send(result);
         shutdown
@@ -1176,22 +1176,42 @@ impl RuntimeService {
     }
 
     fn log(&mut self, level: LogLevel, toast: bool, message: impl Into<String>) {
+        self.log_detailed(level, toast, message, None);
+    }
+
+    /// Records an event whose `detail` may carry external text (provider
+    /// responses, subprocess stderr). Like the diagnostics log, the on-disk
+    /// copy keeps only the launcher-authored `summary`; the full text is shown
+    /// in this session only.
+    fn log_detailed(
+        &mut self,
+        level: LogLevel,
+        toast: bool,
+        summary: impl Into<String>,
+        detail: Option<String>,
+    ) {
         let seq = self.snapshot.log.last().map_or(1, |entry| entry.seq + 1);
         if self.snapshot.log.len() >= LOG_CAPACITY {
             self.snapshot
                 .log
                 .drain(..=self.snapshot.log.len() - LOG_CAPACITY);
         }
-        let entry = LogEntry {
+        let persisted = LogEntry {
             seq,
             at: Utc::now(),
             level,
-            message: message.into(),
+            message: summary.into(),
             toast,
+        };
+        let entry = LogEntry {
+            message: detail.map_or_else(
+                || persisted.message.clone(),
+                |detail| format!("{} — {detail}", persisted.message),
+            ),
+            ..persisted.clone()
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let store = self.store.clone();
-            let persisted = entry.clone();
             runtime.spawn(async move {
                 if let Err(error) = store.append_log(&persisted, LOG_DISK_CAPACITY).await {
                     tracing::warn!(%error, "event log entry not persisted");
@@ -1220,7 +1240,7 @@ impl RuntimeService {
         subject: Option<&str>,
         confidential: bool,
         result: &Result<()>,
-    ) -> Option<(LogLevel, bool, String)> {
+    ) -> Option<(LogLevel, bool, String, Option<String>)> {
         let verb = match name {
             "dispatch" => "Dispatch",
             "review" => "PR review",
@@ -1238,11 +1258,13 @@ impl RuntimeService {
                     LogLevel::Info,
                     false,
                     format!("{verb} of a private run succeeded"),
+                    None,
                 ),
                 Err(_) => (
                     LogLevel::Error,
                     true,
                     format!("{verb} of a private run failed"),
+                    None,
                 ),
             });
         }
@@ -1251,7 +1273,8 @@ impl RuntimeService {
             Err(error) => (
                 LogLevel::Error,
                 true,
-                format!("{verb} failed for {label}: {error}"),
+                format!("{verb} failed for {label}"),
+                Some(error.to_string()),
             ),
             Ok(()) if launch => {
                 let run = subject.and_then(|subject| {
@@ -1278,12 +1301,14 @@ impl RuntimeService {
                     LogLevel::Info,
                     true,
                     format!("{verb}: {agent} started for {label} in {place}"),
+                    None,
                 )
             },
             Ok(()) => (
                 LogLevel::Info,
                 false,
                 format!("{verb} succeeded for {label}"),
+                None,
             ),
         })
     }
@@ -2852,10 +2877,11 @@ impl RuntimeService {
         if blocked != self.snapshot.backend_blocked
             && let Some(reason) = &blocked
         {
-            self.log(
+            self.log_detailed(
                 LogLevel::Error,
                 false,
-                format!("Dispatch disabled: {reason}"),
+                "Dispatch disabled: auto will not fall back from a running but unusable backend",
+                Some(reason.clone()),
             );
         }
         if selected != self.snapshot.selected_backend
@@ -2945,16 +2971,13 @@ impl RuntimeService {
                 RunState::Disconnected | RunState::NeedsInput => LogLevel::Warn,
                 _ => LogLevel::Info,
             };
-            let mut message = format!(
+            let summary = format!(
                 "{} run {:?} → {:?}",
                 self.issue_label(&run.issue_key),
                 previous,
                 run.state
             );
-            if let Some(detail) = &run.message {
-                message.push_str(&format!(": {detail}"));
-            }
-            self.log(level, false, message);
+            self.log_detailed(level, false, summary, run.message.clone());
         }
         if let Some(existing) = self.snapshot.runs.iter_mut().find(|item| item.id == run.id) {
             *existing = run;
@@ -3044,7 +3067,12 @@ impl RuntimeService {
             && !key.starts_with("backend:")
             && self.errors.get(&key) != Some(&message)
         {
-            self.log(LogLevel::Error, false, format!("{key}: {message}"));
+            self.log_detailed(
+                LogLevel::Error,
+                false,
+                format!("{key} failed"),
+                Some(message.clone()),
+            );
         }
         self.errors.insert(key, message);
         self.update_error_text();
@@ -3977,6 +4005,53 @@ mod tests {
             .unwrap();
         assert_eq!(backend.requests.lock().unwrap()[0].prompt, preview);
         assert_eq!(preview, "disk Dispatch title");
+    }
+
+    #[tokio::test]
+    async fn persisted_event_log_omits_external_error_text() {
+        let (mut service, _handle) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![],
+            Store::in_memory().await.unwrap(),
+            runner(&[]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let sensitive = "Authorization: Bearer secret-token https://user:pass@host/";
+        service.set_error("source:github:example", sensitive.into());
+        service.record_command_result("dispatch", &Err(Error::BackendBlocked(sensitive.into())));
+        let line = service.command_log_line(
+            "dispatch",
+            Some("github:example:1"),
+            false,
+            &Err(Error::BackendBlocked(sensitive.into())),
+        );
+        let (level, toast, summary, detail) = line.unwrap();
+        service.log_detailed(level, toast, summary, detail);
+        assert!(
+            service
+                .snapshot
+                .log
+                .iter()
+                .all(|entry| entry.message.contains("secret-token")),
+            "the live session keeps full detail"
+        );
+        let mut persisted = Vec::new();
+        for _ in 0..100 {
+            persisted = service.store.load_recent_log(10).await.unwrap();
+            if persisted.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(persisted.len(), 2);
+        for entry in &persisted {
+            for secret in ["Authorization", "secret-token", "https", "pass@"] {
+                assert!(!entry.message.contains(secret), "{}", entry.message);
+            }
+        }
+        assert_eq!(persisted[0].message, "source:github:example failed");
+        assert!(persisted[1].message.starts_with("Dispatch failed for"));
     }
 
     #[tokio::test]
