@@ -46,7 +46,14 @@ enum UiActionResult {
     },
     Security {
         request_id: u64,
+        issue_key: String,
         result: agent_launcher_runtime::Result<()>,
+    },
+    /// A dispatch or review; clears the item's launching indicator.
+    Launch {
+        issue_key: String,
+        result: agent_launcher_runtime::Result<()>,
+        success: &'static str,
     },
     Prompt {
         request_id: u64,
@@ -1650,13 +1657,19 @@ fn start_launch(
             let request_id = app.next_request_id;
             app.security_launch_pending = Some(request_id);
             app.status_message = Some("starting private security review...".into());
+            let issue_key = issue.canonical();
+            app.launching.insert(issue_key.clone());
             let runtime = runtime.clone();
             let actions = actions.clone();
             tokio::spawn(async move {
                 let result = runtime
                     .dispatch_security(issue, profile, options, true)
                     .await;
-                let _ = actions.send(UiActionResult::Security { request_id, result });
+                let _ = actions.send(UiActionResult::Security {
+                    request_id,
+                    issue_key,
+                    result,
+                });
             });
             return;
         },
@@ -1668,11 +1681,17 @@ fn start_launch(
         } => {
             app.status_message = Some("starting PR review...".to_owned());
             let runtime = runtime.clone();
-            spawn_runtime_action(actions, "PR review started", None, async move {
-                runtime
-                    .review_with_options(issue, profile, target, options)
-                    .await
-            });
+            spawn_launch(
+                app,
+                actions,
+                &issue.clone(),
+                "PR review started",
+                async move {
+                    runtime
+                        .review_with_options(issue, profile, target, options)
+                        .await
+                },
+            );
             return;
         },
         LaunchAction::Dispatch {
@@ -1690,10 +1709,37 @@ fn start_launch(
     };
     app.status_message = Some(status);
     let runtime = runtime.clone();
-    spawn_runtime_action(actions, "agent dispatched", None, async move {
-        runtime
-            .dispatch_with_options(issue, profile, target, options)
-            .await
+    spawn_launch(
+        app,
+        actions,
+        &issue.clone(),
+        "agent dispatched",
+        async move {
+            runtime
+                .dispatch_with_options(issue, profile, target, options)
+                .await
+        },
+    );
+}
+
+/// Marks the item as launching right away, so its row shows a spinner while
+/// the backend creates the workspace and starts the agent.
+fn spawn_launch(
+    app: &mut AppState,
+    actions: &UiActionSender,
+    issue: &agent_launcher_core::IssueKey,
+    success: &'static str,
+    future: impl Future<Output = agent_launcher_runtime::Result<()>> + Send + 'static,
+) {
+    let issue_key = issue.canonical();
+    app.launching.insert(issue_key.clone());
+    let actions = actions.clone();
+    tokio::spawn(async move {
+        let _ = actions.send(UiActionResult::Launch {
+            issue_key,
+            result: future.await,
+            success,
+        });
     });
 }
 
@@ -1866,7 +1912,20 @@ fn apply_ui_action_result(app: &mut AppState, result: UiActionResult) {
                 );
             }
         },
-        UiActionResult::Security { request_id, result } => {
+        UiActionResult::Launch {
+            issue_key,
+            result,
+            success,
+        } => {
+            app.launching.remove(&issue_key);
+            set_result(app, result, success);
+        },
+        UiActionResult::Security {
+            request_id,
+            issue_key,
+            result,
+        } => {
+            app.launching.remove(&issue_key);
             if app.security_launch_pending != Some(request_id) {
                 return;
             }
@@ -2597,6 +2656,25 @@ mod tests {
     }
 
     #[test]
+    fn launch_results_clear_the_launching_indicator() {
+        let mut app = AppState::default();
+        app.launching.insert("github:a:1".into());
+        app.launching.insert("github:a:2".into());
+        apply_ui_action_result(&mut app, UiActionResult::Launch {
+            issue_key: "github:a:1".into(),
+            result: Ok(()),
+            success: "agent dispatched",
+        });
+        apply_ui_action_result(&mut app, UiActionResult::Security {
+            request_id: 7,
+            issue_key: "github:a:2".into(),
+            result: Ok(()),
+        });
+        assert!(app.launching.is_empty());
+        assert_eq!(app.status_message.as_deref(), Some("agent dispatched"));
+    }
+
+    #[test]
     fn blocked_backend_refuses_dispatch_with_toast() {
         let snapshot = RuntimeSnapshot {
             issues: vec![issue("1", Duration::zero())],
@@ -2818,17 +2896,20 @@ mod tests {
         assert!(prepare_dispatch(&mut app, &snapshot).is_none());
         apply_ui_action_result(&mut app, UiActionResult::Security {
             request_id: 41,
+            issue_key: "advisory".into(),
             result: Ok(()),
         });
         assert_eq!(app.security_launch_pending, Some(42));
         apply_ui_action_result(&mut app, UiActionResult::Security {
             request_id: 42,
+            issue_key: "advisory".into(),
             result: Ok(()),
         });
         assert!(app.security_launch_pending.is_none());
         app.security_launch_pending = Some(43);
         apply_ui_action_result(&mut app, UiActionResult::Security {
             request_id: 43,
+            issue_key: "advisory".into(),
             result: Err(agent_launcher_runtime::Error::PromptProfileNotFound(
                 "CONFIDENTIAL_RESPONSE_BODY".into(),
             )),

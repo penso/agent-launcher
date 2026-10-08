@@ -249,6 +249,8 @@ pub(crate) struct AppState {
     pub launched: Option<std::time::Instant>,
     pub activity_history_origin: Option<chrono::DateTime<chrono::Utc>>,
     pub toast: Option<Toast>,
+    /// Items whose dispatch was submitted but has not returned yet.
+    pub launching: std::collections::HashSet<String>,
     /// Highest runtime log sequence already considered for a toast.
     pub last_log_seq: u64,
 }

@@ -1083,7 +1083,8 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
                 .iter()
                 .filter(|run| run.issue_key == issue.key.canonical())
                 .max_by_key(|run| (run.updated_at, run.started_at));
-            let marker = if active.contains(issue.key.canonical().as_str()) {
+            let launching = app.launching.contains(&issue.key.canonical());
+            let marker = if launching || active.contains(issue.key.canonical().as_str()) {
                 theme::BRAILLE_SPINNER[app.tick as usize % theme::BRAILLE_SPINNER.len()]
             } else if index == app.selected {
                 "▶"
@@ -1092,9 +1093,9 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             } else {
                 " "
             };
-            let (state, state_color) = latest_run
-                .map_or((issue.state.as_str(), state_color), |run| {
-                    (run_short_label(run.state), run_color(run.state))
+            let (state, state_color) = launch_state(launching, latest_run)
+                .map_or((issue.state.as_str(), state_color), |state| {
+                    (run_short_label(state), run_color(state))
                 });
             for (index, (column, (text, color))) in security_columns(row_area)
                 .into_iter()
@@ -1128,6 +1129,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
                 issue,
                 index == app.selected,
                 active.contains(issue.key.canonical().as_str()),
+                app.launching.contains(&issue.key.canonical()),
                 app.tick,
                 pr_columns,
             );
@@ -1142,6 +1144,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             columns,
             index == app.selected,
             active.contains(issue.key.canonical().as_str()),
+            app.launching.contains(&issue.key.canonical()),
             app.tick,
         );
     }
@@ -1179,6 +1182,8 @@ fn security_columns(area: Rect) -> [Rect; 5] {
 #[derive(Clone, Copy)]
 struct Columns {
     activity: usize,
+    /// Author name plus a separating gap; hidden on narrower tables.
+    author: usize,
     age: usize,
     source: usize,
     state: usize,
@@ -1189,6 +1194,11 @@ impl Columns {
         if width >= 72 {
             Self {
                 activity: 8,
+                author: if width >= 90 {
+                    13
+                } else {
+                    0
+                },
                 age: 6,
                 source: 8,
                 state: 12,
@@ -1196,6 +1206,7 @@ impl Columns {
         } else if width >= 46 {
             Self {
                 activity: 0,
+                author: 0,
                 age: 5,
                 source: 5,
                 state: 8,
@@ -1203,6 +1214,7 @@ impl Columns {
         } else {
             Self {
                 activity: 0,
+                author: 0,
                 age: 4,
                 source: 3,
                 state: 2,
@@ -1212,7 +1224,11 @@ impl Columns {
 
     fn title(self, width: u16) -> usize {
         width.saturating_sub(
-            4 + self.age as u16 + self.source as u16 + self.state as u16 + self.activity as u16,
+            4 + self.age as u16
+                + self.source as u16
+                + self.state as u16
+                + self.activity as u16
+                + self.author as u16,
         ) as usize
     }
 }
@@ -1244,6 +1260,18 @@ fn draw_table_header(frame: &mut Frame<'_>, area: Rect, columns: Columns) {
     ]);
     let state_width = (columns.state as u16).min(area.width);
     let activity_width = columns.activity as u16;
+    let author_width = columns.author as u16;
+    if author_width > 0 {
+        frame.render_widget(
+            Paragraph::new("author").style(Style::new().fg(theme::muted())),
+            Rect::new(
+                area.right() - state_width - activity_width - author_width,
+                area.y,
+                author_width - 1,
+                1,
+            ),
+        );
+    }
     frame.render_widget(
         Paragraph::new("comments").style(Style::new().fg(theme::muted())),
         Rect::new(
@@ -1255,7 +1283,12 @@ fn draw_table_header(frame: &mut Frame<'_>, area: Rect, columns: Columns) {
     );
     frame.render_widget(
         Paragraph::new(line),
-        Rect::new(area.x, area.y, area.width - state_width - activity_width, 1),
+        Rect::new(
+            area.x,
+            area.y,
+            area.width - state_width - activity_width - author_width,
+            1,
+        ),
     );
     frame.render_widget(
         Paragraph::new(if columns.state <= 2 {
@@ -1279,6 +1312,7 @@ fn draw_table_row(
     columns: Columns,
     selected: bool,
     active: bool,
+    launching: bool,
     tick: u32,
 ) {
     let bg = if selected {
@@ -1292,16 +1326,16 @@ fn draw_table_row(
         .iter()
         .filter(|run| run.issue_key == issue.key.canonical())
         .max_by_key(|run| (run.updated_at, run.started_at));
-    let activity = if active {
+    let activity = if active || launching {
         theme::BRAILLE_SPINNER[tick as usize % theme::BRAILLE_SPINNER.len()]
     } else if latest_run.and_then(|run| run.workspace.as_ref()).is_some() {
         "●"
     } else {
         " "
     };
-    let state_text = latest_run.map_or(issue.state.as_str(), |run| run_label(run.state));
-    let state_color =
-        latest_run.map_or_else(|| issue_color(&issue.state), |run| run_color(run.state));
+    let run_state = launch_state(launching, latest_run);
+    let state_text = run_state.map_or(issue.state.as_str(), |state| run_label(state));
+    let state_color = run_state.map_or_else(|| issue_color(&issue.state), run_color);
     let state = if columns.state <= 2 {
         latest_run.map_or_else(
             || issue_icon(&issue.state),
@@ -1372,6 +1406,22 @@ fn draw_table_row(
     // Keep state independent of the terminal-cell width of the title.
     let state_width = (columns.state as u16).min(area.width);
     let activity_width = columns.activity as u16;
+    let author_width = columns.author as u16;
+    if author_width > 0 {
+        frame.render_widget(
+            Paragraph::new(truncate(
+                issue.author.as_deref().unwrap_or("unknown"),
+                usize::from(author_width - 1),
+            ))
+            .style(Style::new().fg(theme::muted()).bg(bg)),
+            Rect::new(
+                area.right() - state_width - activity_width - author_width,
+                area.y,
+                author_width,
+                1,
+            ),
+        );
+    }
     frame.render_widget(
         Paragraph::new(item_activity_line(issue, false)).style(Style::new().bg(bg)),
         Rect::new(
@@ -1383,7 +1433,12 @@ fn draw_table_row(
     );
     frame.render_widget(
         Paragraph::new(line),
-        Rect::new(area.x, area.y, area.width - state_width - activity_width, 1),
+        Rect::new(
+            area.x,
+            area.y,
+            area.width - state_width - activity_width - author_width,
+            1,
+        ),
     );
     frame.render_widget(
         Paragraph::new(truncate(state, state_width as usize))
@@ -1552,6 +1607,19 @@ fn pr_change_indicator(
     )
 }
 
+/// The run state a row shows: `Starting` while a just-submitted dispatch has
+/// no active run yet, so feedback is immediate; otherwise the latest run's.
+fn launch_state(
+    launching: bool,
+    latest_run: Option<&agent_launcher_core::RunSummary>,
+) -> Option<RunState> {
+    match latest_run {
+        Some(run) if run.state.is_active() || !launching => Some(run.state),
+        _ if launching => Some(RunState::Starting),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_pr_row(
     frame: &mut Frame<'_>,
@@ -1560,6 +1628,7 @@ fn draw_pr_row(
     issue: &Issue,
     selected: bool,
     active: bool,
+    launching: bool,
     tick: u32,
     columns: [Rect; 6],
 ) {
@@ -1576,7 +1645,7 @@ fn draw_pr_row(
         .iter()
         .filter(|run| run.issue_key == issue.key.canonical())
         .max_by_key(|run| (run.updated_at, run.started_at));
-    let marker = if active {
+    let marker = if active || launching {
         theme::BRAILLE_SPINNER[tick as usize % theme::BRAILLE_SPINNER.len()]
     } else if selected {
         "▶"
@@ -1585,9 +1654,9 @@ fn draw_pr_row(
     } else {
         " "
     };
-    let (status, status_color) = latest_run.map_or_else(
+    let (status, status_color) = launch_state(launching, latest_run).map_or_else(
         || (issue.state.as_str(), issue_color(&issue.state)),
-        |run| (run_short_label(run.state), run_color(run.state)),
+        |state| (run_short_label(state), run_color(state)),
     );
     frame.render_widget(Block::new().style(Style::new().bg(bg)), area);
     frame.render_widget(
@@ -5573,6 +5642,77 @@ mod tests {
                 .any(|frame| line.contains(frame)),
             "{line}"
         );
+    }
+
+    #[test]
+    fn submitted_dispatch_spins_immediately_before_a_run_exists() {
+        let mut snapshot = normal_snapshot();
+        let key = snapshot.issues[0].key.canonical();
+        let now = Utc::now();
+        // An earlier, finished run must not mask the new launch.
+        snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: None,
+            id: "run-old".to_owned(),
+            issue_key: key.clone(),
+            workspace: None,
+            agent: "claude".to_owned(),
+            state: RunState::Completed,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        let mut app = AppState {
+            selected: 99,
+            ..Default::default()
+        };
+        app.launching.insert(key);
+        let text = render(112, 28, &snapshot, &mut app);
+        let line = text
+            .lines()
+            .find(|line| line.contains("Repair runtime dispatch"))
+            .unwrap();
+        assert!(
+            line.contains("starting") && !line.contains("completed"),
+            "{line}"
+        );
+        assert!(
+            theme::BRAILLE_SPINNER
+                .iter()
+                .any(|frame| line.contains(frame)),
+            "{line}"
+        );
+        snapshot.runs[0].state = RunState::Running;
+        let text = render(112, 28, &snapshot, &mut app);
+        let line = text
+            .lines()
+            .find(|line| line.contains("Repair runtime dispatch"))
+            .unwrap();
+        assert!(line.contains("running"), "{line}");
+    }
+
+    #[test]
+    fn issue_rows_show_author_on_wide_tables_only() {
+        let mut snapshot = normal_snapshot();
+        snapshot.issues[0].author = Some("facepunch47-with-a-long-name".into());
+        let mut app = AppState::default();
+        let text = render(130, 24, &snapshot, &mut app);
+        let header = text.lines().find(|line| line.contains("title")).unwrap();
+        assert!(header.contains("author"), "{header}");
+        let row = text
+            .lines()
+            .find(|line| line.contains("Repair runtime dispatch"))
+            .unwrap();
+        assert!(row.contains("facepunch47…"), "{row}");
+        let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].chars().count();
+        assert_eq!(
+            column(row, "facepunch47"),
+            column(header, "author"),
+            "{header}\n{row}"
+        );
+        let text = render(80, 24, &snapshot, &mut app);
+        assert!(!text.contains("author") && !text.contains("facepunch"));
     }
 
     #[test]
