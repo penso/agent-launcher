@@ -42,7 +42,7 @@ impl Diagnostics {
     ) {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         let failure = matches!(outcome, "failed" | "unavailable" | "throttled");
-        let severity = if failure {
+        let severity = if failure || outcome == "degraded" {
             "WARN"
         } else {
             "INFO"

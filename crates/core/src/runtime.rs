@@ -54,9 +54,40 @@ pub struct RuntimeSnapshot {
     pub refreshing: bool,
     pub last_refreshed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Non-fatal conditions the user should see, such as backend version skew
+    /// or an automatic backend fallback.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Why no backend is selected even though one could technically run, e.g.
+    /// `auto` refusing to fall back from a running but unusable Herdr.
+    #[serde(default)]
+    pub backend_blocked: Option<String>,
+    /// Recent user-visible events, oldest first and bounded by the runtime.
+    #[serde(default)]
+    pub log: Vec<LogEntry>,
     pub diagnostic_log_path: Option<std::path::PathBuf>,
     pub diagnostic_log_error: Option<String>,
     pub last_failure: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LogEntry {
+    /// Monotonic within one runtime; lets the UI detect entries it has not shown.
+    pub seq: u64,
+    pub at: DateTime<Utc>,
+    pub level: LogLevel,
+    pub message: String,
+    /// Outcomes the user just triggered, surfaced as a transient toast.
+    #[serde(default)]
+    pub toast: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

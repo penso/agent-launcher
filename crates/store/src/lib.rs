@@ -3,8 +3,8 @@
 use std::{collections::HashSet, path::Path, str::FromStr, time::Duration};
 
 use agent_launcher_core::{
-    ActivitySample, AwayState, EventEnvelope, Issue, IssueKey, IssueProvider, RunEvent, RunSummary,
-    WorkspaceRef,
+    ActivitySample, AwayState, EventEnvelope, Issue, IssueKey, IssueProvider, LogEntry, LogLevel,
+    RunEvent, RunSummary, WorkspaceRef,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -15,6 +15,13 @@ use sqlx::{
 use thiserror::Error;
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS event_log (
+    seq INTEGER PRIMARY KEY NOT NULL,
+    at_unix_ms INTEGER NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS away_state (
     id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
     state_json TEXT NOT NULL
@@ -160,6 +167,8 @@ pub enum StoreError {
     RunNotFound(String),
     #[error("activity endpoint count cannot be represented by SQLite or this platform")]
     ActivityCountOutOfRange,
+    #[error("invalid event log timestamp {0} in the database")]
+    InvalidLogTimestamp(i64),
     #[error("invalid activity sample timestamp {0} in the database")]
     InvalidActivityTimestamp(i64),
 }
@@ -582,6 +591,58 @@ impl Store {
             private_root: None,
             security_lock: Default::default(),
         })
+    }
+
+    /// Appends one user-visible event and drops entries beyond the newest `keep`.
+    pub async fn append_log(&self, entry: &LogEntry, keep: usize) -> Result<()> {
+        let seq =
+            i64::try_from(entry.seq).map_err(|_| StoreError::SequenceOutOfRange(entry.seq))?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO event_log (seq, at_unix_ms, level, message) VALUES (?, ?, ?, ?) \
+             ON CONFLICT(seq) DO UPDATE SET at_unix_ms = excluded.at_unix_ms, level = excluded.level, \
+             message = excluded.message",
+        )
+        .bind(seq)
+        .bind(entry.at.timestamp_millis())
+        .bind(serde_json::to_string(&entry.level)?)
+        .bind(&entry.message)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM event_log WHERE seq <= ?")
+            .bind(seq - keep as i64)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Loads the newest `limit` events, oldest first. Reloaded entries never
+    /// carry the toast flag: that only applies to the moment they happened.
+    pub async fn load_recent_log(&self, limit: usize) -> Result<Vec<LogEntry>> {
+        let rows = sqlx::query(
+            "SELECT * FROM (SELECT seq, at_unix_ms, level, message FROM event_log \
+             ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(LogEntry {
+                    seq: u64::try_from(row.get::<i64, _>("seq"))
+                        .map_err(|_| StoreError::InvalidStoredSequence(row.get("seq")))?,
+                    at: {
+                        let millis = row.get::<i64, _>("at_unix_ms");
+                        DateTime::from_timestamp_millis(millis)
+                            .ok_or(StoreError::InvalidLogTimestamp(millis))?
+                    },
+                    level: serde_json::from_str::<LogLevel>(&row.get::<String, _>("level"))?,
+                    message: row.get("message"),
+                    toast: false,
+                })
+            })
+            .collect()
     }
 
     /// Loads the durable Away intent and ledger, or `None` before the first save.
@@ -1281,6 +1342,47 @@ mod tests {
             }],
             error: Some("Paused for review".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn event_log_persists_prunes_and_reloads_without_toasts() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-launcher-event-log-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap(),
+        ));
+        let store = Store::open(&path).await.unwrap();
+        for seq in 1..=5 {
+            store
+                .append_log(
+                    &LogEntry {
+                        seq,
+                        at: Utc.timestamp_millis_opt(1_000 * seq as i64).unwrap(),
+                        level: if seq == 5 {
+                            LogLevel::Error
+                        } else {
+                            LogLevel::Info
+                        },
+                        message: format!("event {seq}"),
+                        toast: true,
+                    },
+                    3,
+                )
+                .await
+                .unwrap();
+        }
+        store.pool.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        let log = reopened.load_recent_log(2).await.unwrap();
+        assert_eq!(log.iter().map(|entry| entry.seq).collect::<Vec<_>>(), [
+            4, 5
+        ]);
+        assert_eq!(log[1].level, LogLevel::Error);
+        assert_eq!(log[1].at, Utc.timestamp_millis_opt(5_000).unwrap());
+        assert!(log.iter().all(|entry| !entry.toast));
+        assert_eq!(reopened.load_recent_log(10).await.unwrap().len(), 3);
+        reopened.pool.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

@@ -69,7 +69,9 @@ impl HerdrBackend {
 
     async fn status(&self) -> Result<HerdrStatus> {
         let status = self.reported_status().await?;
-        validate_status(&status)?;
+        if let Some(warning) = validate_status(&status)? {
+            tracing::warn!("{warning}");
+        }
         Ok(status)
     }
 
@@ -264,6 +266,10 @@ pub async fn verify_private_herdr_transport(runner: &crate::Runner) -> Result<()
 
 fn validate_private_status(status: &HerdrStatus, path: &std::path::Path) -> Result<()> {
     validate_status(status).map_err(|_| Error::PrivateSecurity)?;
+    // Private dispatch stays pinned to one audited release on both ends.
+    if status.server.version.as_deref() != Some(status.client.version.as_str()) {
+        return Err(Error::PrivateSecurity);
+    }
     let protocol = match status.client.version.as_str() {
         "0.8.2" => 20,
         "0.9.0" => 22,
@@ -383,7 +389,7 @@ impl Backend for HerdrBackend {
             available: result.is_ok(),
             manager_running,
             capabilities: self.capabilities(),
-            message: result.err().map(|error| error.to_string()),
+            message: result.unwrap_or_else(|error| Some(error.to_string())),
             compute_targets: Vec::new(),
         })
     }
@@ -846,7 +852,10 @@ struct AgentResult {
     status: String,
 }
 
-fn validate_status(status: &HerdrStatus) -> Result<()> {
+/// Accepts any client/server pair that Herdr reports as compatible on the same
+/// protocol. A differing release (e.g. a CLI upgraded while the server keeps
+/// running) is usable, so it is returned as a warning rather than an error.
+fn validate_status(status: &HerdrStatus) -> Result<Option<String>> {
     if !version_at_least(&status.client.version, MINIMUM_HERDR_VERSION) {
         return Err(Error::InvalidResponse(format!(
             "Herdr {} is too old; version {MINIMUM_HERDR_VERSION} or newer is required",
@@ -865,8 +874,7 @@ fn validate_status(status: &HerdrStatus) -> Result<()> {
         .server
         .protocol
         .ok_or_else(|| Error::InvalidResponse("Herdr status has no server protocol".into()))?;
-    if status.client.version != server_version
-        || status.client.protocol != server_protocol
+    if status.client.protocol != server_protocol
         || status.server.compatible != Some(true)
         || status.server.restart_needed
     {
@@ -875,7 +883,12 @@ fn validate_status(status: &HerdrStatus) -> Result<()> {
             status.client.version, status.client.protocol
         )));
     }
-    Ok(())
+    Ok((status.client.version != server_version).then(|| {
+        format!(
+            "Herdr client {} differs from server {server_version} (both protocol {server_protocol}); restart the Herdr server to match",
+            status.client.version
+        )
+    }))
 }
 
 fn version_at_least(actual: &str, required: &str) -> bool {
@@ -1756,7 +1769,27 @@ fi
             }
         }))
         .expect("status should deserialize");
-        validate_status(&valid).expect("matching status should validate");
+        assert_eq!(
+            validate_status(&valid).expect("matching status should validate"),
+            None
+        );
+
+        let skewed: HerdrStatus = serde_json::from_value(json!({
+            "client": {"version": "0.9.1", "protocol": 22},
+            "server": {
+                "running": true,
+                "version": "0.9.0",
+                "protocol": 22,
+                "compatible": true,
+                "restart_needed": false
+            }
+        }))
+        .expect("status should deserialize");
+        let warning = validate_status(&skewed)
+            .expect("compatible version skew should validate")
+            .expect("version skew should warn");
+        assert!(warning.contains("0.9.1") && warning.contains("0.9.0"));
+        assert!(validate_private_status(&skewed, std::path::Path::new("/x")).is_err());
 
         let incompatible: HerdrStatus = serde_json::from_value(json!({
             "client": {"version": "0.8.2", "protocol": 20},

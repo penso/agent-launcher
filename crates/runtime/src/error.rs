@@ -120,6 +120,9 @@ pub enum Error {
     #[error("no available backend matches {0}")]
     BackendUnavailable(String),
 
+    #[error("dispatch refused: {0}")]
+    BackendBlocked(String),
+
     #[error("runtime command channel is closed")]
     CommandChannelClosed,
 

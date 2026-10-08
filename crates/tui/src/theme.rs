@@ -40,6 +40,10 @@ pub(crate) const fn error() -> Color {
     Color::Rgb(224, 108, 117)
 }
 
+pub(crate) const fn warning() -> Color {
+    Color::Rgb(250, 189, 47)
+}
+
 pub(crate) const fn border() -> Color {
     Color::Rgb(102, 92, 84)
 }

@@ -6,9 +6,9 @@ use std::{
 
 use agent_launcher_core::{
     AppConfig, BackendConfig, BackendKind, BackendStatus, EventEnvelope, Issue, IssueKey,
-    IssueProvider, OutputStream, PromptProfile, PullRequestMetadata, Repository, RunEvent,
-    RunState, RunSummary, RuntimeCommand, RuntimeSnapshot, SourceStatus, WorktreeDeleteAction,
-    WorktreeDeletePreview, WorktreeInspection,
+    IssueProvider, LogEntry, LogLevel, OutputStream, PromptProfile, PullRequestMetadata,
+    Repository, RunEvent, RunState, RunSummary, RuntimeCommand, RuntimeSnapshot, SourceStatus,
+    WorktreeDeleteAction, WorktreeDeletePreview, WorktreeInspection,
 };
 use agent_launcher_issues::{IssueSource, SyncCheckpoint, SyncMode, SyncResult};
 use agent_launcher_runner::{
@@ -35,6 +35,8 @@ const COMMAND_CAPACITY: usize = 64;
 const RUN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_IN_MEMORY_EVENTS: usize = 256;
+const LOG_CAPACITY: usize = 500;
+const LOG_DISK_CAPACITY: usize = 5_000;
 const MAX_SECURITY_JOBS: usize = 4;
 const SECURITY_CACHE_TTL: Duration = Duration::from_secs(300);
 const SECURITY_PREPARATION_TIMEOUT: Duration = Duration::from_secs(660);
@@ -678,6 +680,10 @@ impl RuntimeService {
     }
 
     async fn initialize(&mut self) {
+        match self.store.load_recent_log(LOG_CAPACITY).await {
+            Ok(log) => self.snapshot.log = log,
+            Err(error) => tracing::warn!(%error, "event log history unavailable"),
+        }
         self.initialize_away().await;
         if self.away.owner_error.is_some() {
             self.snapshot.initialized = true;
@@ -920,6 +926,21 @@ impl RuntimeService {
                 .any(|run| run.id == preview.run.id && run.confidential),
             _ => false,
         };
+        let subject = match &command {
+            RuntimeCommand::Dispatch { issue, .. }
+            | RuntimeCommand::Review { issue, .. }
+            | RuntimeCommand::DeleteIssue { issue } => Some(issue.canonical()),
+            RuntimeCommand::SendInput { run_id, .. }
+            | RuntimeCommand::Stop { run_id }
+            | RuntimeCommand::Open { run_id } => self
+                .snapshot
+                .runs
+                .iter()
+                .find(|run| run.id == *run_id)
+                .map(|run| run.issue_key.clone()),
+            RuntimeCommand::DeleteWorktree { preview } => Some(preview.run.issue_key.clone()),
+            _ => None,
+        };
         if matches!(&command, RuntimeCommand::Refresh) {
             self.activity_refresh
                 .send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -1019,6 +1040,8 @@ impl RuntimeService {
         } else {
             result
         };
+        let log_line =
+            self.command_log_line(name, subject.as_deref(), confidential_command, &result);
         if result.is_ok() && matches!(name, "dispatch" | "review" | "stop" | "delete-worktree") {
             self.launch_detection();
         }
@@ -1033,6 +1056,9 @@ impl RuntimeService {
             },
         );
         self.record_command_result(name, &result);
+        if let Some((level, toast, message)) = log_line {
+            self.log(level, toast, message);
+        }
         let _ = acknowledge.send(result);
         shutdown
     }
@@ -1147,6 +1173,119 @@ impl RuntimeService {
         self.config.prompt_profiles = profiles;
         self.publish();
         Ok(document)
+    }
+
+    fn log(&mut self, level: LogLevel, toast: bool, message: impl Into<String>) {
+        let seq = self.snapshot.log.last().map_or(1, |entry| entry.seq + 1);
+        if self.snapshot.log.len() >= LOG_CAPACITY {
+            self.snapshot
+                .log
+                .drain(..=self.snapshot.log.len() - LOG_CAPACITY);
+        }
+        let entry = LogEntry {
+            seq,
+            at: Utc::now(),
+            level,
+            message: message.into(),
+            toast,
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let store = self.store.clone();
+            let persisted = entry.clone();
+            runtime.spawn(async move {
+                if let Err(error) = store.append_log(&persisted, LOG_DISK_CAPACITY).await {
+                    tracing::warn!(%error, "event log entry not persisted");
+                }
+            });
+        }
+        self.snapshot.log.push(entry);
+    }
+
+    fn issue_label(&self, canonical: &str) -> String {
+        self.snapshot
+            .issues
+            .iter()
+            .find(|issue| issue.key.canonical() == canonical)
+            .map_or_else(
+                || canonical.to_owned(),
+                |issue| format!("{} {}", issue.identifier, issue.title),
+            )
+    }
+
+    /// Describes a finished user command for the event log. Dispatch outcomes
+    /// name the backend and workspace so it is clear where the agent went.
+    fn command_log_line(
+        &self,
+        name: &str,
+        subject: Option<&str>,
+        confidential: bool,
+        result: &Result<()>,
+    ) -> Option<(LogLevel, bool, String)> {
+        let verb = match name {
+            "dispatch" => "Dispatch",
+            "review" => "PR review",
+            "stop" => "Stop",
+            "open" => "Open workspace",
+            "send-input" => "Send input",
+            "delete-worktree" => "Delete worktree",
+            "delete-issue" => "Delete issue",
+            _ => return None,
+        };
+        let launch = matches!(name, "dispatch" | "review");
+        if confidential {
+            return Some(match result {
+                Ok(()) => (
+                    LogLevel::Info,
+                    false,
+                    format!("{verb} of a private run succeeded"),
+                ),
+                Err(_) => (
+                    LogLevel::Error,
+                    true,
+                    format!("{verb} of a private run failed"),
+                ),
+            });
+        }
+        let label = subject.map_or_else(String::new, |subject| self.issue_label(subject));
+        Some(match result {
+            Err(error) => (
+                LogLevel::Error,
+                true,
+                format!("{verb} failed for {label}: {error}"),
+            ),
+            Ok(()) if launch => {
+                let run = subject.and_then(|subject| {
+                    self.snapshot
+                        .runs
+                        .iter()
+                        .find(|run| run.issue_key == subject)
+                });
+                let place = run.and_then(|run| run.workspace.as_ref()).map_or_else(
+                    || "no workspace reported".to_owned(),
+                    |workspace| {
+                        let mut place = format!("{} workspace {}", workspace.backend, workspace.id);
+                        if let Some(path) = &workspace.path {
+                            place.push_str(&format!(" at {}", path.display()));
+                        }
+                        if let Some(host) = &workspace.host {
+                            place.push_str(&format!(" on {host}"));
+                        }
+                        place
+                    },
+                );
+                let agent = run.map_or("agent", |run| run.agent.as_str());
+                (
+                    LogLevel::Info,
+                    true,
+                    format!("{verb}: {agent} started for {label} in {place}"),
+                )
+            },
+            Ok(()) => (
+                LogLevel::Info,
+                false,
+                format!("{verb} succeeded for {label}"),
+            ),
+        })
     }
 
     fn record_command_result(&mut self, name: &str, result: &Result<()>) {
@@ -1543,6 +1682,15 @@ impl RuntimeService {
             self.security_in_flight.remove(key);
         }
         self.record_command_result("dispatch-security", &result);
+        // Private runs only ever log a generic outcome.
+        match &result {
+            Ok(()) => self.log(LogLevel::Info, true, "Private security review started"),
+            Err(_) => self.log(
+                LogLevel::Error,
+                true,
+                "Private security dispatch failed; check advisory access and the local backend",
+            ),
+        }
         self.update_refreshing();
         self.publish();
         let _ = acknowledge.send(result);
@@ -1623,7 +1771,10 @@ impl RuntimeService {
             });
         }
         let backend = self.snapshot.selected_backend.ok_or_else(|| {
-            Error::BackendUnavailable(backend_config_name(&self.config.backend).to_owned())
+            self.snapshot.backend_blocked.clone().map_or_else(
+                || Error::BackendUnavailable(backend_config_name(&self.config.backend).to_owned()),
+                Error::BackendBlocked,
+            )
         })?;
         let profile = match action {
             DispatchAction::Review { profile } | DispatchAction::Implement { profile } => profile,
@@ -2686,15 +2837,41 @@ impl RuntimeService {
                 "backend-detection",
                 Some(detection.backend),
                 None,
-                if detection.available {
-                    "succeeded"
-                } else {
-                    "unavailable"
+                match (detection.available, &detection.message) {
+                    (false, _) => "unavailable",
+                    (true, Some(_)) => "degraded",
+                    (true, None) => "succeeded",
                 },
             );
         }
-        let selected = select_backend(&self.config.backend, &detections);
+        let mut selected = select_backend(&self.config.backend, &detections);
+        let blocked = blocked_fallback(&self.config.backend, &detections, selected);
+        if blocked.is_some() {
+            selected = None;
+        }
+        if blocked != self.snapshot.backend_blocked
+            && let Some(reason) = &blocked
+        {
+            self.log(
+                LogLevel::Error,
+                false,
+                format!("Dispatch disabled: {reason}"),
+            );
+        }
+        if selected != self.snapshot.selected_backend
+            && let Some(kind) = selected
+        {
+            self.log(LogLevel::Info, false, format!("Backend selected: {kind}"));
+        }
+        let warnings = backend_warnings(&detections);
+        for warning in &warnings {
+            if !self.snapshot.warnings.contains(warning) {
+                self.log(LogLevel::Warn, false, warning.clone());
+            }
+        }
         self.snapshot.selected_backend = selected;
+        self.snapshot.backend_blocked = blocked.clone();
+        self.snapshot.warnings = warnings;
         self.snapshot.backends = detections
             .iter()
             .map(|detection| BackendStatus {
@@ -2710,7 +2887,12 @@ impl RuntimeService {
             .map_or_else(Vec::new, |detection| detection.compute_targets.clone());
 
         self.errors.retain(|key, _| !key.starts_with("backend:"));
-        if selected.is_none() {
+        if let Some(reason) = blocked {
+            self.errors.insert(
+                "backend:selected".to_owned(),
+                Error::BackendBlocked(reason).to_string(),
+            );
+        } else if selected.is_none() {
             let requested = backend_config_name(&self.config.backend);
             self.errors.insert(
                 "backend:selected".to_owned(),
@@ -2748,6 +2930,32 @@ impl RuntimeService {
     }
 
     fn upsert_snapshot_run(&mut self, run: RunSummary) {
+        let previous = self
+            .snapshot
+            .runs
+            .iter()
+            .find(|item| item.id == run.id)
+            .map(|item| item.state);
+        if !run.confidential
+            && let Some(previous) = previous
+            && previous != run.state
+        {
+            let level = match run.state {
+                RunState::Failed => LogLevel::Error,
+                RunState::Disconnected | RunState::NeedsInput => LogLevel::Warn,
+                _ => LogLevel::Info,
+            };
+            let mut message = format!(
+                "{} run {:?} → {:?}",
+                self.issue_label(&run.issue_key),
+                previous,
+                run.state
+            );
+            if let Some(detail) = &run.message {
+                message.push_str(&format!(": {detail}"));
+            }
+            self.log(level, false, message);
+        }
         if let Some(existing) = self.snapshot.runs.iter_mut().find(|item| item.id == run.id) {
             *existing = run;
         } else {
@@ -2832,6 +3040,12 @@ impl RuntimeService {
             self.diagnostics
                 .record(operation, None, Some(&key), "failed");
         }
+        if !key.starts_with("command:")
+            && !key.starts_with("backend:")
+            && self.errors.get(&key) != Some(&message)
+        {
+            self.log(LogLevel::Error, false, format!("{key}: {message}"));
+        }
         self.errors.insert(key, message);
         self.update_error_text();
     }
@@ -2842,7 +3056,12 @@ impl RuntimeService {
     }
 
     fn clear_error_without_publish(&mut self, key: &str) {
-        self.errors.remove(key);
+        if self.errors.remove(key).is_some()
+            && !key.starts_with("command:")
+            && !key.starts_with("backend:")
+        {
+            self.log(LogLevel::Info, false, format!("{key}: recovered"));
+        }
         self.update_error_text();
     }
 
@@ -3225,6 +3444,41 @@ fn select_backend(
             available(BackendKind::Conductor).then_some(BackendKind::Conductor)
         },
     }
+}
+
+/// With `auto`, a running worktree manager that cannot be used must not be
+/// silently replaced by a lower-priority backend: the user expects its
+/// workspaces. Returns why dispatch is refused in that case.
+fn blocked_fallback(
+    configured: &BackendConfig,
+    detections: &[BackendDetection],
+    selected: Option<BackendKind>,
+) -> Option<String> {
+    if !matches!(configured, BackendConfig::Auto) {
+        return None;
+    }
+    [BackendKind::Superset, BackendKind::Herdr]
+        .into_iter()
+        .take_while(|kind| selected != Some(*kind))
+        .find_map(|kind| {
+            let detection = detections.iter().find(|detection| {
+                detection.backend == kind && detection.manager_running && !detection.available
+            })?;
+            Some(format!(
+                "{kind} is running but unusable ({}); fix {kind}, or set backend = \"{}\" to use it instead",
+                detection.message.as_deref().unwrap_or("no reason reported"),
+                selected.map_or_else(|| "native".to_owned(), |kind| kind.to_string()),
+            ))
+        })
+}
+
+/// Usable backends that reported a problem, such as Herdr version skew.
+fn backend_warnings(detections: &[BackendDetection]) -> Vec<String> {
+    detections
+        .iter()
+        .filter(|detection| detection.available)
+        .filter_map(|detection| detection.message.clone())
+        .collect()
 }
 
 fn backend_config_name(config: &BackendConfig) -> &'static str {
@@ -3723,6 +3977,111 @@ mod tests {
             .unwrap();
         assert_eq!(backend.requests.lock().unwrap()[0].prompt, preview);
         assert_eq!(preview, "disk Dispatch title");
+    }
+
+    #[tokio::test]
+    async fn dispatch_outcomes_are_logged_with_workspace_and_toast() {
+        let backend = MockBackend::new(BackendKind::Native, true);
+        let (mut service, _handle) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![],
+            Store::in_memory().await.unwrap(),
+            runner(&[Arc::clone(&backend)]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        let first = issue("44", "Dispatch title", "open");
+        let second = issue("45", "Blocked title", "open");
+        service.snapshot.issues = vec![first.clone(), second.clone()];
+        service.snapshot.selected_backend = Some(BackendKind::Native);
+        let dispatch = |key: &IssueKey| {
+            let (acknowledge, receiver) = oneshot::channel();
+            let request = CommandRequest::Command {
+                command: RuntimeCommand::Dispatch {
+                    issue: key.clone(),
+                    profile: None,
+                    target: None,
+                    options: Default::default(),
+                },
+                acknowledge,
+            };
+            (request, receiver)
+        };
+
+        let (request, receiver) = dispatch(&first.key);
+        service.handle_command(request).await;
+        receiver.await.unwrap().unwrap();
+        let entry = service.snapshot.log.last().unwrap();
+        assert!(entry.toast && entry.level == LogLevel::Info);
+        assert!(
+            entry.message.contains("Dispatch title") && entry.message.contains("native workspace"),
+            "{}",
+            entry.message
+        );
+
+        service.snapshot.selected_backend = None;
+        service.snapshot.backend_blocked = Some("herdr is running but unusable (skew)".into());
+        let (request, receiver) = dispatch(&second.key);
+        service.handle_command(request).await;
+        assert!(matches!(
+            receiver.await.unwrap(),
+            Err(Error::BackendBlocked(_))
+        ));
+        let entry = service.snapshot.log.last().unwrap();
+        assert!(entry.toast && entry.level == LogLevel::Error);
+        assert!(
+            entry.message.contains("Blocked title")
+                && entry
+                    .message
+                    .contains("dispatch refused: herdr is running but unusable"),
+            "{}",
+            entry.message
+        );
+        assert_eq!(backend.dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn event_log_history_reloads_and_numbering_continues() {
+        let store = Store::in_memory().await.unwrap();
+        store
+            .append_log(
+                &LogEntry {
+                    seq: 7,
+                    at: Utc::now(),
+                    level: LogLevel::Info,
+                    message: "Dispatch: earlier session".into(),
+                    toast: true,
+                },
+                LOG_DISK_CAPACITY,
+            )
+            .await
+            .unwrap();
+        let backend = MockBackend::new(BackendKind::Native, true);
+        let (mut service, _handle) = RuntimeService::new_with_notifier(
+            repository(),
+            vec![],
+            store,
+            runner(&[backend]),
+            config(),
+            Arc::new(NoopNotifier),
+        );
+        service.initialize().await;
+        let first = &service.snapshot.log[0];
+        assert_eq!(first.seq, 7);
+        assert!(!first.toast, "history never re-toasts");
+        assert!(
+            service
+                .snapshot
+                .log
+                .iter()
+                .skip(1)
+                .all(|entry| entry.seq > 7)
+        );
+        service.log(LogLevel::Info, false, "new");
+        assert_eq!(
+            service.snapshot.log.last().unwrap().seq,
+            service.snapshot.log[service.snapshot.log.len() - 2].seq + 1
+        );
     }
 
     #[tokio::test]
@@ -6420,6 +6779,51 @@ mod tests {
             select_backend(&BackendConfig::Auto, &detections),
             Some(BackendKind::Herdr)
         );
+    }
+
+    #[test]
+    fn auto_refuses_fallback_and_version_skew_surfaces_as_warning() {
+        let detection =
+            |backend, available, manager_running, message: Option<&str>| BackendDetection {
+                backend,
+                available,
+                manager_running,
+                capabilities: BackendCapabilities::default(),
+                message: message.map(str::to_owned),
+                compute_targets: Vec::new(),
+            };
+        let skipped = [
+            detection(BackendKind::Superset, false, false, Some("not installed")),
+            detection(BackendKind::Herdr, false, true, Some("incompatible")),
+            detection(BackendKind::Native, true, false, None),
+        ];
+        let selected = select_backend(&BackendConfig::Auto, &skipped);
+        assert_eq!(selected, Some(BackendKind::Native));
+        let blocked = blocked_fallback(&BackendConfig::Auto, &skipped, selected)
+            .expect("auto must not silently fall back from a running Herdr");
+        assert!(blocked.contains("herdr is running but unusable (incompatible)"));
+        assert!(blocked.contains("backend = \"native\""));
+        assert_eq!(
+            blocked_fallback(&BackendConfig::Native, &skipped, selected),
+            None
+        );
+
+        let skewed = [
+            detection(
+                BackendKind::Herdr,
+                true,
+                true,
+                Some("Herdr client 0.9.1 differs"),
+            ),
+            detection(BackendKind::Native, true, false, None),
+        ];
+        let selected = select_backend(&BackendConfig::Auto, &skewed);
+        assert_eq!(selected, Some(BackendKind::Herdr));
+        assert_eq!(
+            blocked_fallback(&BackendConfig::Auto, &skewed, selected),
+            None
+        );
+        assert_eq!(backend_warnings(&skewed), ["Herdr client 0.9.1 differs"]);
     }
 
     #[tokio::test]

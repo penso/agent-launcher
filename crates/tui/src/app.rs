@@ -1,6 +1,6 @@
 use agent_launcher_core::{
-    BackendKind, DispatchOptions, Issue, IssueKey, ModelSelection, RunSummary, RuntimeSnapshot,
-    WorktreeDeletePreview,
+    BackendKind, DispatchOptions, Issue, IssueKey, LogEntry, LogLevel, ModelSelection, RunSummary,
+    RuntimeSnapshot, WorktreeDeletePreview,
 };
 
 use crate::{
@@ -21,16 +21,18 @@ pub(crate) enum InboxTab {
     Issues,
     PullRequests,
     Security,
+    Logs,
 }
 
 impl InboxTab {
-    pub const ALL: [Self; 3] = [Self::Issues, Self::PullRequests, Self::Security];
+    pub const ALL: [Self; 4] = [Self::Issues, Self::PullRequests, Self::Security, Self::Logs];
 
     pub const fn index(self) -> usize {
         match self {
             Self::Issues => 0,
             Self::PullRequests => 1,
             Self::Security => 2,
+            Self::Logs => 3,
         }
     }
 
@@ -47,6 +49,7 @@ impl InboxTab {
             Self::Issues => "Issues",
             Self::PullRequests => "PRs",
             Self::Security => "Security",
+            Self::Logs => "Logs",
         }
     }
 }
@@ -211,7 +214,7 @@ pub(crate) struct AppState {
     pub mouse: crate::mouse::MouseGeometry,
     pub route: Route,
     pub tab: InboxTab,
-    pub inactive_lists: [InactiveList; 3],
+    pub inactive_lists: [InactiveList; 4],
     pub selected: usize,
     pub detail_issue_key: Option<IssueKey>,
     pub scroll: usize,
@@ -242,7 +245,34 @@ pub(crate) struct AppState {
     pub host_metrics: HostMetrics,
     pub tick: u32,
     pub demo_started: Option<std::time::Instant>,
+    /// When the TUI started; drives the launch logo fade over the activity graph.
+    pub launched: Option<std::time::Instant>,
     pub activity_history_origin: Option<chrono::DateTime<chrono::Utc>>,
+    pub toast: Option<Toast>,
+    /// Highest runtime log sequence already considered for a toast.
+    pub last_log_seq: u64,
+}
+
+pub(crate) struct Toast {
+    pub level: LogLevel,
+    pub message: String,
+    pub expires: std::time::Instant,
+}
+
+impl Toast {
+    pub fn new(level: LogLevel, message: impl Into<String>) -> Self {
+        // Failures stay up longer: they usually need reading, not just noticing.
+        let seconds = if level == LogLevel::Error {
+            15
+        } else {
+            8
+        };
+        Self {
+            level,
+            message: message.into(),
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+        }
+    }
 }
 
 impl AppState {
@@ -260,6 +290,54 @@ impl AppState {
         match (self.status_message.as_ref(), error) {
             (Some(status), Some(error)) => Some(format!("{status} | {error}")),
             (status, error) => status.or(error).cloned(),
+        }
+    }
+
+    /// Raises a toast for the newest unseen runtime log entry flagged for one.
+    pub fn ingest_log(&mut self, snapshot: &RuntimeSnapshot) {
+        if let Some(entry) = snapshot
+            .log
+            .iter()
+            .rev()
+            .take_while(|entry| entry.seq > self.last_log_seq)
+            .find(|entry| entry.toast)
+        {
+            self.toast = Some(Toast::new(entry.level, entry.message.clone()));
+        }
+        if let Some(last) = snapshot.log.last() {
+            self.last_log_seq = self.last_log_seq.max(last.seq);
+        }
+    }
+
+    /// Drops an expired toast; returns whether the screen needs a redraw.
+    pub fn expire_toast(&mut self) -> bool {
+        let expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.expires <= std::time::Instant::now());
+        if expired {
+            self.toast = None;
+        }
+        expired
+    }
+
+    /// Log entries for the Logs tab, newest first, filtered by the search query.
+    pub fn log_entries<'a>(&self, snapshot: &'a RuntimeSnapshot) -> Vec<&'a LogEntry> {
+        let query = self.search_query.to_lowercase();
+        snapshot
+            .log
+            .iter()
+            .rev()
+            .filter(|entry| query.is_empty() || entry.message.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    /// Number of selectable rows in the current tab.
+    pub fn list_len(&self, snapshot: &RuntimeSnapshot) -> usize {
+        if self.tab == InboxTab::Logs {
+            self.log_entries(snapshot).len()
+        } else {
+            self.rows(snapshot).len()
         }
     }
 
@@ -302,6 +380,11 @@ impl AppState {
         snapshot: &RuntimeSnapshot,
         selected_key: Option<&IssueKey>,
     ) {
+        if self.tab == InboxTab::Logs {
+            // Log rows are not issues; only keep the cursor in range.
+            self.selected = self.selected.min(self.list_len(snapshot).saturating_sub(1));
+            return;
+        }
         let rows = self.rows(snapshot);
         if let Some(position) = selected_key.and_then(|key| {
             rows.iter()

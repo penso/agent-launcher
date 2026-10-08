@@ -105,6 +105,7 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
     let mut snapshot = runtime.snapshot();
     let mut app = AppState {
         layout,
+        launched: Some(std::time::Instant::now()),
         demo_started: std::env::var_os("AGENT_LAUNCHER_DEMO_ACTIVITY")
             .map(|_| std::time::Instant::now()),
         ..Default::default()
@@ -190,13 +191,14 @@ pub async fn run(runtime: RuntimeHandle, layout: LayoutMode) -> Result<(), Error
                 app.security_confirmation_visible = false;
                 app.reconcile_lists(&snapshot, &next);
                 snapshot = next;
+                app.ingest_log(&snapshot);
                 app.reconcile_detail(&snapshot);
                 app.reconcile_dispatch(&snapshot);
                 needs_draw = true;
             }
             _ = ticker.tick() => {
                 app.tick = app.tick.wrapping_add(1);
-                if animation_active(&snapshot, &app) {
+                if app.expire_toast() || animation_active(&snapshot, &app) {
                     needs_draw = true;
                 }
             }
@@ -396,7 +398,7 @@ fn handle_key(
 }
 
 fn handle_list_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot) -> bool {
-    let count = app.rows(snapshot).len();
+    let count = app.list_len(snapshot);
     match key.code {
         KeyCode::Esc => return true,
         KeyCode::Tab => {
@@ -407,6 +409,7 @@ fn handle_list_key(app: &mut AppState, key: KeyEvent, snapshot: &RuntimeSnapshot
             app.set_tab(app.tab.previous());
             app.status_message = None;
         },
+        KeyCode::Enter if app.tab == crate::app::InboxTab::Logs => {},
         KeyCode::Enter => {
             app.open_detail(snapshot);
         },
@@ -938,6 +941,17 @@ fn prepare_dispatch(app: &mut AppState, snapshot: &RuntimeSnapshot) -> Option<La
         return None;
     }
     let issue_key = dispatch_target(app, snapshot)?;
+    if !is_security(snapshot, &issue_key)
+        && let Some(reason) = &snapshot.backend_blocked
+    {
+        let message = format!("Dispatch refused: {reason}");
+        app.status_message = Some(message.clone());
+        app.toast = Some(crate::app::Toast::new(
+            agent_launcher_core::LogLevel::Error,
+            message,
+        ));
+        return None;
+    }
     if is_security(snapshot, &issue_key) && !security_supported(snapshot) {
         app.status_message = Some("Private dispatch requires local Native (no compute targets) or Herdr. No automatic public fallback.".into());
         return None;
@@ -1804,7 +1818,9 @@ fn selected_action_issue<'a>(
         Route::Detail => app.detail_issue(snapshot),
     };
     if issue.is_none() {
-        app.status_message = Some(if app.tab == crate::app::InboxTab::Security {
+        app.status_message = Some(if app.tab == crate::app::InboxTab::Logs {
+            "switch to Issues or PRs to act on an item".to_owned()
+        } else if app.tab == crate::app::InboxTab::Security {
             "no private advisory selected".to_owned()
         } else if app.tab == crate::app::InboxTab::PullRequests {
             "no PR selected".to_owned()
@@ -2534,7 +2550,7 @@ mod tests {
         let filters = ["Issue", "Review", "CVE-2026-1234"];
         let sorts = [IssueSort::Newest, IssueSort::Oldest, IssueSort::Title];
         let mut keys = Vec::new();
-        for tab in InboxTab::ALL {
+        for tab in [InboxTab::Issues, InboxTab::PullRequests, InboxTab::Security] {
             app.set_tab(tab);
             app.search_query = filters[tab.index()].into();
             app.issue_sort = sorts[tab.index()];
@@ -2546,9 +2562,17 @@ mod tests {
         refreshed.issues.reverse();
         app.reconcile_lists(&snapshot, &refreshed);
         assert_eq!(app.tab, InboxTab::Security);
-        for tab in [InboxTab::PullRequests, InboxTab::Issues, InboxTab::Security] {
+        for tab in [
+            InboxTab::PullRequests,
+            InboxTab::Issues,
+            InboxTab::Logs,
+            InboxTab::Security,
+        ] {
             handle_list_key(&mut app, KeyCode::BackTab.into(), &refreshed);
             assert_eq!(app.tab, tab);
+            if tab == InboxTab::Logs {
+                continue;
+            }
             assert_eq!(app.search_query, filters[tab.index()]);
             assert_eq!(app.issue_sort, sorts[tab.index()]);
             assert_eq!(app.scroll, tab.index() + 1);
@@ -2567,7 +2591,64 @@ mod tests {
         assert_eq!(app.search_query, "d123?");
         assert!(app.dispatch_overlay.is_none());
         handle_list_key(&mut app, KeyCode::Tab.into(), &refreshed);
+        assert_eq!(app.tab, InboxTab::Logs);
+        handle_list_key(&mut app, KeyCode::Tab.into(), &refreshed);
         assert_eq!(app.tab, InboxTab::Issues);
+    }
+
+    #[test]
+    fn blocked_backend_refuses_dispatch_with_toast() {
+        let snapshot = RuntimeSnapshot {
+            issues: vec![issue("1", Duration::zero())],
+            backend_blocked: Some("herdr is running but unusable (skew)".into()),
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        assert!(prepare_dispatch(&mut app, &snapshot).is_none());
+        assert!(app.dispatch_overlay.is_none());
+        let toast = app.toast.as_ref().expect("refusal raises a toast");
+        assert_eq!(toast.level, agent_launcher_core::LogLevel::Error);
+        assert!(toast.message.contains("Dispatch refused: herdr is running"));
+    }
+
+    #[test]
+    fn only_new_toast_entries_raise_a_toast_and_logs_tab_keeps_cursor() {
+        use agent_launcher_core::{LogEntry, LogLevel};
+        let entry = |seq, toast, message: &str| LogEntry {
+            seq,
+            at: chrono::Utc::now(),
+            level: LogLevel::Info,
+            message: message.into(),
+            toast,
+        };
+        let mut snapshot = RuntimeSnapshot {
+            log: vec![entry(1, false, "Backend selected: herdr")],
+            ..Default::default()
+        };
+        let mut app = AppState::default();
+        app.ingest_log(&snapshot);
+        assert!(app.toast.is_none());
+        snapshot
+            .log
+            .push(entry(2, true, "Dispatch: claude started"));
+        snapshot.log.push(entry(3, false, "run transition"));
+        app.ingest_log(&snapshot);
+        assert_eq!(
+            app.toast.as_ref().unwrap().message,
+            "Dispatch: claude started"
+        );
+        app.toast = None;
+        app.ingest_log(&snapshot);
+        assert!(app.toast.is_none(), "an entry toasts once");
+
+        app.set_tab(crate::app::InboxTab::Logs);
+        assert_eq!(app.list_len(&snapshot), 3);
+        handle_list_key(&mut app, KeyCode::Down.into(), &snapshot);
+        let next = snapshot.clone();
+        app.reconcile_lists(&snapshot, &next);
+        assert_eq!(app.selected, 1);
+        app.search_query = "dispatch".into();
+        assert_eq!(app.list_len(&snapshot), 1);
     }
 
     #[test]

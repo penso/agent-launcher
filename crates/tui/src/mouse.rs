@@ -109,7 +109,7 @@ pub(crate) fn handle_mouse(
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = event.kind == MouseEventKind::ScrollDown;
             if app.route == Route::Inbox && hit.list.contains(position) && app.visible_rows > 0 {
-                let count = app.rows(snapshot).len();
+                let count = app.list_len(snapshot);
                 let max_scroll = count.saturating_sub(app.visible_rows);
                 app.scroll = if down {
                     app.scroll.saturating_add(3).min(max_scroll)

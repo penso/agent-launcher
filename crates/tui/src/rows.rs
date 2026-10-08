@@ -59,6 +59,7 @@ pub(crate) fn display_rows(
                 InboxTab::PullRequests => {
                     issue.security_advisory.is_none() && issue.pull_request.is_some()
                 },
+                InboxTab::Logs => false,
             }
         })
         .collect::<Vec<_>>();

@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use agent_launcher_core::{
-    BackendKind, ComputeTargetAvailability, ComputeTargetStatus, Issue, RunState, RuntimeSnapshot,
+    BackendKind, ComputeTargetAvailability, ComputeTargetStatus, Issue, LogLevel, RunState,
+    RuntimeSnapshot,
 };
 use ratatui::{
     Frame,
@@ -87,6 +88,9 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
         }
         draw_footer(frame, footer_area, snapshot, &app.host_metrics, app.tab);
     }
+    if let Some(toast) = &app.toast {
+        draw_toast(frame, content, toast);
+    }
     app.away_quit_visible = false;
     if app.away_overlay.is_some() || app.away_quit {
         crate::away::draw(frame, overlay_area, snapshot, app);
@@ -94,38 +98,39 @@ pub(crate) fn draw(frame: &mut Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut 
     app.mouse.scroll = app.scroll;
 }
 
+/// The mode is a setting, not a view: draw it as a picker (label, value and a
+/// chevron) rather than as another tab. Clicking it opens the mode chooser.
 fn draw_mode_button(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot) -> Rect {
     use agent_launcher_core::AppMode;
 
-    let away = &snapshot.away;
-    let active = away.mode == AppMode::Away;
-    let mode = if active {
-        "Away"
-    } else {
-        "Manual"
-    };
-    let Some(label) = [format!(" {mode} "), mode.to_owned()]
-        .into_iter()
-        .find(|label| label.len() <= usize::from(area.width))
-    else {
-        return Rect::default();
-    };
     if area.height == 0 {
         return Rect::default();
     }
-    let button = Rect::new(
-        area.right() - label.len() as u16,
-        area.y,
-        label.len() as u16,
-        1,
-    );
-    let style = if active {
-        Style::new().fg(theme::bg()).bg(theme::primary()).bold()
+    let active = snapshot.away.mode == AppMode::Away;
+    let (mode, value) = if active {
+        ("Away", Style::new().fg(theme::primary()).bold())
     } else {
-        Style::new().fg(theme::text()).bg(theme::element())
+        ("Manual", Style::new().fg(theme::text()))
     };
-    frame.render_widget(Paragraph::new(label).style(style), button);
+    let muted = Style::new().fg(theme::muted());
+    let variants = [
+        vec![Span::styled(mode, value), Span::styled(" ▾", muted)],
+        vec![Span::styled(mode, value)],
+    ];
+    let Some(spans) = variants
+        .into_iter()
+        .find(|spans| line_width(spans) <= usize::from(area.width))
+    else {
+        return Rect::default();
+    };
+    let width = line_width(&spans) as u16;
+    let button = Rect::new(area.right() - width, area.y, width, 1);
+    frame.render_widget(Paragraph::new(Line::from(spans)), button);
     button
+}
+
+fn line_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &mut AppState) {
@@ -295,7 +300,7 @@ fn draw_agent_activity(
     } else {
         &snapshot.herdr_activity
     };
-    draw_activity_panel(
+    draw_activity_panel_with_intro(
         frame,
         area,
         activity,
@@ -307,9 +312,45 @@ fn draw_agent_activity(
             app.activity_history_origin
         },
         demo_elapsed,
+        app.launched
+            .and_then(|launched| intro_progress(launched.elapsed())),
     );
 }
 
+/// The launch logo stays fully visible for this long over recorded history...
+const INTRO_HOLD: std::time::Duration = std::time::Duration::from_millis(1200);
+/// ...then dissolves into the graph over this long.
+const INTRO_FADE: std::time::Duration = std::time::Duration::from_millis(1600);
+
+/// Fade progress of the launch logo, 0.0 (opaque) to 1.0, or `None` once done.
+fn intro_progress(elapsed: std::time::Duration) -> Option<f32> {
+    if elapsed >= INTRO_HOLD + INTRO_FADE {
+        return None;
+    }
+    Some(elapsed.saturating_sub(INTRO_HOLD).as_secs_f32() / INTRO_FADE.as_secs_f32())
+}
+
+fn mix(from: ratatui::style::Color, to: ratatui::style::Color, t: f32) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    match (from, to) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let channel =
+                |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+            Color::Rgb(channel(r1, r2), channel(g1, g2), channel(b1, b2))
+        },
+        _ if t < 0.5 => from,
+        _ => to,
+    }
+}
+
+/// Stable per-cell threshold in [0, 1) so the logo dissolves in a scattered pattern.
+fn dissolve_threshold(x: u16, y: u16) -> f32 {
+    let hash = (u32::from(x).wrapping_mul(73_856_093) ^ u32::from(y).wrapping_mul(19_349_663))
+        .wrapping_mul(2_654_435_761);
+    (hash >> 8) as f32 / (1u32 << 24) as f32
+}
+
+#[cfg(test)]
 fn draw_activity_panel(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -318,6 +359,22 @@ fn draw_activity_panel(
     demo: bool,
     origin: Option<chrono::DateTime<chrono::Utc>>,
     demo_elapsed: Option<std::time::Duration>,
+) {
+    draw_activity_panel_with_intro(frame, area, snapshot, now, demo, origin, demo_elapsed, None);
+}
+
+/// `intro` is the launch logo's fade progress: while set, the logo covers the
+/// whole graph (not just unobserved columns) and dissolves into recorded history.
+#[allow(clippy::too_many_arguments)]
+fn draw_activity_panel_with_intro(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &agent_launcher_core::HerdrActivitySnapshot,
+    now: chrono::DateTime<chrono::Utc>,
+    demo: bool,
+    origin: Option<chrono::DateTime<chrono::Utc>>,
+    demo_elapsed: Option<std::time::Duration>,
+    intro: Option<f32>,
 ) {
     use agent_launcher_core::ActivityCompleteness;
 
@@ -401,7 +458,12 @@ fn draw_activity_panel(
     // Fit both pieces before drawing: right alignment must never erase scope or the demo label.
     let mut header = (String::new(), String::new());
     'fit: for status in statuses {
-        for title in ["Herdr activity", "Herdr", ""] {
+        for title in [
+            "agent launcher · Herdr activity",
+            "Herdr activity",
+            "Herdr",
+            "",
+        ] {
             let label = [
                 title,
                 if demo {
@@ -476,7 +538,7 @@ fn draw_activity_panel(
     } else {
         crate::activity::unobserved_columns(snapshot, graph.width.into(), now, origin)
     } as u16;
-    if leading > 0 && !graph.is_empty() {
+    if (leading > 0 || intro.is_some()) && !graph.is_empty() {
         let full = graph.width >= 62 && graph.height >= 2;
         let lines = if full {
             (0..2)
@@ -497,9 +559,20 @@ fn draw_activity_panel(
             .style(Style::new().fg(theme::muted()).bg(theme::panel()).bold())
             .render(logo, &mut buffer);
         // Crop whole cells, never half of a Braille column or any recorded gap.
+        // During the launch intro, cells over recorded history dissolve away.
         for y in logo.y..logo.bottom() {
-            for x in logo.x..logo.right().min(graph.x + leading) {
-                frame.buffer_mut()[(x, y)] = buffer[(x, y)].clone();
+            for x in logo.x..logo.right() {
+                let mut cell = buffer[(x, y)].clone();
+                if x >= graph.x + leading {
+                    let Some(progress) = intro else {
+                        break;
+                    };
+                    if dissolve_threshold(x, y) < progress {
+                        continue;
+                    }
+                    cell.set_fg(mix(theme::muted(), theme::panel(), progress));
+                }
+                frame.buffer_mut()[(x, y)] = cell;
             }
         }
     }
@@ -539,7 +612,9 @@ fn draw_search(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         && app.delete_overlay.is_none();
     if app.search_query.is_empty() {
         frame.render_widget(
-            Paragraph::new(if app.tab == InboxTab::Security {
+            Paragraph::new(if app.tab == InboxTab::Logs {
+                "Search logs…"
+            } else if app.tab == InboxTab::Security {
                 "Search private advisories (GHSA / CVE / severity)..."
             } else if app.tab == InboxTab::PullRequests {
                 "Search PRs…"
@@ -587,55 +662,101 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
         return;
     }
 
-    let metadata = app.issue_sort.label();
-    let mut tabs = Vec::new();
-    let mut x = inner.x;
+    let metadata = if app.tab == InboxTab::Logs {
+        ""
+    } else {
+        app.issue_sort.label()
+    };
     let compact = inner.width < 27;
-    for tab in InboxTab::ALL {
-        if !tabs.is_empty() {
-            tabs.push(Span::raw(if compact {
-                " "
-            } else {
-                "  "
-            }));
-            x += if compact {
-                1
-            } else {
-                2
-            };
-        }
-        let label = if compact {
+    let gap: u16 = if compact {
+        1
+    } else {
+        2
+    };
+    let tab_label = |tab: InboxTab| {
+        if compact {
             tab.label().to_owned()
         } else {
             format!(" {} ", tab.label())
-        };
+        }
+    };
+    let tab_style = |tab: InboxTab| {
+        if app.tab == tab {
+            Style::new().fg(theme::bg()).bg(theme::primary()).bold()
+        } else {
+            Style::new().fg(theme::text()).bg(theme::element())
+        }
+    };
+    // Item tabs flow from the left; Logs is a different kind of view and sits
+    // on the right, next to the mode picker, when there is room for it.
+    let mut tabs = Vec::new();
+    let mut x = inner.x;
+    let mut placed = Vec::new();
+    for tab in [InboxTab::Issues, InboxTab::PullRequests, InboxTab::Security] {
+        if !tabs.is_empty() {
+            tabs.push(Span::raw(" ".repeat(usize::from(gap))));
+            x += gap;
+        }
+        let label = tab_label(tab);
         let width = label.len() as u16;
-        app.mouse
-            .tabs
-            .push((Rect::new(x, inner.y, width, 1).intersection(inner), tab));
+        placed.push((Rect::new(x, inner.y, width, 1), tab));
         x += width;
-        tabs.push(Span::styled(
-            label,
-            if app.tab == tab {
-                Style::new().fg(theme::bg()).bg(theme::primary()).bold()
-            } else {
-                Style::new().fg(theme::text()).bg(theme::element())
-            },
-        ));
+        tabs.push(Span::styled(label, tab_style(tab)));
     }
     // Reserve room for either mode so switching does not move the control.
-    let minimum = " Manual ".len();
+    let minimum = "Manual ▾".chars().count();
     let available = inner.right().saturating_sub(x + 1);
     if usize::from(available) >= minimum {
         app.mouse.mode = draw_mode_button(frame, Rect::new(x + 1, inner.y, available, 1), snapshot);
     }
+    // Size the gap for the widest mode label so Logs stays put when it changes.
+    let reserved = ["Manual ▾", "Manual"]
+        .into_iter()
+        .map(|label| label.chars().count() as u16)
+        .find(|width| *width <= available)
+        .unwrap_or(app.mouse.mode.width);
     let tabs_right = if app.mouse.mode.is_empty() {
         inner.right()
     } else {
-        app.mouse.mode.x - 1
+        app.mouse.mode.right().saturating_sub(reserved + gap + 1)
     };
+    let logs_label = tab_label(InboxTab::Logs);
+    let logs_width = logs_label.len() as u16;
+    let mut left_right = tabs_right;
+    let mut right_aligned = None;
+    if tabs_right >= x + gap + logs_width {
+        let rect = Rect::new(tabs_right - logs_width, inner.y, logs_width, 1);
+        right_aligned = Some(rect);
+        frame.render_widget(
+            Paragraph::new(logs_label).style(tab_style(InboxTab::Logs)),
+            rect,
+        );
+        if !app.mouse.mode.is_empty() {
+            frame.render_widget(
+                Paragraph::new("│").style(Style::new().fg(theme::border())),
+                Rect::new(tabs_right + gap.div_ceil(2), inner.y, 1, 1),
+            );
+        }
+        left_right = rect.x.saturating_sub(gap);
+    } else {
+        tabs.push(Span::raw(" ".repeat(usize::from(gap))));
+        placed.push((Rect::new(x + gap, inner.y, logs_width, 1), InboxTab::Logs));
+        x += gap + logs_width;
+        tabs.push(Span::styled(logs_label, tab_style(InboxTab::Logs)));
+    }
+    // Tabs flowing from the left are cut off where the picker begins.
+    let text_right = left_right.min(tabs_right);
+    for (rect, tab) in placed {
+        // A clipped tab on a very narrow screen is not a reliable click target.
+        if rect.intersection(inner) == rect && rect.right() <= text_right {
+            app.mouse.tabs.push((rect, tab));
+        }
+    }
+    if let Some(rect) = right_aligned {
+        app.mouse.tabs.push((rect, InboxTab::Logs));
+    }
     tabs.push(Span::styled(
-        if inner.width >= 62 && usize::from(tabs_right.saturating_sub(x)) >= metadata.len() + 2 {
+        if inner.width >= 62 && usize::from(left_right.saturating_sub(x)) >= metadata.len() + 2 {
             format!("  {metadata}")
         } else {
             String::new()
@@ -644,7 +765,7 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
     ));
     frame.render_widget(
         Paragraph::new(Line::from(tabs)),
-        Rect::new(inner.x, inner.y, tabs_right.saturating_sub(inner.x), 1),
+        Rect::new(inner.x, inner.y, text_right.saturating_sub(inner.x), 1),
     );
 
     let roomy = inner.height >= 10;
@@ -672,9 +793,167 @@ fn draw_listing(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, a
     );
 }
 
+fn log_level_style(level: LogLevel) -> (&'static str, Style) {
+    match level {
+        LogLevel::Info => ("info ", Style::new().fg(theme::muted())),
+        LogLevel::Warn => ("warn ", Style::new().fg(theme::warning())),
+        LogLevel::Error => ("error", Style::new().fg(theme::error())),
+    }
+}
+
+/// Newest-first event log; the selected entry is shown in full underneath.
+fn draw_log_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    app: &mut AppState,
+) {
+    let entries = app.log_entries(snapshot);
+    app.selected = app.selected.min(entries.len().saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new("time      level  event").style(Style::new().fg(theme::muted())),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if app.search_query.is_empty() {
+                "No events yet. Dispatches, backend changes, run transitions and errors appear here."
+            } else {
+                "No matching events. Backspace edits · Ctrl+G, c clears."
+            })
+            .style(Style::new().fg(theme::muted()))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+            Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1)),
+        );
+        app.visible_rows = 0;
+        return;
+    }
+    let detail_height = if area.height >= 10 {
+        4
+    } else {
+        0
+    };
+    let visible_rows = area.height.saturating_sub(1 + detail_height) as usize;
+    app.visible_rows = visible_rows;
+    app.mouse.list = Rect::new(area.x, area.y + 1, area.width, visible_rows as u16);
+    let max_scroll = entries.len().saturating_sub(visible_rows);
+    app.scroll = app.scroll.min(max_scroll);
+    if app.selected < app.scroll {
+        app.scroll = app.selected;
+    } else if app.selected >= app.scroll.saturating_add(visible_rows) {
+        app.scroll = app
+            .selected
+            .saturating_sub(visible_rows.saturating_sub(1))
+            .min(max_scroll);
+    }
+    for (screen_row, entry) in entries
+        .iter()
+        .skip(app.scroll)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let index = app.scroll + screen_row;
+        let row_area = Rect::new(area.x, area.y + 1 + screen_row as u16, area.width, 1);
+        let background = if index == app.selected {
+            theme::element()
+        } else {
+            theme::panel()
+        };
+        let (label, style) = log_level_style(entry.level);
+        let time = entry.at.with_timezone(&chrono::Local).format("%H:%M:%S");
+        let message_width = (area.width as usize).saturating_sub(17);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{time}  "), Style::new().fg(theme::muted())),
+                Span::styled(format!("{label}  "), style),
+                Span::styled(
+                    truncate(&entry.message, message_width),
+                    Style::new().fg(theme::text()),
+                ),
+            ]))
+            .style(Style::new().bg(background)),
+            row_area,
+        );
+    }
+    if detail_height > 0
+        && let Some(entry) = entries.get(app.selected)
+    {
+        let (_, style) = log_level_style(entry.level);
+        let detail = Rect::new(
+            area.x,
+            area.bottom() - detail_height,
+            area.width,
+            detail_height,
+        );
+        frame.render_widget(
+            Paragraph::new(entry.message.as_str())
+                .style(style)
+                .wrap(ratatui::widgets::Wrap { trim: true }),
+            detail,
+        );
+    }
+}
+
+/// Transient notice in the top-right corner, above the listing.
+fn draw_toast(frame: &mut Frame<'_>, area: Rect, toast: &crate::app::Toast) {
+    let width = area.width.saturating_sub(4).min(64);
+    if width < 12 || area.height < 4 {
+        return;
+    }
+    let (_, style) = log_level_style(toast.level);
+    let inner_width = width.saturating_sub(4) as usize;
+    let lines = textwrap_lines(&toast.message, inner_width).min(5) as u16;
+    let height = (lines + 2).min(area.height);
+    let popup = Rect::new(area.right() - width - 1, area.y + 1, width, height);
+    frame.render_widget(Clear, popup);
+    let border = match toast.level {
+        LogLevel::Info => theme::primary(),
+        LogLevel::Warn => theme::warning(),
+        LogLevel::Error => theme::error(),
+    };
+    frame.render_widget(
+        Paragraph::new(toast.message.as_str())
+            .style(style.bg(theme::element()))
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .block(
+                Block::bordered()
+                    .border_style(Style::new().fg(border).bg(theme::element()))
+                    .padding(Padding::horizontal(1)),
+            ),
+        popup,
+    );
+}
+
+/// Greedy word-wrap line count, used only to size the toast.
+fn textwrap_lines(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut lines = 1;
+    let mut column = 0;
+    for word in text.split_whitespace() {
+        let length = word.chars().count();
+        if column == 0 {
+            column = length;
+        } else if column + 1 + length <= width {
+            column += 1 + length;
+        } else {
+            lines += 1;
+            column = length;
+        }
+        while column > width {
+            lines += 1;
+            column -= width;
+        }
+    }
+    lines
+}
+
 fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &mut AppState) {
     if area.is_empty() {
         app.visible_rows = 0;
+        return;
+    }
+    if app.tab == InboxTab::Logs {
+        draw_log_table(frame, area, snapshot, app);
         return;
     }
     let rows = app.rows(snapshot);
@@ -1378,21 +1657,22 @@ fn draw_empty_state(
 }
 
 fn draw_legends(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
-    let rows = app.rows(snapshot);
-    let start = if rows.is_empty() {
+    let count = app.list_len(snapshot);
+    let start = if count == 0 {
         0
     } else {
         app.scroll + 1
     };
-    let end = (app.scroll + app.visible_rows).min(rows.len());
-    let range = if rows.is_empty() {
-        format!("0 of 0 · {}", app.issue_sort.label())
+    let end = (app.scroll + app.visible_rows).min(count);
+    let order = if app.tab == InboxTab::Logs {
+        "events, newest first"
     } else {
-        format!(
-            "{start}-{end} of {} · {}",
-            rows.len(),
-            app.issue_sort.label()
-        )
+        app.issue_sort.label()
+    };
+    let range = if count == 0 {
+        format!("0 of 0 · {order}")
+    } else {
+        format!("{start}-{end} of {count} · {order}")
     };
     let range_width = range.chars().count().min(area.width as usize) as u16;
     let status_width = area.width.saturating_sub(range_width.saturating_add(2));
@@ -1433,16 +1713,16 @@ fn status_line<'a>(snapshot: &'a RuntimeSnapshot, app: &'a AppState) -> Line<'a>
         .iter()
         .filter(|run| run_is_working(run.state))
         .count();
-    if snapshot.refreshing {
-        Line::from(vec![
+    let mut spans = if snapshot.refreshing {
+        vec![
             Span::styled(
                 theme::BRAILLE_SPINNER[app.tick as usize % theme::BRAILLE_SPINNER.len()],
                 Style::new().fg(theme::primary()),
             ),
             Span::styled(" refreshing", Style::new().fg(theme::muted())),
-        ])
+        ]
     } else if working > 0 {
-        Line::from(vec![
+        vec![
             Span::styled(
                 theme::BRAILLE_SPINNER[app.tick as usize % theme::BRAILLE_SPINNER.len()],
                 Style::new().fg(theme::primary()),
@@ -1451,13 +1731,25 @@ fn status_line<'a>(snapshot: &'a RuntimeSnapshot, app: &'a AppState) -> Line<'a>
                 format!(" {working} working"),
                 Style::new().fg(theme::muted()),
             ),
-        ])
-    } else {
-        Line::from(vec![
+        ]
+    } else if snapshot.warnings.is_empty() {
+        vec![
             Span::styled("● ", Style::new().fg(theme::primary())),
             Span::styled("ready", Style::new().fg(theme::muted())),
-        ])
+        ]
+    } else {
+        Vec::new()
+    };
+    if !snapshot.warnings.is_empty() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::new().fg(theme::muted())));
+        }
+        spans.push(Span::styled(
+            format!("▲ {}", snapshot.warnings.join("; ")),
+            Style::new().fg(theme::warning()),
+        ));
     }
+    Line::from(spans)
 }
 
 fn run_is_working(state: RunState) -> bool {
@@ -1801,6 +2093,12 @@ fn draw_dispatch_overlay(
             Line::raw("Availability is determined by the harness on the selected host."),
             Line::raw("This launch only; no config changes, installs or permission changes."),
         ];
+        lines.splice(
+            4..4,
+            snapshot.warnings.iter().map(|warning| {
+                Line::styled(format!("▲ {warning}"), Style::new().fg(theme::warning()))
+            }),
+        );
         if let Some(status) = &app.status_message {
             lines.push(Line::styled(
                 status.clone(),
@@ -2587,6 +2885,9 @@ fn draw_debug_overlay(
         ),
         format!("Error: {}", snapshot.error.as_deref().unwrap_or("none")),
     ];
+    for warning in &snapshot.warnings {
+        lines.push(format!("Warning: {warning}"));
+    }
     if let Some(path) = &snapshot.diagnostic_log_path {
         lines.push(format!("Diagnostic log: {}", path.display()));
     }
@@ -3433,13 +3734,14 @@ mod tests {
                         let label: String = (button.x..button.right())
                             .map(|x| buffer[(x, button.y)].symbol())
                             .collect();
-                        assert_eq!(
-                            label.trim(),
-                            if phase == AwayPhase::Inactive {
-                                "Manual"
-                            } else {
-                                "Away"
-                            }
+                        let mode = if phase == AwayPhase::Inactive {
+                            "Manual"
+                        } else {
+                            "Away"
+                        };
+                        assert!(
+                            [format!("{mode} ▾"), mode.to_owned()].contains(&label),
+                            "{label}"
                         );
                         assert!(!render(width, height, &snapshot, &mut app).contains("MODE:"));
                         if route == Route::Inbox && width >= 80 {
@@ -3458,20 +3760,22 @@ mod tests {
                             assert!(!button.intersects(*tab));
                         }
                         assert!(!button.intersects(app.mouse.detail));
+                        // A picker, not a tab: no filled background, value colored by mode.
+                        let value_x = button.x
+                            + label
+                                .chars()
+                                .take_while(|c| *c != mode.chars().next().unwrap())
+                                .count() as u16;
+                        for x in button.x..button.right() {
+                            assert_ne!(buffer[(x, button.y)].bg, theme::element());
+                            assert_ne!(buffer[(x, button.y)].bg, theme::primary());
+                        }
                         assert_eq!(
-                            buffer[(button.x, button.y)].bg,
-                            if phase == AwayPhase::Inactive {
-                                theme::element()
-                            } else {
-                                theme::primary()
-                            }
-                        );
-                        assert_eq!(
-                            buffer[(button.x, button.y)].fg,
+                            buffer[(value_x, button.y)].fg,
                             if phase == AwayPhase::Inactive {
                                 theme::text()
                             } else {
-                                theme::bg()
+                                theme::primary()
                             }
                         );
                     }
@@ -3562,10 +3866,10 @@ mod tests {
         snapshot.away.mode = AppMode::Away;
         snapshot.away.prioritizing = true;
         for (phase, width, expected) in [
-            (AwayPhase::Running, 13, " Away "),
-            (AwayPhase::Paused, 17, " Away "),
-            (AwayPhase::Attention, 20, " Away "),
-            (AwayPhase::Attention, 30, " Away "),
+            (AwayPhase::Running, 6, "Away ▾"),
+            (AwayPhase::Paused, 11, "Away ▾"),
+            (AwayPhase::Attention, 20, "Away ▾"),
+            (AwayPhase::Attention, 4, "Away"),
         ] {
             snapshot.away.phase = phase;
             let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
@@ -5035,6 +5339,58 @@ mod tests {
     }
 
     #[test]
+    fn footer_shows_backend_warnings_instead_of_ready() {
+        let mut snapshot = normal_snapshot();
+        let mut app = AppState::default();
+        assert!(render(160, 30, &snapshot, &mut app).contains("ready"));
+        snapshot.warnings = vec!["Herdr client 0.9.1 differs".into()];
+        let text = render(160, 30, &snapshot, &mut app);
+        assert!(text.contains("▲ Herdr client 0.9.1 differs"), "{text}");
+    }
+
+    #[test]
+    fn logs_tab_lists_newest_first_and_toast_overlays_listing() {
+        use agent_launcher_core::{LogEntry, LogLevel};
+        let mut snapshot = normal_snapshot();
+        snapshot.log = vec![
+            LogEntry {
+                seq: 1,
+                at: Utc::now(),
+                level: LogLevel::Info,
+                message: "Backend selected: herdr".into(),
+                toast: false,
+            },
+            LogEntry {
+                seq: 2,
+                at: Utc::now(),
+                level: LogLevel::Error,
+                message: "Dispatch failed for 1294 Title: dispatch refused: herdr is running but unusable".into(),
+                toast: true,
+            },
+        ];
+        let mut app = AppState::default();
+        app.set_tab(InboxTab::Logs);
+        let text = render(140, 30, &snapshot, &mut app);
+        let newest = text
+            .find("Dispatch failed for 1294")
+            .expect("newest entry listed");
+        let oldest = text
+            .find("Backend selected: herdr")
+            .expect("oldest entry listed");
+        assert!(newest < oldest, "{text}");
+        assert!(text.contains("error") && text.contains("Logs"));
+        assert!(text.contains("1-2 of 2 · events, newest first"), "{text}");
+
+        app.set_tab(InboxTab::Issues);
+        app.toast = Some(crate::app::Toast::new(
+            LogLevel::Info,
+            "Dispatch: claude started for 1294 in herdr workspace w9 at /tmp/wt",
+        ));
+        let text = render(140, 30, &snapshot, &mut app);
+        assert!(text.contains("herdr workspace w9"), "{text}");
+    }
+
+    #[test]
     fn pr_empty_loading_error_and_filter_states_are_distinct() {
         let mut snapshot = normal_snapshot();
         let mut app = AppState {
@@ -5216,6 +5572,7 @@ mod tests {
         assert!(!text.contains("Filter issues..."));
         assert!(text.contains("Search issues…"));
         assert!(text.contains(" Issues    PRs    Security   newest first"));
+        assert!(text.contains("Logs  │ Manual ▾"));
         assert!(!text.contains("1 source"));
         assert!(!text.contains('┃'));
         assert!(text.contains('╹'));
@@ -5819,6 +6176,67 @@ mod tests {
     }
 
     #[test]
+    fn launch_logo_covers_full_history_then_dissolves() {
+        assert_eq!(intro_progress(std::time::Duration::ZERO), Some(0.0));
+        assert_eq!(intro_progress(INTRO_HOLD), Some(0.0));
+        let halfway = intro_progress(INTRO_HOLD + INTRO_FADE / 2).unwrap();
+        assert!((halfway - 0.5).abs() < 0.01);
+        assert_eq!(intro_progress(INTRO_HOLD + INTRO_FADE), None);
+
+        let now = Utc::now();
+        let mut snapshot = agent_launcher_core::HerdrActivitySnapshot {
+            enabled: true,
+            ..Default::default()
+        };
+        // History older than the window: no unobserved columns are left for the logo.
+        snapshot.samples.push(crate::activity::sample(
+            now - chrono::Duration::minutes(16),
+            1,
+            agent_launcher_core::ActivityCompleteness::Complete,
+        ));
+        let origin = Some(now - chrono::Duration::minutes(16));
+        let logo_cells = |intro| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_activity_panel_with_intro(
+                        frame,
+                        frame.area(),
+                        &snapshot,
+                        now,
+                        false,
+                        origin,
+                        None,
+                        intro,
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let logo: String = theme::AGENT_LOGO
+                .iter()
+                .chain(theme::LAUNCHER_LOGO)
+                .flat_map(|line| line.chars())
+                .filter(|c| !c.is_whitespace() && *c != '░')
+                .collect();
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| {
+                    cell.symbol()
+                        .chars()
+                        .next()
+                        .is_some_and(|c| logo.contains(c))
+                })
+                .count()
+        };
+        let opaque = logo_cells(Some(0.0));
+        assert!(opaque > 40, "logo drawn over recorded history: {opaque}");
+        let fading = logo_cells(Some(0.6));
+        assert!(fading > 0 && fading < opaque, "{fading} of {opaque}");
+        assert_eq!(logo_cells(None), 0);
+    }
+
+    #[test]
     fn live_history_origin_survives_empty_snapshots_and_small_terminal_resize() {
         let mut snapshot = normal_snapshot();
         let old = Utc::now() - chrono::Duration::minutes(16);
@@ -5839,7 +6257,7 @@ mod tests {
             assert_eq!(app.activity_history_origin, Some(old));
             if width >= 112 {
                 assert!(!text.contains(theme::AGENT_LOGO[0]));
-                assert!(!text.contains("agent launcher"));
+                assert!(text.contains("agent launcher · Herdr activity"));
             } else {
                 assert!(text.contains("agent launcher"));
             }
@@ -6422,6 +6840,7 @@ mod tests {
         snapshot.sources[0].connected = false;
         snapshot.sources[0].message = Some("GitHub throttled; retry after tomorrow".into());
         snapshot.error = Some("refresh failed".into());
+        snapshot.warnings = vec!["Herdr client 0.9.1 differs from server 0.9.0".into()];
         snapshot.compute_targets.push(compute_target(
             "remote",
             ComputeTargetAvailability::Offline,
@@ -6447,6 +6866,7 @@ mod tests {
             "disconnected",
             "GitHub throttled",
             "refresh failed",
+            "Warning: Herdr client 0.9.1 differs from server 0.9.0",
             "Last refresh:",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
