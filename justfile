@@ -25,4 +25,8 @@ run:
 install:
     cargo +{{nightly_toolchain}} build --release -p agent-launcher-cli
     mkdir -p "$HOME/.local/bin"
-    cp target/release/agent-launcher "$HOME/.local/bin/agent-launcher"
+    # Copy to a new file and rename over the old one: overwriting a signed
+    # binary in place leaves macOS's cached signature stale and the next
+    # launch is killed (SIGKILL) before it runs.
+    cp target/release/agent-launcher "$HOME/.local/bin/agent-launcher.new"
+    mv -f "$HOME/.local/bin/agent-launcher.new" "$HOME/.local/bin/agent-launcher"
