@@ -47,3 +47,18 @@ pub(crate) const fn run_color(state: RunState) -> Color {
         RunState::Idle | RunState::Cancelled => theme::muted(),
     }
 }
+
+/// Run state in at most eight cells, for narrow status columns.
+pub(crate) const fn run_short_label(state: RunState) -> &'static str {
+    match state {
+        RunState::Provisioning => "setup",
+        RunState::Starting => "starting",
+        RunState::Running => "running",
+        RunState::NeedsInput => "input",
+        RunState::Idle => "idle",
+        RunState::Completed => "done",
+        RunState::Failed => "failed",
+        RunState::Cancelled => "stopped",
+        RunState::Disconnected => "offline",
+    }
+}

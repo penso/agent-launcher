@@ -22,7 +22,7 @@ use crate::{
     format::{age_label, truncate},
     metrics::HostMetrics,
     rows::{DisplayRow, IssueSort, hierarchy_prefix},
-    status::{issue_color, issue_icon, run_color, run_label},
+    status::{issue_color, issue_icon, run_color, run_label, run_short_label},
     theme,
     widgets::{BrailleSparkline, SparklineSample, SparklineVariant, render_bottom_edge},
 };
@@ -1003,9 +1003,15 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             );
         }
     } else if app.tab == InboxTab::PullRequests {
-        for (column, label) in pr_columns
-            .into_iter()
-            .zip(["PR", "title", "author", "diff", "status", "activity"])
+        let activity_label = if pr_columns[5].width >= PR_ACTIVITY_WIDTH {
+            "comments commits"
+        } else {
+            "comments"
+        };
+        for (column, label) in
+            pr_columns
+                .into_iter()
+                .zip(["PR", "title", "author", "diff", "status", activity_label])
         {
             frame.render_widget(
                 Paragraph::new(label)
@@ -1071,21 +1077,33 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
                 _ => theme::muted(),
             };
             let age = age_label(issue.created_at);
+            // Same run cues as issue and PR rows.
+            let latest_run = snapshot
+                .runs
+                .iter()
+                .filter(|run| run.issue_key == issue.key.canonical())
+                .max_by_key(|run| (run.updated_at, run.started_at));
+            let marker = if active.contains(issue.key.canonical().as_str()) {
+                theme::BRAILLE_SPINNER[app.tick as usize % theme::BRAILLE_SPINNER.len()]
+            } else if index == app.selected {
+                "▶"
+            } else if latest_run.is_some() {
+                "●"
+            } else {
+                " "
+            };
+            let (state, state_color) = latest_run
+                .map_or((issue.state.as_str(), state_color), |run| {
+                    (run_short_label(run.state), run_color(run.state))
+                });
             for (index, (column, (text, color))) in security_columns(row_area)
                 .into_iter()
                 .zip([
-                    (
-                        if index == app.selected {
-                            "▶"
-                        } else {
-                            " "
-                        },
-                        theme::primary(),
-                    ),
+                    (marker, theme::primary()),
                     (age.as_str(), theme::muted()),
                     (severity, severity_color),
                     (issue.title.as_str(), theme::text()),
-                    (issue.state.as_str(), state_color),
+                    (state, state_color),
                 ])
                 .enumerate()
             {
@@ -1103,7 +1121,16 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             continue;
         }
         if issue.pull_request.is_some() {
-            draw_pr_row(frame, row_area, issue, index == app.selected, pr_columns);
+            draw_pr_row(
+                frame,
+                row_area,
+                snapshot,
+                issue,
+                index == app.selected,
+                active.contains(issue.key.canonical().as_str()),
+                app.tick,
+                pr_columns,
+            );
             continue;
         }
         draw_table_row(
@@ -1218,7 +1245,7 @@ fn draw_table_header(frame: &mut Frame<'_>, area: Rect, columns: Columns) {
     let state_width = (columns.state as u16).min(area.width);
     let activity_width = columns.activity as u16;
     frame.render_widget(
-        Paragraph::new("activity").style(Style::new().fg(theme::muted())),
+        Paragraph::new("comments").style(Style::new().fg(theme::muted())),
         Rect::new(
             area.right() - state_width - activity_width,
             area.y,
@@ -1366,11 +1393,14 @@ fn draw_table_row(
     );
 }
 
+/// Fits the "comments commits" header with each count under its word.
+const PR_ACTIVITY_WIDTH: u16 = 16;
+
 fn pr_columns(area: Rect, number_width: u16) -> [Rect; 6] {
     // Reserve identity, diff, and lifecycle before sharing the rest with title/author.
     let available = area.width.saturating_sub(6);
     let number = number_width.min(available);
-    let status = 6.min(available.saturating_sub(number));
+    let status = 8.min(available.saturating_sub(number));
     let diff_cells = match area.width {
         160.. => 8,
         120.. => 6,
@@ -1379,7 +1409,7 @@ fn pr_columns(area: Rect, number_width: u16) -> [Rect; 6] {
     let diff = diff_cells.min(available.saturating_sub(number + status));
     let remaining = available.saturating_sub(number + status + diff);
     let activity = match area.width {
-        100.. => 15,
+        100.. => PR_ACTIVITY_WIDTH,
         76.. => 8,
         _ => 0,
     }
@@ -1439,8 +1469,15 @@ fn item_activity_line(issue: &Issue, show_commits: bool) -> Line<'static> {
             )
         },
     );
+    // Plain numbers under "comments" / "commits" headers: glyphs like ≡ read as
+    // noise or a rendering glitch next to a count.
+    let comments_width = if show_commits {
+        8
+    } else {
+        7
+    };
     let mut spans = vec![Span::styled(
-        format!("≡{count:<6} "),
+        format!("{count:<comments_width$} "),
         Style::new().fg(if discussion.is_some_and(|n| n >= 10) {
             theme::primary()
         } else {
@@ -1452,7 +1489,7 @@ fn item_activity_line(issue: &Issue, show_commits: bool) -> Line<'static> {
             .commits
             .map_or_else(|| "?".to_owned(), |n| compact_activity_count(u128::from(n)));
         spans.push(Span::styled(
-            format!("○{count}"),
+            count,
             Style::new().fg(if activity.commits.is_some_and(|n| n >= 10) {
                 theme::primary()
             } else {
@@ -1515,11 +1552,15 @@ fn pr_change_indicator(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_pr_row(
     frame: &mut Frame<'_>,
     area: Rect,
+    snapshot: &RuntimeSnapshot,
     issue: &Issue,
     selected: bool,
+    active: bool,
+    tick: u32,
     columns: [Rect; 6],
 ) {
     let pr = issue.pull_request.as_ref().expect("PR row");
@@ -1528,11 +1569,26 @@ fn draw_pr_row(
     } else {
         theme::panel()
     };
-    let marker = if selected {
+    // Same run cues as issue rows: a spinner while an agent works on the PR,
+    // a dot once it has a workspace, and the run state in the status column.
+    let latest_run = snapshot
+        .runs
+        .iter()
+        .filter(|run| run.issue_key == issue.key.canonical())
+        .max_by_key(|run| (run.updated_at, run.started_at));
+    let marker = if active {
+        theme::BRAILLE_SPINNER[tick as usize % theme::BRAILLE_SPINNER.len()]
+    } else if selected {
         "▶"
+    } else if latest_run.and_then(|run| run.workspace.as_ref()).is_some() {
+        "●"
     } else {
         " "
     };
+    let (status, status_color) = latest_run.map_or_else(
+        || (issue.state.as_str(), issue_color(&issue.state)),
+        |run| (run_short_label(run.state), run_color(run.state)),
+    );
     frame.render_widget(Block::new().style(Style::new().bg(bg)), area);
     frame.render_widget(
         Paragraph::new(marker).style(Style::new().fg(theme::primary())),
@@ -1553,11 +1609,11 @@ fn draw_pr_row(
         ),
         pr_change_indicator(pr.additions, pr.deletions, columns[3].width),
         Line::styled(
-            issue.state.as_str(),
-            Style::new().fg(issue_color(&issue.state)),
+            truncate(status, columns[4].width as usize),
+            Style::new().fg(status_color),
         )
         .alignment(Alignment::Right),
-        item_activity_line(issue, columns[5].width >= 15),
+        item_activity_line(issue, columns[5].width >= PR_ACTIVITY_WIDTH),
     ];
     for (mut column, line) in columns.into_iter().zip(lines) {
         column.y = area.y;
@@ -3946,7 +4002,7 @@ mod tests {
                         assert_eq!(columns[index].width, old[index].width);
                     }
                     assert_eq!(columns[2].width, 12);
-                    assert_eq!(columns[4].width, 6);
+                    assert_eq!(columns[4].width, 8);
                     assert_eq!(
                         (columns[2].x..columns[2].right())
                             .filter(|&x| buffer[(x, row.y)].symbol() == "a")
@@ -4897,14 +4953,14 @@ mod tests {
                 assert_eq!(columns[3].width, expected_cells);
                 assert_eq!(
                     columns[1].width,
-                    table_width - 27 - expected_cells - columns[5].width - 1
+                    table_width - 29 - expected_cells - columns[5].width - 1
                 );
                 assert_eq!(columns[2].width, 12);
-                assert_eq!(columns[4].width, 6);
+                assert_eq!(columns[4].width, 8);
                 assert_eq!(columns[4].right(), row.right());
                 for (column, label) in columns
                     .iter()
-                    .zip(["PR", "title", "author", "diff", "status", "activity"])
+                    .zip(["PR", "title", "author", "diff", "status", "comments"])
                 {
                     let x = if label == "status" {
                         column.right() - label.len() as u16
@@ -4923,7 +4979,7 @@ mod tests {
                     ),
                     (columns[2], format!("{}…", "a".repeat(11))),
                     (columns[3], "■".repeat(usize::from(expected_cells))),
-                    (columns[4], "  open".to_owned()),
+                    (columns[4], "    open".to_owned()),
                 ] {
                     let actual: String = (column.x..column.right())
                         .map(|x| buffer[(x, row.y)].symbol())
@@ -4986,7 +5042,7 @@ mod tests {
             }
             assert_eq!(buffer[(row.right() - 1, row.y - 1)].symbol(), "s");
             assert_eq!(columns[3].width, 4);
-            assert_eq!(columns[4].width, 6);
+            assert_eq!(columns[4].width, 8);
             assert!(columns[2].width <= 12);
             assert_eq!(buffer[(columns[0].x, row.y)].symbol(), "#");
             assert_eq!(buffer[(columns[3].x, row.y)].fg, theme::done());
@@ -5079,7 +5135,11 @@ mod tests {
                         assert_eq!(row.right(), right);
                         let columns = Columns::for_width(row.width);
                         let expected = if tab == InboxTab::PullRequests {
-                            "open".to_owned()
+                            // PR rows show the run state, shortened to the status column.
+                            truncate(
+                                run_state.map_or("open", run_short_label),
+                                pr_columns(*row, 3)[4].width as usize,
+                            )
                         } else if columns.state <= 2 {
                             run_state
                                 .map_or_else(
@@ -5175,16 +5235,16 @@ mod tests {
         let mut snapshot = pr_snapshot();
         let issue = &mut snapshot.issues[1];
         for (comments, reviews, commits, expected, color) in [
-            (None, None, None, "≡?      ○?", theme::muted()),
-            (Some(0), Some(0), Some(0), "≡0      ○0", theme::muted()),
-            (Some(0), None, None, "≡0+     ○?", theme::muted()),
-            (None, Some(5), Some(1), "≡5+     ○1", theme::muted()),
-            (Some(5), Some(5), Some(10), "≡10     ○10", theme::primary()),
+            (None, None, None, "?        ?", theme::muted()),
+            (Some(0), Some(0), Some(0), "0        0", theme::muted()),
+            (Some(0), None, None, "0+       ?", theme::muted()),
+            (None, Some(5), Some(1), "5+       1", theme::muted()),
+            (Some(5), Some(5), Some(10), "10       10", theme::primary()),
             (
                 Some(u64::MAX),
                 Some(u64::MAX),
                 Some(u64::MAX),
-                "≡36E    ○18E",
+                "36E      18E",
                 theme::primary(),
             ),
         ] {
@@ -5196,7 +5256,7 @@ mod tests {
             let line = item_activity_line(issue, true);
             assert_eq!(line.to_string(), expected);
             assert_eq!(line.spans[0].style.fg, Some(color));
-            assert!(line.width() <= 15);
+            assert!(line.width() <= usize::from(PR_ACTIVITY_WIDTH));
             assert_eq!(item_activity_line(issue, false).width(), 8);
         }
         issue.pull_request = None;
@@ -5205,7 +5265,7 @@ mod tests {
             review_comments: Some(9),
             commits: None,
         });
-        assert_eq!(item_activity_line(issue, false).to_string(), "≡3      ");
+        assert_eq!(item_activity_line(issue, false).to_string(), "3       ");
     }
 
     #[test]
@@ -5253,13 +5313,17 @@ mod tests {
                     let header: String = (x..x + 8)
                         .map(|x| buffer[(x, app.mouse.list.y - 1)].symbol())
                         .collect();
-                    assert_eq!(header, "activity");
-                    assert_eq!(buffer[(x, row.y)].symbol(), "≡");
+                    assert_eq!(header, "comments");
+                    assert_eq!(buffer[(x, row.y)].symbol(), "1");
                     assert_eq!(buffer[(x, row.y)].fg, theme::primary());
                     assert_eq!(buffer[(x, row.y)].bg, theme::element());
-                    assert_eq!(buffer[(x + 1, row.y)].symbol(), "1");
-                    if width >= 15 {
-                        assert_eq!(buffer[(x + 8, row.y)].symbol(), "○");
+                    if width >= PR_ACTIVITY_WIDTH {
+                        // Commits sit under the "commits" header word.
+                        let header: String = (x + 9..x + 16)
+                            .map(|x| buffer[(x, app.mouse.list.y - 1)].symbol())
+                            .collect();
+                        assert_eq!(header, "commits");
+                        assert_eq!(buffer[(x + 9, row.y)].symbol(), "4");
                     }
                     mouse(&mut app, &snapshot, MouseEventKind::Moved, x, row.y);
                     assert_eq!(app.selected, 0);
@@ -5423,6 +5487,92 @@ mod tests {
         let search_line = text.lines().find(|line| line.contains("Repair█")).unwrap();
         assert!(search_line.contains("Repair█"));
         assert!(!search_line.contains('┃'));
+    }
+
+    #[test]
+    fn dispatched_prs_show_run_spinner_and_state() {
+        let mut snapshot = pr_snapshot();
+        let pr = snapshot
+            .issues
+            .iter()
+            .find(|issue| issue.pull_request.is_some())
+            .unwrap()
+            .clone();
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: None,
+            id: "run-pr".to_owned(),
+            issue_key: pr.key.canonical(),
+            workspace: None,
+            agent: "claude".to_owned(),
+            state: RunState::Running,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        let mut app = AppState {
+            tab: InboxTab::PullRequests,
+            selected: 99,
+            ..Default::default()
+        };
+        let text = render(112, 28, &snapshot, &mut app);
+        let line = text
+            .lines()
+            .find(|line| line.contains(&pr.title))
+            .expect("PR row visible");
+        assert!(line.contains("running"), "{line}");
+        assert!(
+            theme::BRAILLE_SPINNER
+                .iter()
+                .any(|frame| line.contains(frame)),
+            "{line}"
+        );
+        snapshot.runs[0].state = RunState::Idle;
+        let text = render(112, 28, &snapshot, &mut app);
+        let line = text.lines().find(|line| line.contains(&pr.title)).unwrap();
+        assert!(line.contains("idle") && !line.contains("open"), "{line}");
+    }
+
+    #[test]
+    fn security_rows_show_private_run_spinner_and_state() {
+        let mut snapshot = security_snapshot();
+        let advisory = snapshot.issues.last().unwrap().clone();
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            confidential: true,
+            model: None,
+            id: "run-private".to_owned(),
+            issue_key: advisory.key.canonical(),
+            workspace: None,
+            agent: "claude".to_owned(),
+            state: RunState::Running,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        let mut app = AppState {
+            tab: InboxTab::Security,
+            selected: 99,
+            ..Default::default()
+        };
+        let text = render(112, 28, &snapshot, &mut app);
+        let line = text
+            .lines()
+            .find(|line| line.contains("Confidential advisory title"))
+            .expect("advisory row visible");
+        assert!(
+            line.contains("running") && !line.contains("draft"),
+            "{line}"
+        );
+        assert!(
+            theme::BRAILLE_SPINNER
+                .iter()
+                .any(|frame| line.contains(frame)),
+            "{line}"
+        );
     }
 
     #[test]

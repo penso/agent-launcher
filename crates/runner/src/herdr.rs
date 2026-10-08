@@ -583,6 +583,14 @@ impl Backend for HerdrBackend {
                 .await
             {
                 Ok(value) => parse_agent(&value)?,
+                // Runs recorded as completed before `done` meant a finished turn
+                // are re-checked once; an agent closed since then stays completed.
+                Err(_) if record.summary.state == RunState::Completed => {
+                    return Ok(StatusResult {
+                        run: record.summary,
+                        output: None,
+                    });
+                },
                 Err(error) => {
                     let error = error.for_private(private);
                     let summary = self
@@ -611,6 +619,7 @@ impl Backend for HerdrBackend {
                         .into(),
                 ),
                 "unknown" => Some("Herdr cannot classify the agent state".into()),
+                "done" => Some("Agent finished its turn; review it in Herdr".into()),
                 _ => None,
             };
                 summary.updated_at = Utc::now();
@@ -941,8 +950,9 @@ fn map_agent_status(status: &str) -> RunState {
     match status {
         "working" => RunState::Running,
         "blocked" => RunState::NeedsInput,
-        "idle" => RunState::Idle,
-        "done" => RunState::Completed,
+        // Herdr's `done` is a finished turn whose output is unseen, not the end of
+        // the session: the agent can be prompted again, so keep tracking it.
+        "idle" | "done" => RunState::Idle,
         _ => RunState::Disconnected,
     }
 }
@@ -1752,7 +1762,7 @@ fi
             }
         );
         assert_eq!(map_agent_status("blocked"), RunState::NeedsInput);
-        assert_eq!(map_agent_status("done"), RunState::Completed);
+        assert_eq!(map_agent_status("done"), RunState::Idle);
         assert_eq!(map_agent_status("future"), RunState::Disconnected);
     }
 

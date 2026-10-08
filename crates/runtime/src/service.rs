@@ -759,6 +759,27 @@ impl RuntimeService {
             self.upsert_snapshot_run(run);
         }
         self.initialize_event_cursors().await;
+        // Herdr runs used to be marked completed when an agent merely finished a
+        // turn, which stopped tracking them. Check those once more; live agents
+        // become active again, closed ones stay completed.
+        let stale_herdr = self
+            .snapshot
+            .runs
+            .iter()
+            .filter(|run| {
+                run.state == RunState::Completed
+                    && !run.confidential
+                    && !self.snapshot.away.owns_run(&run.id)
+                    && run
+                        .workspace
+                        .as_ref()
+                        .is_some_and(|workspace| workspace.backend == BackendKind::Herdr)
+            })
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        for run_id in stale_herdr {
+            self.launch_run_refresh(&run_id);
+        }
         self.apply_detections(self.runner.detect(&self.repository).await);
         self.snapshot.initialized = true;
         self.publish();
