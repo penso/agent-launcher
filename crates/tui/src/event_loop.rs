@@ -382,6 +382,18 @@ fn handle_key(
     }
     match (app.route, key.code) {
         (Route::Detail, KeyCode::Esc) => app.reset_detail(),
+        (Route::Detail, KeyCode::Tab) => {
+            app.detail_tab = app.detail_tab.next();
+            app.detail_scroll = 0;
+        },
+        (Route::Detail, KeyCode::BackTab) => {
+            app.detail_tab = app.detail_tab.previous();
+            app.detail_scroll = 0;
+        },
+        (Route::Detail, KeyCode::Char(digit @ '1'..='4')) => {
+            app.detail_tab = crate::app::DetailTab::ALL[usize::from(digit as u8 - b'1')];
+            app.detail_scroll = 0;
+        },
         (Route::Detail, KeyCode::Char('r')) => {
             app.status_message = Some("refreshing issue sources...".to_owned());
             let runtime = runtime.clone();

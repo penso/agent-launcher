@@ -77,3 +77,13 @@ pub(crate) fn agent_glyph(agent: &str) -> &'static str {
         _ => "◆",
     }
 }
+
+/// P0 red, P1 orange, P2 yellow; lower priorities stay quiet.
+pub(crate) const fn priority_color(priority: i64) -> Color {
+    match priority {
+        i64::MIN..=0 => theme::error(),
+        1 => theme::primary(),
+        2 => theme::warning(),
+        _ => theme::muted(),
+    }
+}

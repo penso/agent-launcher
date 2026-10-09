@@ -17,6 +17,44 @@ pub(crate) enum Route {
     Detail,
 }
 
+/// Sections of the detail view, cycled with Tab.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DetailTab {
+    #[default]
+    Overview,
+    Description,
+    Agent,
+    Details,
+}
+
+impl DetailTab {
+    pub const ALL: [Self; 4] = [
+        Self::Overview,
+        Self::Description,
+        Self::Agent,
+        Self::Details,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Description => "Description",
+            Self::Agent => "Agent",
+            Self::Details => "Details",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum InboxTab {
     #[default]
@@ -448,6 +486,7 @@ pub(crate) struct AppState {
     pub visible_rows: usize,
     pub search_query: String,
     pub detail_scroll: u16,
+    pub detail_tab: DetailTab,
     pub detail_scroll_max: u16,
     pub(crate) markdown_cache: crate::widgets::markdown::MarkdownCache,
     pub input_overlay: Option<InputOverlay>,
@@ -648,6 +687,7 @@ impl AppState {
         self.route = Route::Detail;
         self.detail_issue_key = Some(key);
         self.detail_scroll = 0;
+        self.detail_tab = DetailTab::Overview;
         self.status_message = None;
         true
     }
@@ -756,6 +796,7 @@ impl AppState {
     pub fn reset_detail(&mut self) {
         self.route = Route::Inbox;
         self.detail_issue_key = None;
+        self.detail_tab = DetailTab::Overview;
         self.markdown_cache = Default::default();
         self.detail_scroll = 0;
         self.detail_scroll_max = 0;

@@ -261,7 +261,11 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         .saturating_sub(listing_y)
         .saturating_sub(legend_height);
     let listing = Rect::new(panel.x, listing_y, panel.width, listing_height);
+    let (listing, preview) = split_preview(listing, app.tab);
     draw_listing(frame, listing, snapshot, app);
+    if let Some(preview) = preview {
+        crate::detail::draw_preview(frame, preview, snapshot, app);
+    }
     if legend_height > 0 {
         draw_legends(
             frame,
@@ -275,6 +279,31 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             app,
         );
     }
+}
+
+/// Narrowest listing that gets a preview beside it; below this the list
+/// keeps the full width and Enter opens the detail view, as before.
+const PREVIEW_MIN_WIDTH: u16 = 140;
+
+/// Splits the listing into the list and a preview of the selected row when
+/// the window is wide enough. The Logs tab has nothing to preview.
+fn split_preview(listing: Rect, tab: InboxTab) -> (Rect, Option<Rect>) {
+    if listing.width < PREVIEW_MIN_WIDTH || listing.height < 10 || tab == InboxTab::Logs {
+        return (listing, None);
+    }
+    let preview_width = (listing.width * 9 / 20).clamp(60, 100);
+    let list_width = listing.width - preview_width - 1;
+    (
+        Rect {
+            width: list_width,
+            ..listing
+        },
+        Some(Rect {
+            x: listing.x + list_width + 1,
+            width: preview_width,
+            ..listing
+        }),
+    )
 }
 
 fn draw_tiny_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
@@ -1683,7 +1712,14 @@ fn title_with_agent(
     style: Style,
 ) -> Vec<Span<'static>> {
     let Some(run) = run.filter(|_| width >= 24) else {
-        return vec![Span::styled(truncate(title, width), style)];
+        // A cut title keeps one blank cell before the next column.
+        let fits = title.chars().count() <= width;
+        let title = if fits || width < 2 {
+            truncate(title, width)
+        } else {
+            format!("{} ", truncate(title, width - 1))
+        };
+        return vec![Span::styled(title, style)];
     };
     let agent = truncate(&run.agent, 10);
     let tag_width = 3 + agent.chars().count();
@@ -4014,7 +4050,7 @@ mod tests {
             &snapshot,
             (120, 48)
         ));
-        let text = render(120, 60, &snapshot, &mut app);
+        let text = render_tabs(120, 60, &snapshot, &mut app);
         assert!(text.contains("PRIVATE_BODY_SENTINEL"));
         assert!(text.contains("PRIVATE Security Advisory"));
         assert!(text.contains("GHSA-aaaa-bbbb-cccc"));
@@ -4240,7 +4276,7 @@ mod tests {
         };
         for layout in [crate::LayoutMode::Fixed, crate::LayoutMode::Flexible] {
             app.layout = layout;
-            let text = render(120, 60, &snapshot, &mut app);
+            let text = render_tabs(120, 60, &snapshot, &mut app);
             assert!(text.contains("PRIVATE run"));
             assert!(text.contains("not persisted"));
             assert!(!text.contains("MODEL_SENTINEL"));
@@ -4292,6 +4328,34 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, snapshot, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// Right edge of the list in a flexible inbox `width` cells wide: the
+    /// whole panel, or what the preview leaves of it on wide screens.
+    fn listing_right(width: u16) -> u16 {
+        let panel = Rect::new(2, 0, width - 4, 30);
+        split_preview(panel, InboxTab::Issues).0.right()
+    }
+
+    /// Every detail tab's text, for checks that care what the detail view
+    /// shows rather than which tab shows it. Leaves the current tab selected.
+    fn render_tabs(
+        width: u16,
+        height: u16,
+        snapshot: &RuntimeSnapshot,
+        app: &mut AppState,
+    ) -> String {
+        let current = app.detail_tab;
+        let text = crate::app::DetailTab::ALL
+            .into_iter()
+            .map(|tab| {
+                app.detail_tab = tab;
+                render(width, height, snapshot, app)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.detail_tab = current;
+        text
     }
 
     fn render(width: u16, height: u16, snapshot: &RuntimeSnapshot, app: &mut AppState) -> String {
@@ -4589,7 +4653,7 @@ mod tests {
                 }
                 let fixed_row = fixed.mouse.rows[0].0;
                 let row = flexible.mouse.rows[0].0;
-                assert_eq!((row.x, row.right()), (4, width - 3));
+                assert_eq!((row.x, row.right()), (4, listing_right(width) - 1));
                 assert!(row.y < fixed_row.y);
                 assert!(flexible.visible_rows > fixed.visible_rows);
                 assert_eq!(flexible.scroll, fixed.scroll);
@@ -4598,18 +4662,21 @@ mod tests {
                         .filter(|&x| buffer[(x, row.y)].symbol() == "T")
                         .count()
                 };
-                assert_eq!(
-                    title_cells(&buffer, row) - title_cells(&fixed_buffer, fixed_row),
-                    usize::from(
-                        width
-                            - 108
-                            - if tab == InboxTab::PullRequests {
-                                pr_columns(row, 3)[3].width - 4
-                            } else {
-                                0
-                            }
-                    )
-                );
+                // Titles get the extra width, unless the preview takes it.
+                if listing_right(width) + 2 > 108 {
+                    assert_eq!(
+                        title_cells(&buffer, row) - title_cells(&fixed_buffer, fixed_row),
+                        usize::from(
+                            listing_right(width) + 2
+                                - 108
+                                - if tab == InboxTab::PullRequests {
+                                    pr_columns(row, 3)[3].width - 4
+                                } else {
+                                    0
+                                }
+                        )
+                    );
+                }
                 if tab == InboxTab::PullRequests {
                     let columns = pr_columns(row, 3);
                     let old = pr_columns(fixed_row, 3);
@@ -4713,7 +4780,14 @@ mod tests {
                         assert!(line(7).trim().is_empty());
                         assert!(line(3).contains(theme::AGENT_LOGO[0]));
                         assert!(line(4).contains(theme::LAUNCHER_LOGO[1]));
-                        assert!(line(10).trim().is_empty());
+                        assert!(
+                            line(10)
+                                .chars()
+                                .take(usize::from(listing_right(width)))
+                                .collect::<String>()
+                                .trim()
+                                .is_empty()
+                        );
                         assert!(line(height - 4).contains('╹'));
                         assert!(line(height - 3).contains(&format!(
                             "{}-{} of 100",
@@ -4840,7 +4914,7 @@ mod tests {
                 };
                 render_buffer(width, 24, &snapshot, &mut app);
                 let (row, index, key) = app.mouse.rows[1].clone();
-                assert_eq!(row.right(), width - 5); // Two cells reserved for the scrollbar.
+                assert_eq!(row.right(), listing_right(width) - 3); // Two cells reserved for the scrollbar.
                 assert_eq!(index, 4);
                 let click = MouseEventKind::Down(MouseButton::Left);
                 for x in [0, 1, width - 2, width - 1, row.right()] {
@@ -5549,13 +5623,14 @@ mod tests {
             };
             // Resize both ways; scrollbar reservation must affect the breakpoint too.
             for table_width in [119, 120, 121, 133, 159, 160, 161, 160, 159, 120, 119] {
-                let screen_width = table_width
-                    + 7
-                    + if count > 2 {
-                        2
-                    } else {
-                        0
-                    };
+                // The narrowest screen whose list rows are this wide: the
+                // preview takes part of wide screens.
+                let screen_width = (table_width..table_width + 200)
+                    .find(|&width| {
+                        render_buffer(width, 24, &snapshot, &mut app);
+                        app.mouse.rows[1].0.width == table_width
+                    })
+                    .unwrap();
                 let buffer = render_buffer(screen_width, 24, &snapshot, &mut app);
                 let (row, index, key) = app.mouse.rows[1].clone();
                 assert_eq!(row.width, table_width);
@@ -5590,7 +5665,8 @@ mod tests {
                 for (column, expected) in [
                     (
                         columns[1],
-                        format!("{}…", "T".repeat(usize::from(columns[1].width - 1))),
+                        // A cut title leaves a blank before the author column.
+                        format!("{}… ", "T".repeat(usize::from(columns[1].width - 2))),
                     ),
                     (columns[2], format!("{}…", "a".repeat(11))),
                     (columns[3], "■".repeat(usize::from(expected_cells))),
@@ -5802,7 +5878,7 @@ mod tests {
             ..AppState::default()
         };
         assert!(app.open_detail(&snapshot));
-        let text = render(112, 48, &snapshot, &mut app);
+        let text = render_tabs(112, 48, &snapshot, &mut app);
         for expected in [
             "Pull Request",
             "main (base-123)",
@@ -5810,7 +5886,7 @@ mod tests {
             "octocat/launcher",
             "+128 -?",
             "d review PR",
-            "Opening details does not start a review",
+            "Not reviewed. Press d to start a PR review.",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
@@ -5825,7 +5901,7 @@ mod tests {
             let pr = snapshot.issues[1].pull_request.as_mut().unwrap();
             pr.additions = counts.0;
             pr.deletions = counts.1;
-            let text = render(112, 48, &snapshot, &mut app);
+            let text = render_tabs(112, 48, &snapshot, &mut app);
             let expected = format!(
                 "+{} -{}",
                 counts.0.map_or_else(|| "?".to_owned(), |n| n.to_string()),
@@ -5963,7 +6039,7 @@ mod tests {
                 ..Default::default()
             };
             app.open_detail(&snapshot);
-            let text = render(112, 60, &snapshot, &mut app);
+            let text = render_tabs(112, 60, &snapshot, &mut app);
             assert!(text.contains("12345"));
             assert!(!text.contains("12k"));
             if tab == InboxTab::PullRequests {
@@ -5973,7 +6049,7 @@ mod tests {
                 assert!(!text.contains("review comments"));
             }
             snapshot.issues[index].activity = None;
-            let text = render(112, 60, &snapshot, &mut app);
+            let text = render_tabs(112, 60, &snapshot, &mut app);
             assert!(
                 text.lines()
                     .any(|line| line.contains("comments") && line.contains("unknown"))
@@ -8329,16 +8405,18 @@ mod tests {
         assert!(text.contains("Esc back"));
         assert!(!text.contains('┌'));
         let buffer = render_buffer(88, 24, &snapshot, &mut app);
-        assert_eq!(buffer[(4, 1)].fg, theme::primary());
+        // The tab strip leads (rows 1-3); the title sits alone on row 5.
+        assert_eq!(buffer[(4, 5)].fg, theme::primary());
         assert!(
-            buffer[(4, 1)]
+            buffer[(4, 5)]
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD)
         );
         for y in 0..23 {
             for x in 0..88 {
                 let expected = if (2..86).contains(&x) && (1..22).contains(&y) {
-                    if y < 4 {
+                    // Only the tab strip (rows 1-3) has its own colour.
+                    if (1..=3).contains(&y) {
                         theme::element()
                     } else {
                         theme::panel()
@@ -8346,17 +8424,16 @@ mod tests {
                 } else {
                     theme::bg()
                 };
-                assert_eq!(buffer[(x, y)].bg, expected, "at {x},{y}");
+                // The active tab (row 2) and the state pill (row 5) are coloured chips.
+                let chip = (y == 2 || y == 5) && buffer[(x, y)].bg == theme::primary();
+                if !chip {
+                    assert_eq!(buffer[(x, y)].bg, expected, "at {x},{y}");
+                }
             }
         }
+        // The Overview opens on muted field labels.
         let body = app.mouse.detail;
-        assert_eq!(buffer[(body.x, body.y)].symbol(), "I");
-        assert_eq!(buffer[(body.x, body.y)].fg, theme::primary());
-        assert!(
-            buffer[(body.x, body.y)]
-                .modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
+        assert_eq!(buffer[(body.x, body.y)].fg, theme::muted());
         for y in 1..body.bottom() {
             let rail = &buffer[(body.x - 2, y)];
             assert_eq!(rail.symbol(), " ");
@@ -8376,7 +8453,8 @@ mod tests {
         let text = render(40, 10, &snapshot, &mut app);
         assert!(!text.contains('┃'));
         assert!(text.contains("#7  Repair runtime dispatch"));
-        assert!(text.contains("github · acme/launcher · open"));
+        assert!(text.contains(" open "));
+        assert!(text.contains("1 Overview"));
         assert!(text.contains("d dispatch"));
         assert!(text.contains("i input"));
         assert!(text.contains("Esc back"));
@@ -8445,25 +8523,44 @@ mod tests {
                     panel_width,
                     available.height,
                 );
-                let header_height = if panel.width < 18 || panel.height < 4 {
-                    0
-                } else if panel.height >= 12 {
+                let full = panel.width >= 18 && panel.height >= 4;
+                // The tab strip leads: three rows when tall, the tabs in the middle.
+                let strip_height = if panel.height >= 16 {
                     3
                 } else {
-                    2
+                    u16::from(panel.height >= 8)
                 };
+                let strip = (full && strip_height > 0).then(|| panel.y..panel.y + strip_height);
+                let title_y = panel.y
+                    + if full {
+                        strip_height
+                    } else {
+                        0
+                    }
+                    + u16::from(full && panel.height >= 12);
+                let tabs_y = strip.as_ref().map(|rows| rows.start + strip_height / 2);
                 for y in panel.y..panel.bottom() {
                     for x in panel.x..panel.right() {
-                        let expected = if y < panel.y + header_height {
+                        // Only the tab strip has its own colour.
+                        let expected = if strip.as_ref().is_some_and(|rows| rows.contains(&y)) {
                             theme::element()
                         } else {
                             theme::panel()
                         };
-                        assert_eq!(
-                            completed.buffer[(x, y)].bg,
-                            expected,
-                            "{layout:?} {width}x{height} at {x},{y}"
-                        );
+                        // The state pill and the active tab are coloured chips.
+                        let chip = (y == title_y || Some(y) == tabs_y)
+                            && completed.buffer[(x, y)].bg == theme::primary();
+                        // Overflowing content gets a scrollbar in the right padding.
+                        let scrollbar = x == panel.right() - 1
+                            && [theme::element(), theme::border()]
+                                .contains(&completed.buffer[(x, y)].bg);
+                        if !chip && !scrollbar {
+                            assert_eq!(
+                                completed.buffer[(x, y)].bg,
+                                expected,
+                                "{layout:?} {width}x{height} at {x},{y}"
+                            );
+                        }
                     }
                 }
             }
@@ -8484,6 +8581,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(app.open_detail(&snapshot));
+            app.detail_tab = crate::app::DetailTab::Description;
             let buffer = render_buffer(120, 70, &snapshot, &mut app);
             let locate = |needle: &str| {
                 (0..70)
@@ -8513,10 +8611,13 @@ mod tests {
             let heading = buffer[locate("Impact")].clone();
             assert_eq!(heading.fg, theme::primary());
             assert!(heading.modifier.contains(Modifier::BOLD));
-            assert_eq!(buffer[locate("repository")].bg, theme::panel());
+            app.detail_tab = crate::app::DetailTab::Details;
+            let details = render(120, 70, &snapshot, &mut app);
+            assert!(details.contains("repository"));
+            app.detail_tab = crate::app::DetailTab::Description;
             assert_eq!(
                 buffer[locate(&app.detail_issue(&snapshot).unwrap().title)].bg,
-                theme::element()
+                theme::panel()
             );
             let text = render(120, 70, &snapshot, &mut app);
             assert!(!text.contains("### Impact"));
@@ -8526,6 +8627,7 @@ mod tests {
                 app.detail_issue(&snapshot).unwrap().description.as_deref(),
                 Some(source)
             );
+            app.detail_tab = crate::app::DetailTab::Agent;
             for width in [40, 80, 120, 40] {
                 app.detail_scroll = u16::MAX;
                 let text = render(width, 24, &snapshot, &mut app);
@@ -8545,6 +8647,7 @@ mod tests {
                 .unwrap()
                 .description = Some("**Updated**".into());
             app.detail_scroll = 0;
+            app.detail_tab = crate::app::DetailTab::Description;
             assert!(render(120, 70, &snapshot, &mut app).contains("Updated"));
             app.reset_detail();
         }
@@ -8604,16 +8707,14 @@ mod tests {
                     ..Default::default()
                 };
                 assert!(app.open_detail(&snapshot));
+                app.detail_tab = crate::app::DetailTab::Description;
                 let key = app.detail_issue_key.clone();
                 for width in [40, 88, 160, 240, 40] {
                     app.detail_scroll = u16::MAX;
                     let text = render(width, 24, &snapshot, &mut app);
                     assert_eq!(app.detail_scroll, app.detail_scroll_max);
-                    assert!(text.contains(if tab == InboxTab::PullRequests {
-                        "Not reviewed."
-                    } else {
-                        "Not dispatched."
-                    }));
+                    // Scrolled to the end, the description's last words show.
+                    assert!(text.contains("narrow wrapping"), "{text}");
                     assert_eq!(app.detail_issue_key, key);
                     let body = app.mouse.detail;
                     // TestBackend receives only emitted cells, not wide-glyph continuation
@@ -8624,13 +8725,19 @@ mod tests {
                         .unwrap();
                     let buffer = completed.buffer;
                     for y in body.y..body.bottom() {
-                        for x in body.x - 2..body.right() + 1 {
+                        for x in body.x - 2..body.right() {
                             assert_eq!(
                                 buffer[(x, y)].bg,
                                 theme::panel(),
                                 "{layout:?} {tab:?} width {width} at {x},{y}"
                             );
                         }
+                        // The long description gets a scrollbar beside the text.
+                        assert!(
+                            [theme::element(), theme::border()]
+                                .contains(&buffer[(body.right(), y)].bg),
+                            "{layout:?} {tab:?} width {width}: no scrollbar at {y}"
+                        );
                     }
                     for (x, y) in [
                         (body.x - 1, body.y),
@@ -8650,7 +8757,7 @@ mod tests {
                     assert_eq!(app.detail_scroll, app.detail_scroll_max.saturating_sub(3));
                 }
                 app.detail_scroll = 0;
-                let text = render(112, 48, &snapshot, &mut app);
+                let text = render_tabs(112, 48, &snapshot, &mut app);
                 for metadata in [
                     "dependency-1",
                     "octocat",
@@ -8733,7 +8840,7 @@ mod tests {
             detail_issue_key: Some(snapshot.issues[0].key.clone()),
             ..AppState::default()
         };
-        let text = render(100, 44, &snapshot, &mut app);
+        let text = render_tabs(100, 44, &snapshot, &mut app);
         assert!(text.contains("ATTENTION"));
         assert!(text.contains("needs input"));
         assert!(text.contains("session-7"));
@@ -8848,13 +8955,13 @@ mod tests {
         });
         let mut app = AppState::default();
         assert!(app.open_detail(&snapshot));
-        let text = render(120, 60, &snapshot, &mut app);
+        let text = render_tabs(120, 60, &snapshot, &mut app);
         assert!(text.contains(" Manual "));
         assert!(text.contains("Implemented the fix."));
         assert!(text.contains("Tests passed."));
         assert!(text.contains("cd -- '/work/away tree' && opencode -s ses_real123"));
         snapshot.runs[0].session_id = Some("herdr-agent-123".into());
-        let text = render(120, 60, &snapshot, &mut app);
+        let text = render_tabs(120, 60, &snapshot, &mut app);
         assert!(!text.contains("opencode -s"));
     }
 
@@ -8899,5 +9006,108 @@ mod tests {
 
         let text = render(20, 5, &snapshot, &mut app);
         assert!(text.contains("Esc cancel"));
+    }
+    #[test]
+    fn priority_is_coloured_by_level() {
+        use crate::status::priority_color;
+        assert_eq!(priority_color(0), theme::error());
+        assert_eq!(priority_color(1), theme::primary());
+        assert_eq!(priority_color(2), theme::warning());
+        assert_eq!(priority_color(4), theme::muted());
+        let mut snapshot = normal_snapshot();
+        snapshot.issues[0].priority = Some(0);
+        let mut app = AppState::default();
+        assert!(app.open_detail(&snapshot));
+        let buffer = render_buffer(120, 40, &snapshot, &mut app);
+        let (x, y) = (0..40)
+            .find_map(|y| {
+                let row: String = (0..120).map(|x| buffer[(x, y)].symbol()).collect();
+                let byte = row.find("Priority    P0")?;
+                Some((row[..byte].chars().count() as u16 + 12, y))
+            })
+            .expect("priority field");
+        assert_eq!(buffer[(x, y)].fg, theme::error());
+        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn wide_inbox_previews_the_selected_row_and_detail_splits_into_tabs() {
+        let mut snapshot = pr_snapshot();
+        let description = format!(
+            "## Summary\n\nSmart dispatch picks the host with the most room.\n\n{}",
+            "More detail. ".repeat(200)
+        );
+        for issue in &mut snapshot.issues {
+            issue.description = Some(description.clone());
+            issue.author = Some("penso".into());
+        }
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: Some("sonnet".into()),
+            id: "run".into(),
+            issue_key: snapshot.issues[1].key.canonical(),
+            workspace: None,
+            agent: "claude".into(),
+            state: RunState::Running,
+            message: None,
+            session_id: None,
+            started_at: now - Duration::minutes(12),
+            updated_at: now,
+        });
+        let mut app = AppState {
+            tab: InboxTab::PullRequests,
+            ..Default::default()
+        };
+
+        // Wide: the list and a preview of the selected row, side by side.
+        let text = render(180, 40, &snapshot, &mut app);
+        for expected in [
+            "Improve review flow",
+            "Branch      review-ui → main",
+            "Review      ✳ claude running for 12m · sonnet",
+            "Smart dispatch picks the host",
+            "Enter to read",
+        ] {
+            assert!(text.contains(expected), "missing {expected}:\n{text}");
+        }
+        assert!(app.mouse.rows[0].0.right() < 100);
+        // The preview names the item by title; its ID is a field.
+        assert!(text.contains("ID          #42"));
+        assert!(!text.contains("#42  Improve review flow"));
+        assert!(!text.contains("head-456"), "SHAs stay in Details");
+
+        // Narrow, or on Logs: the list keeps the full width, as before.
+        for (width, tab) in [(130, InboxTab::PullRequests), (180, InboxTab::Logs)] {
+            app.tab = tab;
+            let text = render(width, 40, &snapshot, &mut app);
+            assert!(!text.contains("Enter to read"), "{width} {tab:?}");
+        }
+        app.tab = InboxTab::PullRequests;
+
+        // The detail opens on Overview; each tab holds its own part.
+        assert!(app.open_detail(&snapshot));
+        let text = render(130, 40, &snapshot, &mut app);
+        assert!(text.contains("1 Overview") && text.contains("4 Details"));
+        assert!(text.contains("Full description:") && !text.contains("head-456"));
+        for (tab, expected) in [
+            (crate::app::DetailTab::Description, "More detail."),
+            (crate::app::DetailTab::Agent, "Latest run"),
+            (crate::app::DetailTab::Details, "review-ui (head-456)"),
+        ] {
+            app.detail_tab = tab;
+            let text = render(130, 40, &snapshot, &mut app);
+            assert!(text.contains(expected), "{tab:?} missing {expected}");
+        }
+        assert_eq!(
+            crate::app::DetailTab::Details.next(),
+            crate::app::DetailTab::Overview
+        );
+        assert_eq!(
+            crate::app::DetailTab::Overview.previous(),
+            crate::app::DetailTab::Details
+        );
+        app.reset_detail();
+        assert_eq!(app.detail_tab, crate::app::DetailTab::Overview);
     }
 }
