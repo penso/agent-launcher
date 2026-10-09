@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Deny by default; every job below declares the scopes it actually needs.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Audits the workflows themselves for injection, over-broad permissions,
+  # unpinned actions, and credential persistence, before anything else runs.
+  zizmor:
+    if: >-
+      github.repository == 'penso/agent-launcher' &&
+      github.actor == 'penso' && github.triggering_actor == 'penso' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.user.login == 'penso' &&
+        github.event.pull_request.head.repo.full_name == 'penso/agent-launcher') ||
+       ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        github.ref == 'refs/heads/main'))
+    name: Workflow Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          advanced-security: false
+          online-audits: false
+
+  checks:
+    name: Format, lint, and test (${{ matrix.runner }})
+    needs: zizmor
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: checks
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      # One platform is enough for TOML and release scripts.
+      - name: Check TOML formatting with pinned taplo
+        if: runner.os == 'Linux'
+        env:
+          TAPLO_SHA256: 8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -o "$RUNNER_TEMP/taplo.gz" \
+            https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz
+          echo "$TAPLO_SHA256  $RUNNER_TEMP/taplo.gz" | sha256sum --check --strict
+          gunzip "$RUNNER_TEMP/taplo.gz"
+          chmod +x "$RUNNER_TEMP/taplo"
+          "$RUNNER_TEMP/taplo" fmt --check
+      - name: Check release scripts
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for script in scripts/release/*.sh scripts/demo/*.sh; do bash -n "$script"; done
+          python3 -m unittest discover -s scripts/release/tests -v
+      - name: Lint every target and feature
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+
+  # Keep the branch-protection context stable while requiring every platform.
+  checks-passed:
+    name: Format, lint, and test
+    needs: [zizmor, checks]
+    if: >-
+      always() &&
+      github.repository == 'penso/agent-launcher' &&
+      github.actor == 'penso' && github.triggering_actor == 'penso'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require all platform checks
+        env:
+          ZIZMOR: ${{ needs.zizmor.result }}
+          RESULT: ${{ needs.checks.result }}
+        run: test "$ZIZMOR" = success && test "$RESULT" = success
+
+  # Proves every release target still builds an optimized binary that starts.
+  build:
+    if: >-
+      github.repository == 'penso/agent-launcher' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.actor == 'penso' && github.triggering_actor == 'penso'
+    name: Release build (${{ matrix.target }})
+    needs: zizmor
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Require the declared native target
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$TARGET"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build optimized executable
+        run: cargo build --locked --release -p agent-launcher-cli --target "$TARGET"
+      - name: Run the release executable
+        run: |
+          "target/$TARGET/release/agent-launcher" --version
+          "target/$TARGET/release/agent-launcher" --help > /dev/null

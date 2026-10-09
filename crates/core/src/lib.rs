@@ -1,5 +1,12 @@
 //! Shared domain types for agent-launcher.
 
+/// The release version (`YYYYMMDD.N`) when built by the release workflow,
+/// otherwise the crate version.
+pub const VERSION: &str = match option_env!("AGENT_LAUNCHER_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 mod activity;
 mod away;
 mod config;

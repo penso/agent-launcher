@@ -3521,7 +3521,7 @@ fn draw_footer(
     let mut text = footer_source_label(snapshot, tab);
     text.spans.push(Span::raw(format!(" {repository}")));
     let identity_width = text.width();
-    let version = env!("CARGO_PKG_VERSION");
+    let version = agent_launcher_core::VERSION;
 
     let version_width = version.len() as u16;
     let version_x = footer.x + footer.width.saturating_sub(version_width);

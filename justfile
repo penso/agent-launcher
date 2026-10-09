@@ -38,3 +38,16 @@ install:
 # server, and write colour screenshots to target/demo/screenshots.html.
 demo-shots:
     scripts/demo/screenshots.sh
+
+# Dispatch the Release workflow for main's HEAD and watch it. The workflow picks
+# the calendar version (YYYYMMDD.N), builds, publishes, and updates Homebrew.
+release:
+    bash scripts/release/dispatch.sh
+
+# Check the release scripts and workflows locally, as CI does.
+release-check:
+    for script in scripts/release/*.sh scripts/demo/*.sh; do bash -n "$script" || exit; done
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/release/tests -v
+    actionlint .github/workflows/*.yml
+    zizmor --offline .github/
+    git diff --check

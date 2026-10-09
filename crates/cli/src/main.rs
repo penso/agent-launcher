@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 /// Repository issue inbox and coding-agent launcher.
 #[derive(Debug, Parser)]
-#[command(version)]
+#[command(name = "agent-launcher", version = agent_launcher_core::VERSION)]
 struct Cli {
     /// Override the detected GitHub or GitLab repository remote.
     #[arg(long, value_name = "URL", value_parser = validate_remote_url)]
