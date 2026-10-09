@@ -608,6 +608,9 @@ http.server.HTTPServer(('127.0.0.1', int(sys.argv[-1])), Handler).serve_forever(
         let backend = std::sync::Arc::new(NativeBackend::new(
             NativeConfig {
                 opencode_executable: fake,
+                // A freshly written script can take many seconds to first start on
+                // CI runners (macOS scans new executables); the product default is 15s.
+                startup_timeout: std::time::Duration::from_secs(60),
                 ..Default::default()
             },
             registry.clone(),
