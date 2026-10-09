@@ -27,6 +27,8 @@ pub(crate) struct MouseGeometry {
     /// list and the preview (or the handle that reopens a closed preview).
     pub listing: Rect,
     pub divider: Rect,
+    /// The detail view's tabs.
+    pub detail_tabs: Vec<(Rect, crate::app::DetailTab)>,
 }
 
 pub(crate) fn handle_mouse(
@@ -101,6 +103,19 @@ pub(crate) fn handle_mouse(
     let position = Position::new(event.column, event.row);
     if event.kind == MouseEventKind::Down(MouseButton::Left) && hit.mode.contains(position) {
         crate::away::open(app, snapshot);
+        return true;
+    }
+    if event.kind == MouseEventKind::Down(MouseButton::Left)
+        && app.route == Route::Detail
+        && let Some((_, tab)) = hit
+            .detail_tabs
+            .iter()
+            .find(|(rect, _)| rect.contains(position))
+    {
+        if *tab != app.detail_tab {
+            app.detail_tab = *tab;
+            app.detail_scroll = 0;
+        }
         return true;
     }
     if event.kind == MouseEventKind::Down(MouseButton::Left)

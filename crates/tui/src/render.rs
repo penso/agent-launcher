@@ -9072,6 +9072,75 @@ mod tests {
         assert!(text.contains("Esc cancel"));
     }
     #[test]
+    fn detail_tabs_take_clicks_and_the_agent_tab_shows_its_run() {
+        use crate::app::DetailTab;
+        let mut snapshot = normal_snapshot();
+        let now = Utc::now();
+        snapshot.runs.push(RunSummary {
+            confidential: false,
+            model: None,
+            id: "run".into(),
+            issue_key: snapshot.issues[0].key.canonical(),
+            workspace: None,
+            agent: "claude".into(),
+            state: RunState::Running,
+            message: None,
+            session_id: None,
+            started_at: now,
+            updated_at: now,
+        });
+        let mut app = AppState::default();
+        assert!(app.open_detail(&snapshot));
+        let agent_tab = |app: &mut AppState, snapshot: &RuntimeSnapshot| {
+            let buffer = render_buffer(120, 40, snapshot, app);
+            let rect = app
+                .mouse
+                .detail_tabs
+                .iter()
+                .find(|(_, tab)| *tab == DetailTab::Agent)
+                .unwrap()
+                .0;
+            (rect.x..rect.right())
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect::<String>()
+        };
+
+        // Working: a spinner inside the tab, advancing with the animation tick.
+        let first = agent_tab(&mut app, &snapshot);
+        app.tick += 1;
+        let second = agent_tab(&mut app, &snapshot);
+        assert!(first.starts_with(" 3 Agent ") && second.starts_with(" 3 Agent "));
+        assert_ne!(first, second, "the spinner animates");
+        assert!(
+            theme::BRAILLE_SPINNER
+                .iter()
+                .any(|frame| first.contains(frame))
+        );
+        snapshot.runs[0].state = RunState::Idle;
+        assert_eq!(agent_tab(&mut app, &snapshot).trim_end(), " 3 Agent ●");
+
+        // Clicking a tab switches to it.
+        for tab in [DetailTab::Details, DetailTab::Agent, DetailTab::Overview] {
+            render(120, 40, &snapshot, &mut app);
+            let rect = app
+                .mouse
+                .detail_tabs
+                .iter()
+                .find(|(_, candidate)| *candidate == tab)
+                .unwrap()
+                .0;
+            assert!(mouse(
+                &mut app,
+                &snapshot,
+                MouseEventKind::Down(MouseButton::Left),
+                rect.right() - 1,
+                rect.y
+            ));
+            assert_eq!(app.detail_tab, tab);
+        }
+    }
+
+    #[test]
     fn dragging_the_divider_resizes_closes_and_reopens_the_preview() {
         use crate::app::PreviewSize;
         let snapshot = pr_snapshot();

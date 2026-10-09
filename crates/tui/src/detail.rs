@@ -1,5 +1,5 @@
 use agent_launcher_core::{
-    EventEnvelope, Issue, RunEvent, RunSummary, RuntimeSnapshot, WorktreeDeleteAction,
+    EventEnvelope, Issue, RunEvent, RunState, RunSummary, RuntimeSnapshot, WorktreeDeleteAction,
 };
 use ratatui::{
     Frame,
@@ -95,7 +95,7 @@ pub(crate) fn draw_detail(
     let latest_run = app.latest_run(snapshot, issue);
 
     draw_detail_header(frame, header, issue);
-    draw_tabs(frame, tabs, app.detail_tab, latest_run);
+    app.mouse.detail_tabs = draw_tabs(frame, tabs, app.detail_tab, latest_run, app.tick);
     draw_detail_body(frame, body, snapshot, issue, latest_run, app);
     draw_controls(
         frame,
@@ -275,11 +275,18 @@ fn draw_detail_header(frame: &mut Frame<'_>, area: Rect, issue: &Issue) {
     frame.render_widget(Paragraph::new(title), inner);
 }
 
-/// Overview · Description · Agent · Details, with a dot on Agent while a run
-/// exists so its output is not hidden behind the tab.
-fn draw_tabs(frame: &mut Frame<'_>, area: Rect, current: DetailTab, run: Option<&RunSummary>) {
+/// Overview · Description · Agent · Details. The Agent tab carries the run's
+/// status inside it, a spinner while it works, so its output is not hidden
+/// behind the tab. Returns each tab's cells, for clicks.
+fn draw_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    current: DetailTab,
+    run: Option<&RunSummary>,
+    tick: u32,
+) -> Vec<(Rect, DetailTab)> {
     if area.is_empty() {
-        return;
+        return Vec::new();
     }
     frame.render_widget(Block::new().style(Style::new().bg(theme::element())), area);
     // The tabs sit on the strip's middle row.
@@ -291,8 +298,11 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, current: DetailTab, run: Option<
     // Narrow screens name only the current tab; the others keep their number.
     let compact = area.width < 64;
     let mut spans = vec![Span::raw(" ")];
+    let mut hits = Vec::new();
+    let mut x = area.x + 1;
     for (index, tab) in DetailTab::ALL.into_iter().enumerate() {
-        let style = if tab == current {
+        let selected = tab == current;
+        let style = if selected {
             Style::new()
                 .fg(theme::bg())
                 .bg(theme::primary())
@@ -300,22 +310,42 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, current: DetailTab, run: Option<
         } else {
             Style::new().fg(theme::muted())
         };
-        spans.push(Span::styled(
-            if compact && tab != current {
+        let mut tab_spans = vec![Span::styled(
+            if compact && !selected {
                 format!(" {} ", index + 1)
             } else {
                 format!(" {} {} ", index + 1, tab.label())
             },
             style,
-        ));
+        )];
         if tab == DetailTab::Agent
             && let Some(run) = run
         {
-            spans.push(Span::styled("●", Style::new().fg(run_color(run.state))));
-        } else {
-            spans.push(Span::raw(" "));
+            let working = matches!(
+                run.state,
+                RunState::Provisioning | RunState::Starting | RunState::Running
+            );
+            let mark = if working {
+                theme::BRAILLE_SPINNER[tick as usize % theme::BRAILLE_SPINNER.len()]
+            } else {
+                "●"
+            };
+            // On the selected chip the mark takes the chip's text colour.
+            let color = if selected {
+                theme::bg()
+            } else {
+                run_color(run.state)
+            };
+            tab_spans.push(Span::styled(format!("{mark} "), style.fg(color)));
         }
-        spans.push(Span::raw(" "));
+        let width = tab_spans.iter().map(Span::width).sum::<usize>() as u16;
+        let cells = width.min(area.right().saturating_sub(x));
+        if cells > 0 {
+            hits.push((Rect::new(x, area.y, cells, 1), tab));
+        }
+        x = x.saturating_add(width + 2);
+        spans.extend(tab_spans);
+        spans.push(Span::raw("  "));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     // The key hint sits apart, at the right edge, so it doesn't read as a tab.
@@ -329,6 +359,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, current: DetailTab, run: Option<
             area,
         );
     }
+    hits
 }
 
 fn draw_detail_body(
