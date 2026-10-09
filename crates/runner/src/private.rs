@@ -702,10 +702,10 @@ http.server.HTTPServer(('127.0.0.1', int(sys.argv[-1])), Handler).serve_forever(
         std::fs::write(checkout.join("block-session"), "").unwrap();
         let launching = backend.clone();
         let task = tokio::spawn(async move { launching.dispatch(request).await });
-        for _ in 0..500 {
-            if checkout.join("session-waiting").exists() {
-                break;
-            }
+        // This dispatch starts a new fixture server: allow it the same slow first
+        // start as the fixture's startup timeout.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !checkout.join("session-waiting").exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(checkout.join("session-waiting").exists());
