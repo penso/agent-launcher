@@ -87,9 +87,38 @@ jobs:
           printf 'version=%s\nsha=%s\n' "$version" "$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
           printf 'Publishing v%s\n' "$version"
 
+  # One report for every archive: cargo-about over the locked graph for all
+  # release targets (scripts/release/about.toml).
+  notices:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - run: rustup show
+      # cargo-about gates its binary behind the non-default `cli` feature, and
+      # `cargo install` only warns and exits 0 when it installs nothing. Verify
+      # the subcommand resolves here rather than failing in the next step.
+      - name: Install the notice generator
+        run: |
+          cargo install cargo-about --version 0.9.2 --locked --features cli
+          cargo about --version
+      - run: python3 scripts/release/generate-notices.py THIRD-PARTY-NOTICES.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY-NOTICES.txt
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     name: Build (${{ matrix.target }})
-    needs: validate
+    needs: [validate, notices]
     strategy:
       fail-fast: false
       matrix:
@@ -127,10 +156,15 @@ jobs:
         run: |
           set -euo pipefail
           test "$("target/$TARGET/release/agent-launcher" --version)" = "agent-launcher $VERSION"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: third-party-notices
+          path: notices
       - name: Package the executable
         run: |
           mkdir dist
-          bash scripts/release/package.sh "$VERSION" "$TARGET" "target/$TARGET/release/agent-launcher" dist
+          bash scripts/release/package.sh "$VERSION" "$TARGET" "target/$TARGET/release/agent-launcher" dist \
+            notices/THIRD-PARTY-NOTICES.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.target }}
@@ -173,7 +207,8 @@ jobs:
             "thin/x86_64/agent-launcher-$VERSION-x86_64-apple-darwin/bin/agent-launcher"
           test "$(lipo -archs agent-launcher | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
           mkdir dist
-          bash scripts/release/package.sh "$VERSION" universal-apple-darwin agent-launcher dist
+          bash scripts/release/package.sh "$VERSION" universal-apple-darwin agent-launcher dist \
+            "thin/aarch64/agent-launcher-$VERSION-aarch64-apple-darwin/THIRD-PARTY-NOTICES.txt"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-universal-apple-darwin

@@ -1,6 +1,11 @@
 <h1 align="center">agent-launcher</h1>
 
 <p align="center">
+  <a href="https://github.com/penso/agent-launcher/actions/workflows/ci.yml"><img src="https://github.com/penso/agent-launcher/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/penso/agent-launcher/releases">Releases</a> ·
   <a href="docs/inbox.md">The inbox</a> ·
   <a href="docs/dispatch.md">Dispatching agents</a> ·
   <a href="docs/away-mode.md">Away mode</a> ·
@@ -44,14 +49,23 @@ advisories after explicit consent.
 
 ## Install
 
-Requires Rust (the toolchain is pinned in `rust-toolchain.toml`) and, for the backends you use,
-their CLIs: `gh`, `bd`, `herdr`, `opencode`, `superset`.
+With [Homebrew](https://brew.sh/), on macOS (Apple Silicon or Intel) or Linux:
+
+```sh
+brew install penso/tap/agent-launcher
+```
+
+Or download a tarball from [Releases](https://github.com/penso/agent-launcher/releases) and put
+`bin/agent-launcher` on your `PATH`. To build from source, with the Rust toolchain pinned in
+`rust-toolchain.toml`:
 
 ```sh
 git clone https://github.com/penso/agent-launcher
 cd agent-launcher
 just install   # builds a release binary into ~/.local/bin/agent-launcher
 ```
+
+The backends you use need their CLIs: `gh`, `bd`, `herdr`, `opencode` or `superset`.
 
 ## Usage
 

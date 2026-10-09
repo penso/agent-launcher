@@ -23,7 +23,7 @@ class AgentLauncher < Formula
   def install
     bin.install "bin/agent-launcher"
     pkgshare.install "config.example.toml"
-    doc.install "README.md"
+    doc.install "README.md", "NOTICE", "THIRD-PARTY-NOTICES.txt"
   end
 
   test do

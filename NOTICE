@@ -1,0 +1,19 @@
+agent-launcher
+Copyright 2026 Fabien Penso
+
+This product includes software developed as part of the agent-launcher
+project, licensed under the Apache License, Version 2.0. The full license text
+is in LICENSE at the root of this repository.
+
+Release archives also carry THIRD-PARTY-NOTICES.txt, generated at release time
+by cargo-about from the locked dependency graph, with the license texts and
+notices of every Rust crate the binaries are built from.
+
+The agent skill in .agents/skills/typesafe-ai is vendored unmodified from
+https://github.com/typesafe-ai/skills, Copyright (c) 2026 TypeSafe AI, and
+licensed under the MIT License; .agents/skills/typesafe-ai/LICENSE has the full
+text. It is a development aid for coding agents working on this repository and
+is not part of the agent-launcher binaries.
+
+The security reviewer prompt (prompts/security-reviewer.md) is an original
+synthesis; docs/security.md credits the public sources that informed it.

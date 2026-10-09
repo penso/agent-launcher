@@ -38,13 +38,16 @@ class Packaging(unittest.TestCase):
             executable = pathlib.Path(temp, "agent-launcher")
             executable.write_text("#!/bin/sh\n")
             executable.chmod(0o755)
+            notices = pathlib.Path(temp, "notices.txt")
+            notices.write_text("Third-party notices\n")
             archive = run("bash", RELEASE / "package.sh", "20261009.1",
-                          "x86_64-unknown-linux-gnu", executable, temp).stdout.strip()
+                          "x86_64-unknown-linux-gnu", executable, temp, notices).stdout.strip()
             prefix = "agent-launcher-20261009.1-x86_64-unknown-linux-gnu/"
             with tarfile.open(archive) as tar:
                 members = {member.name: member for member in tar.getmembers()}
             self.assertEqual(members[prefix + "bin/agent-launcher"].mode & 0o777, 0o755)
-            for name in ("README.md", "LICENSE", "config.example.toml"):
+            for name in ("README.md", "LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.txt",
+                         "config.example.toml"):
                 self.assertIn(prefix + name, members)
             self.assertTrue(all(member.uid == 0 for member in members.values()))
 
