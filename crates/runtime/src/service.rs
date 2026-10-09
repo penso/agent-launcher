@@ -7056,7 +7056,8 @@ mod tests {
         let executable = directory.join("fake-herdr");
         tokio::fs::write(
             &executable,
-            b"#!/bin/sh\nprintf '%s' $$ > \"$XDG_STATE_HOME/started\"\nexec sleep 30\n",
+            // Written whole then renamed, so the test never reads a half-written file.
+            b"#!/bin/sh\nprintf '%s' $$ > \"$XDG_STATE_HOME/started.tmp\" && mv \"$XDG_STATE_HOME/started.tmp\" \"$XDG_STATE_HOME/started\"\nexec sleep 30\n",
         )
         .await
         .unwrap();
@@ -7078,7 +7079,8 @@ mod tests {
             config,
         );
         handle.attach(tokio::spawn(service.run_with_demo_activity(false)));
-        tokio::time::timeout(Duration::from_secs(3), async {
+        // A new executable can take many seconds to first start on CI runners.
+        tokio::time::timeout(Duration::from_secs(60), async {
             while !tokio::fs::try_exists(directory.join("started"))
                 .await
                 .unwrap()

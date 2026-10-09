@@ -954,15 +954,15 @@ http.server.HTTPServer(('127.0.0.1', int(sys.argv[-1])), Handler).serve_forever(
         let fake = root.join("sleeping-git");
         executable(
             &fake,
-            "#!/bin/sh\nprintf '%s' $$ > ../child-pid\nexec sleep 60\n",
+            // Written whole then renamed, so the test never reads a half-written file.
+            "#!/bin/sh\nprintf '%s' $$ > ../child-pid.tmp && mv ../child-pid.tmp ../child-pid\nexec sleep 60\n",
         );
         let task_root = root.clone();
         let task = tokio::spawn(async move { prepare_using(&fork(), &task_root, &fake).await });
         let pid_path = root.join("child-pid");
-        for _ in 0..200 {
-            if pid_path.exists() {
-                break;
-            }
+        // A new executable can take many seconds to first start on CI runners.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !pid_path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let pid = std::fs::read_to_string(&pid_path).unwrap();
@@ -1187,13 +1187,17 @@ http.server.HTTPServer(('127.0.0.1', int(sys.argv[-1])), Handler).serve_forever(
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            child
+            // A rejecting hook may exit before reading its input, as git allows;
+            // the exit status below is the verdict either way.
+            let written = child
                 .stdin
                 .take()
                 .unwrap()
                 .write_all(format!("{local} {local_oid} {target} {remote_oid}\n").as_bytes())
-                .await
-                .unwrap();
+                .await;
+            if let Err(error) = written {
+                assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+            }
             assert_eq!(
                 child.wait().await.unwrap().success(),
                 expected,

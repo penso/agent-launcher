@@ -2926,7 +2926,12 @@ mod tests {
             .join(format!("native-cancel-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let fake = root.join("server");
-        std::fs::write(&fake, "#!/bin/sh\nprintf '%s' $$ > pid\nexec sleep 60\n").unwrap();
+        // Written whole then renamed, so the test never reads a half-written file.
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s' $$ > pid.tmp && mv pid.tmp pid\nexec sleep 60\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
         let registry = SessionRegistry::load(Some(root.join("registry.json")))
             .await
@@ -2944,10 +2949,9 @@ mod tests {
                 .launch_local_server(&work, Some("fixture-password"))
                 .await
         });
-        for _ in 0..200 {
-            if root.join("pid").exists() {
-                break;
-            }
+        // A new executable can take many seconds to first start on CI runners.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !root.join("pid").exists() && std::time::Instant::now() < deadline {
             sleep(Duration::from_millis(10)).await;
         }
         let pid = std::fs::read_to_string(root.join("pid"))
