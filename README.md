@@ -3,6 +3,20 @@
 A repository-local issue and PR inbox for dispatching coding agents into isolated local or remote
 workspaces.
 
+![agent-launcher: the issue list beside a preview of the selected issue](docs/screenshot.png)
+
+## Highlights
+
+- **One inbox per repository**: GitHub or GitLab issues, GitHub pull requests, private GitHub
+  security advisories, and local [Beads](https://github.com/steveyegge/beads) issues.
+- **Preview beside the list** on wide terminals; drag the divider to resize or close it.
+- **Tabbed details**: Overview, Description (Markdown), Agent (the run and its log) and Details.
+- **Dispatch with settings per launch**: prompt profile, compute target, harness and model
+  (picked from what is installed), plus one-off instructions appended to the prompt.
+- **Agents in [Herdr](https://github.com/herdrdev/herdr)**, local OpenCode, Superset or
+  Conductor, each in its own worktree; `→` jumps to an item's agent.
+- **Manual and Away modes**: dispatch by hand, or let Away work through a prioritized queue.
+
 Run `agent-launcher` from inside a Git repository. It detects the current repository's GitHub or
 GitLab remote from Git configuration and also enables Beads when `.beads` exists. GitHub pull
 requests appear in a separate PRs tab; GitLab merge requests are not yet supported.
@@ -661,6 +675,8 @@ The agent environment needs authenticated GitHub CLI or Git access to the PR and
 | Type / Backspace | Filter | |
 | `Tab` / `Shift+Tab` | Switch Issues / PRs | |
 | `Enter` | Open issue or PR | |
+| `→` | Go to the item's agent, worktree or workspace | Same |
+| `Tab` / `Shift+Tab`, `1`–`4` | | Switch Overview / Description / Agent / Details |
 | `Ctrl+G`, then `d` | Dispatch issue / review PR | |
 | `Ctrl+G`, then `r` | Refresh | |
 | `Ctrl+G`, then `s` | Choose sorting | |
@@ -692,6 +708,11 @@ configuration or environment variables or display the raw remote URL. Use arrows
 Page Up/Down, Home/End, or the mouse wheel over the pane to scroll; Esc closes it
 without changing the inbox search or selection.
 
+On terminals wide enough (a list area of 140+ columns), the selected row's Overview shows beside
+the list. Drag the divider between them to resize both panels, or drag it to the right edge to
+close the preview; drag the remaining handle back to reopen it. The size lasts for the session.
+Detail tabs take clicks too.
+
 Click a tab to switch between Issues and PRs. Hover a row to select it, then click to open its details. Mouse-wheel
 scrolling over the list moves three items at a time; over details it moves three lines. Overlays
 block background mouse actions. Opening a PR does not launch a review.
@@ -704,3 +725,11 @@ just format-check
 just lint
 just test
 ```
+
+### Demo screenshots
+
+`just demo-shots` seeds a throwaway repository of realistic Beads issues under
+`/tmp/agent-launcher-demo`, runs the launcher on it in a private tmux server with a throwaway
+`HOME` (your real state, configuration and Herdr session are never touched), walks the main
+screens, and writes colour captures to `target/demo/screenshots.html`. With Google Chrome
+installed it also renders `target/demo/readme.png`, the source of `docs/screenshot.png`.

@@ -2,6 +2,7 @@
 """Turns `tmux capture-pane -e` captures into one HTML page of screenshots.
 
     ansi2html.py out.html "Title one" one.ansi "Title two" two.ansi ...
+    ansi2html.py --bare out.html one.ansi      (a single frame, no page chrome)
 
 Handles the SGR codes ratatui emits: bold, dim, italic, underline, reverse,
 and 16-colour, 256-colour and 24-bit foregrounds and backgrounds.
@@ -130,7 +131,27 @@ def convert(text):
     return "".join(out)
 
 
+def bare(output, path):
+    """One capture alone, edge to edge, for a PNG screenshot."""
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        body = convert(handle.read())
+    with open(output, "w", encoding="utf-8") as handle:
+        handle.write(
+            """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Screenshot</title>
+<style>html,body{margin:0;background:#282828}
+pre{margin:0;padding:0;background:#282828;color:#ebdbb2;white-space:pre;display:inline-block;
+font:13px/1 Menlo,"SF Mono",monospace;font-variant-ligatures:none}
+pre .l{display:block;height:1.25em;line-height:1.25em}
+pre .l span{display:inline-block;height:1.25em;line-height:1.25em;vertical-align:top}
+</style></head><body><pre>"""
+            + body
+            + "</pre></body></html>\n"
+        )
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--bare":
+        return bare(sys.argv[2], sys.argv[3])
     if len(sys.argv) < 4 or len(sys.argv) % 2:
         sys.exit(__doc__)
     output, pairs = sys.argv[1], sys.argv[2:]
