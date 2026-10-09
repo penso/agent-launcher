@@ -90,6 +90,16 @@ fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let mut used = 0;
     for span in line.spans {
         for word in span.content.split_word_bounds() {
+            // A space that would overflow ends the line rather than starting
+            // the next one, so wrapped prose never begins with a blank.
+            if used > 0 && word.chars().all(|c| c == ' ') && used + word.width() > width {
+                result.push(std::mem::replace(
+                    &mut current,
+                    Line::default().style(line.style),
+                ));
+                used = 0;
+                continue;
+            }
             if !word.chars().any(char::is_whitespace)
                 && word.width() <= width
                 && used + word.width() > width
@@ -791,7 +801,12 @@ mod tests {
         let long = "x".repeat(MAX_SOURCE + 1);
         let text = markdown(&long, 1);
         assert!(text.lines.len() <= MAX_LINES + 40);
-        assert!(plain(&text).replace('\n', "").contains("display limit"));
+        // At width 1 the wrap drops spaces, so compare without them.
+        assert!(
+            plain(&text)
+                .replace(['\n', ' '], "")
+                .contains("displaylimit")
+        );
         let references = format!(
             "{}\n\n[ref]: https://example.test/{}",
             "[x][ref] ".repeat(2000),
@@ -825,5 +840,18 @@ mod tests {
         assert!(!cache.entry.as_ref().unwrap().1);
         cache.render(&"x".repeat(MAX_SOURCE + 1), 80);
         assert!(cache.entry.as_ref().unwrap().1);
+    }
+
+    #[test]
+    fn wrapped_prose_never_starts_with_a_space() {
+        let text = render("aaaa bbbb cccc", 9, MarkdownTheme::default());
+        let lines: Vec<String> = text.lines.iter().map(ToString::to_string).collect();
+        assert_eq!(lines, ["aaaa bbbb", "cccc"]);
+        let code = render("```\n    indented\n```", 20, MarkdownTheme::default());
+        assert!(
+            code.lines
+                .iter()
+                .any(|line| line.to_string() == "    indented")
+        );
     }
 }
