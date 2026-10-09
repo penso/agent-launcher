@@ -1721,6 +1721,11 @@ impl Backend for NativeBackend {
         })
         }.await;
         result.map_err(|error| {
+            // Test builds name the masked cause, so a failing fixture is diagnosable.
+            #[cfg(test)]
+            if private {
+                eprintln!("private dispatch failed: {error:?}");
+            }
             if private {
                 Error::PrivateSecurity
             } else {
