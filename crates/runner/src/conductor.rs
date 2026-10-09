@@ -55,7 +55,7 @@ impl ConductorBackend {
                 .user_agent(format!(
                     "{}/{}",
                     env!("CARGO_PKG_NAME"),
-                    env!("CARGO_PKG_VERSION")
+                    agent_launcher_core::VERSION
                 ))
                 .build()
                 .expect("static Conductor HTTP client configuration is valid"),

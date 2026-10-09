@@ -4860,7 +4860,7 @@ mod tests {
                         )));
                         assert!(line(height - 2).contains("Ctrl+G"));
                         assert!(line(height - 1).contains("github.com/acme/launcher"));
-                        assert!(line(height - 1).contains(env!("CARGO_PKG_VERSION")));
+                        assert!(line(height - 1).contains(agent_launcher_core::VERSION));
                         let list = app.mouse.list;
                         let thumb_y = if selected == 0 {
                             list.y
@@ -6604,8 +6604,8 @@ mod tests {
         assert!(!text.contains("Ctrl+P"));
         assert!(!text.contains("Tab/BackTab"));
         assert!(text.contains("\u{f09b} github.com/acme/launcher"));
-        assert!(text.contains(env!("CARGO_PKG_VERSION")));
-        assert!(!text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains(agent_launcher_core::VERSION));
+        assert!(!text.contains(&format!("v{}", agent_launcher_core::VERSION)));
     }
 
     #[test]
@@ -8288,7 +8288,7 @@ mod tests {
     fn footer_clips_identity_without_overlapping_metrics_or_version() {
         let snapshot = normal_snapshot();
         let identity = "\u{f09b} github.com/acme/launcher";
-        let version = env!("CARGO_PKG_VERSION");
+        let version = agent_launcher_core::VERSION;
         for width in 0..=120 {
             for sampled in [false, true] {
                 let mut metrics = HostMetrics::default();
@@ -8394,7 +8394,7 @@ mod tests {
 
         assert!(text.contains("CPU  82% 15m"));
         assert!(text.contains("MEM  67%"));
-        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+        assert!(text.contains(agent_launcher_core::VERSION));
     }
 
     #[test]
