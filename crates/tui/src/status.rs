@@ -67,9 +67,11 @@ pub(crate) const fn run_short_label(state: RunState) -> &'static str {
 }
 
 /// One-cell mark for the harness that runs a dispatch, after Herdr's agent list.
+/// Only symbols that are never drawn as emoji: a terminal that draws one two
+/// cells wide shifts the rest of the row and leaves stale cells behind.
 pub(crate) fn agent_glyph(agent: &str) -> &'static str {
     match agent.to_ascii_lowercase().as_str() {
-        "claude" => "✳",
+        "claude" => "✻",
         "opencode" => "▯",
         "codex" => "◎",
         "gemini" => "✦",

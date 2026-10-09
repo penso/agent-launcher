@@ -1228,7 +1228,7 @@ fn draw_table(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
             let marker = if launching || active.contains(issue.key.canonical().as_str()) {
                 theme::BRAILLE_SPINNER[app.tick as usize % theme::BRAILLE_SPINNER.len()]
             } else if index == app.selected {
-                "▶"
+                "▸"
             } else if latest_run.is_some() {
                 "●"
             } else {
@@ -1520,7 +1520,7 @@ fn draw_table_row(
     let line = Line::from(vec![
         Span::styled(
             if selected {
-                "▶ "
+                "▸ "
             } else {
                 "  "
             },
@@ -1764,7 +1764,7 @@ fn pr_change_indicator(
     )
 }
 
-/// A title cut to `width` cells, ending with the dispatched agent ("✳ claude")
+/// A title cut to `width` cells, ending with the dispatched agent ("✻ claude")
 /// when the row has a run, like Herdr's agent list. The glyph takes the run's
 /// status color so agent and state read together.
 fn title_with_agent(
@@ -1843,7 +1843,7 @@ fn draw_pr_row(
     let marker = if active || launching {
         theme::BRAILLE_SPINNER[tick as usize % theme::BRAILLE_SPINNER.len()]
     } else if selected {
-        "▶"
+        "▸"
     } else if latest_run.and_then(|run| run.workspace.as_ref()).is_some() {
         "●"
     } else {
@@ -4167,7 +4167,7 @@ mod tests {
                             .unwrap();
                         let buffer = terminal.backend().buffer();
                         let columns = security_columns(Rect::new(0, 1, width, 1));
-                        assert_eq!(buffer[(0, 1)].symbol(), "▶");
+                        assert_eq!(buffer[(0, 1)].symbol(), "▸");
                         if width >= 24 {
                             assert_eq!(buffer[(columns[1].x, 1)].symbol(), "3");
                             assert_eq!(buffer[(columns[1].x + 1, 1)].symbol(), "d");
@@ -9263,7 +9263,7 @@ mod tests {
         for expected in [
             "Improve review flow",
             "Branch      review-ui → main",
-            "Review      ✳ claude running for 12m · sonnet",
+            "Review      ✻ claude running for 12m · sonnet",
             "Smart dispatch picks the host",
             "Enter to read",
         ] {
@@ -9315,5 +9315,43 @@ mod tests {
         );
         app.reset_detail();
         assert_eq!(app.detail_tab, crate::app::DetailTab::Overview);
+    }
+    #[test]
+    fn frames_avoid_symbols_terminals_may_draw_as_emoji() {
+        // Drawn two cells wide by some terminals, these shift the rest of the
+        // row and leave stale cells behind ("openn").
+        const EMOJI_CAPABLE: &[char] = &['▶', '◀', '✳', '✴', '⚠', '✔', '✖', '➡', '⬅', '★'];
+        let mut snapshot = pr_snapshot();
+        let now = Utc::now();
+        for agent in ["claude", "opencode", "codex", "gemini", "pi", "other"] {
+            snapshot.runs.push(RunSummary {
+                confidential: false,
+                model: None,
+                id: agent.into(),
+                issue_key: snapshot.issues[1].key.canonical(),
+                workspace: None,
+                agent: agent.into(),
+                state: RunState::Running,
+                message: None,
+                session_id: None,
+                started_at: now,
+                updated_at: now,
+            });
+        }
+        for tab in [InboxTab::Issues, InboxTab::PullRequests] {
+            let mut app = AppState {
+                tab,
+                ..Default::default()
+            };
+            let text = render(180, 40, &snapshot, &mut app);
+            // A row with a working agent shows its spinner instead of the marker.
+            if tab == InboxTab::Issues {
+                assert!(text.contains('▸'), "the selected row is marked:\n{text}");
+            }
+            assert!(!text.contains(EMOJI_CAPABLE), "{text}");
+        }
+        for agent in ["claude", "opencode", "codex", "gemini", "pi", "other"] {
+            assert!(!agent_glyph(agent).contains(EMOJI_CAPABLE), "{agent}");
+        }
     }
 }
