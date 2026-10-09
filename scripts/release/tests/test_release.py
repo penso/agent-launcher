@@ -57,8 +57,8 @@ class Formula(unittest.TestCase):
         version = "20261009.1"
         sums = {
             target: hashlib.sha256(target.encode()).hexdigest()
-            for target in ("universal-apple-darwin", "x86_64-unknown-linux-gnu",
-                           "aarch64-unknown-linux-gnu")
+            for target in ("aarch64-apple-darwin", "x86_64-apple-darwin",
+                           "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
         }
         with tempfile.TemporaryDirectory() as temp:
             path = pathlib.Path(temp, "SHA256SUMS")
@@ -66,7 +66,7 @@ class Formula(unittest.TestCase):
                 f"{digest}  agent-launcher-{version}-{target}.tar.gz\n"
                 for target, digest in sums.items()))
             formula = run("bash", RELEASE / "render-formula.sh", version, path).stdout
-        self.assertIn(f'  version "{version}"', formula)
+        self.assertNotIn("version \"", formula, "Homebrew scans the version from the URL")
         self.assertNotIn("@", formula.replace("@users", ""))
         for target, digest in sums.items():
             self.assertIn(f"v{version}/agent-launcher-{version}-{target}.tar.gz", formula)
@@ -79,6 +79,30 @@ class Formula(unittest.TestCase):
             result = subprocess.run(["bash", RELEASE / "render-formula.sh", "20261009.1", path],
                                     capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
+
+
+class FormulaVersion(unittest.TestCase):
+    """update-homebrew.sh reads a formula's version from its release URLs."""
+
+    def version(self, text):
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp, "formula.rb")
+            path.write_text(text)
+            script = (
+                f'source "{RELEASE}/common.sh"; '
+                f'eval "$(sed -n "/^formula_version()/,/^}}/p" "{RELEASE}/update-homebrew.sh")"; '
+                f'formula_version "{path}"'
+            )
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return result.stdout if result.returncode == 0 else None
+
+    def test_reads_the_single_release_version(self):
+        url = "https://github.com/penso/agent-launcher/releases/download/v20261009.2/x.tar.gz"
+        self.assertEqual(self.version(f'url "{url}"\nurl "{url}"\n'), "20261009.2")
+
+    def test_refuses_mixed_or_missing_versions(self):
+        self.assertIsNone(self.version("releases/download/v1.1/ releases/download/v2.2/\n"))
+        self.assertIsNone(self.version("no release here\n"))
 
 
 if __name__ == "__main__":

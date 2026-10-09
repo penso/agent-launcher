@@ -12,12 +12,14 @@ checksum() {
     [[ $sum =~ ^[0-9a-f]{64}$ ]] || fail "No checksum for agent-launcher-$1-$2.tar.gz"
     printf '%s' "$sum"
 }
-macos=$(checksum "$1" universal-apple-darwin "$2")
-linux_x86_64=$(checksum "$1" x86_64-unknown-linux-gnu "$2")
+macos_aarch64=$(checksum "$1" aarch64-apple-darwin "$2")
+macos_x86_64=$(checksum "$1" x86_64-apple-darwin "$2")
 linux_aarch64=$(checksum "$1" aarch64-unknown-linux-gnu "$2")
+linux_x86_64=$(checksum "$1" x86_64-unknown-linux-gnu "$2")
 while IFS= read -r line; do
     line=${line//@VERSION@/$1}
-    line=${line//@SHA256_MACOS@/$macos}
-    line=${line//@SHA256_LINUX_X86_64@/$linux_x86_64}
-    printf '%s\n' "${line//@SHA256_LINUX_AARCH64@/$linux_aarch64}"
+    line=${line//@SHA256_MACOS_AARCH64@/$macos_aarch64}
+    line=${line//@SHA256_MACOS_X86_64@/$macos_x86_64}
+    line=${line//@SHA256_LINUX_AARCH64@/$linux_aarch64}
+    printf '%s\n' "${line//@SHA256_LINUX_X86_64@/$linux_x86_64}"
 done < "$release_root/scripts/release/homebrew/Formula/agent-launcher.rb"

@@ -7,7 +7,15 @@ source "$(dirname -- "$0")/common.sh"
 [[ $# == 2 ]] || fail 'Usage: bash update-homebrew.sh VERSION RENDERED_FORMULA'
 version_check "$1"
 [[ -f $2 && ! -L $2 && -s $2 ]] || fail 'Rendered formula must be a nonempty regular file'
-grep -Fxq "  version \"$1\"" "$2" || fail 'Rendered formula version does not match'
+# The version lives in each release URL (Homebrew scans it from there).
+formula_version() {
+    local versions
+    versions=$(grep -oE 'releases/download/v[0-9]+\.[0-9]+/' "$1" | sort -u) || return 1
+    [[ $versions != *$'\n'* ]] || return 1
+    [[ $versions =~ ^releases/download/v([0-9]+\.[0-9]+)/$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+[[ "$(formula_version "$2")" == "$1" ]] || fail 'Rendered formula version does not match'
 [[ -n ${HOMEBREW_TAP_SSH_KEY:-} ]] || fail 'HOMEBREW_TAP_SSH_KEY is required'
 
 formula=Formula/agent-launcher.rb
@@ -33,10 +41,8 @@ git check-ref-format "refs/heads/$branch"
 [[ ! -L $temp/tap/Formula && ! -L $temp/tap/$formula ]] || fail 'Refusing symlink formula path'
 [[ ! -e $temp/tap/$formula || -f $temp/tap/$formula ]] || fail 'Formula path is not a regular file'
 if [[ -f $temp/tap/$formula ]]; then
-    # Parse only a single literal version declaration; never evaluate tap Ruby.
-    declaration=$(grep -E '^[[:blank:]]*version([[:blank:]]|$)' "$temp/tap/$formula") || fail 'Missing existing formula version'
-    [[ $declaration =~ ^[[:blank:]]*version[[:blank:]]+\"([0-9.]+)\"[[:blank:]]*$ ]] || fail 'Malformed existing formula version'
-    current_version=${BASH_REMATCH[1]}
+    # Read only the release URLs' single version; never evaluate tap Ruby.
+    current_version=$(formula_version "$temp/tap/$formula") || fail 'Malformed existing formula version'
     version_check "$current_version"
     IFS=. read -r -a current_parts <<< "$current_version"
     IFS=. read -r -a next_parts <<< "$1"
