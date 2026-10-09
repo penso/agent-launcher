@@ -6,7 +6,7 @@ The user subsequently authorized implementation. The polling rollout is implemen
 separate core telemetry/configuration types, runtime-owned read-only local/SSH
 discovery and bounded polling, aggregate SQLite history, and a freshness-aware
 working-count graph. Launcher run controls and explicit demo behavior remain separate.
-See README's Herdr Activity section and `config.example.toml` for shipped coverage.
+See docs/herdr-activity.md and `config.example.toml` for shipped coverage.
 
 Verification: all 274 workspace tests, `just format-check`, `just lockfile-check`,
 `just lint`, and `git diff --check` passed. Tests use sanitized fixtures/fake

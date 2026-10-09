@@ -93,15 +93,37 @@ for _ in $(seq 1 14); do
 done
 # Past the launch logo's fade, so the activity graph shows on its own.
 sleep 3
-capture > "$shots/readme.ansi"
-python3 "$root/scripts/demo/ansi2html.py" --bare "$out/readme.html" "$shots/readme.ansi"
 chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-if [ -x "$chrome" ]; then
-  # 180 columns of 13px Menlo, 48 rows of 1.25em, at 2x for a crisp image.
-  "$chrome" --headless=new --disable-gpu --hide-scrollbars \
-    --force-device-scale-factor=2 --window-size=1412,780 \
-    --screenshot="$out/readme.png" "file://$out/readme.html" >/dev/null 2>&1 || true
-fi
+# png NAME: captures the screen as a frame-only PNG for the README.
+png() {
+  capture > "$shots/$1.ansi"
+  python3 "$root/scripts/demo/ansi2html.py" --bare "$out/$1.html" "$shots/$1.ansi"
+  if [ -x "$chrome" ]; then
+    # 180 columns of 13px Menlo, 48 rows of 1.25em, at 2x for a crisp image.
+    "$chrome" --headless=new --disable-gpu --hide-scrollbars \
+      --force-device-scale-factor=2 --window-size=1412,780 \
+      --screenshot="$out/$1.png" "file://$out/$1.html" >/dev/null 2>&1 || true
+  fi
+}
+png readme
+# The full view on its Description tab.
+"${tmux[@]}" send-keys -t demo Enter
+sleep 0.4
+"${tmux[@]}" send-keys -t demo 2
+sleep 0.8
+png readme-detail
+# Launch settings: d, the built-in prompt, a one-off instruction, then the
+# harness picker.
+"${tmux[@]}" send-keys -t demo 1 d
+sleep 1.5
+"${tmux[@]}" send-keys -t demo Enter
+sleep 1
+"${tmux[@]}" send-keys -t demo -l "Add a regression test that pastes a 25 MB PNG."
+sleep 0.3
+"${tmux[@]}" send-keys -t demo Tab h
+sleep 1
+png readme-dispatch
+for _ in 1 2 3 4; do "${tmux[@]}" send-keys -t demo Escape; sleep 0.2; done
 "${tmux[@]}" send-keys -t demo Home
 # Search for the crash report: it has steps, a log block and a list. Search
 # is fuzzy over descriptions too, so the query must be distinctive.
