@@ -23,6 +23,10 @@ pub(crate) struct MouseGeometry {
     pub launch_picker: Rect,
     pub launch_picker_rows: Vec<(Rect, usize)>,
     pub launch_instructions: Rect,
+    /// The inbox listing before it is split, and the divider between the
+    /// list and the preview (or the handle that reopens a closed preview).
+    pub listing: Rect,
+    pub divider: Rect,
 }
 
 pub(crate) fn handle_mouse(
@@ -64,6 +68,22 @@ pub(crate) fn handle_mouse(
         }
         return handle_launch_settings(app, event);
     }
+    // A divider drag continues until release, whatever the pointer crosses.
+    if let Some(listing) = app.preview_drag {
+        match event.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let size = crate::render::preview_size_at(listing, event.column);
+                let changed = size != app.preview_size;
+                app.preview_size = size;
+                return changed;
+            },
+            MouseEventKind::Up(_) | MouseEventKind::Down(_) => {
+                app.preview_drag = None;
+                return true;
+            },
+            _ => return false,
+        }
+    }
     if hit.blocked
         || app.input_overlay.is_some()
         || app.delete_overlay.is_some()
@@ -81,6 +101,13 @@ pub(crate) fn handle_mouse(
     let position = Position::new(event.column, event.row);
     if event.kind == MouseEventKind::Down(MouseButton::Left) && hit.mode.contains(position) {
         crate::away::open(app, snapshot);
+        return true;
+    }
+    if event.kind == MouseEventKind::Down(MouseButton::Left)
+        && app.route == Route::Inbox
+        && hit.divider.contains(position)
+    {
+        app.preview_drag = Some(hit.listing);
         return true;
     }
     match event.kind {

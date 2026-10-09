@@ -128,27 +128,17 @@ pub(crate) fn draw_preview(
         return;
     };
     let latest_run = app.latest_run(snapshot, issue);
-    // The title wraps beside the state pill, which sits at the top right.
-    let pill = state_pill(issue);
-    let pill_width = pill.width() as u16;
+    // The title alone: the list beside it already shows the state.
     let title = Paragraph::new(Line::styled(
         issue.title.clone(),
         Style::new().fg(theme::text()).add_modifier(Modifier::BOLD),
     ))
     .wrap(Wrap { trim: true });
-    let title_width = inner.width.saturating_sub(pill_width + 2);
-    let title_height = (title.line_count(title_width.max(1)) as u16).min(inner.height);
+    let title_height = (title.line_count(inner.width) as u16).min(inner.height);
     frame.render_widget(title, Rect {
-        width: title_width,
         height: title_height,
         ..inner
     });
-    if inner.width > pill_width {
-        frame.render_widget(
-            Paragraph::new(pill),
-            Rect::new(inner.right() - pill_width, inner.y, pill_width, 1),
-        );
-    }
     let inner = Rect {
         y: inner.y + title_height,
         height: inner.height - title_height,

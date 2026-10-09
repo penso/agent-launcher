@@ -17,6 +17,18 @@ pub(crate) enum Route {
     Detail,
 }
 
+/// How much of a wide inbox the preview takes, set by dragging the divider.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PreviewSize {
+    /// The default split for the window width.
+    #[default]
+    Auto,
+    /// Columns the preview takes, clamped so the list keeps its minimum.
+    Width(u16),
+    /// Dragged closed: the list takes the full width beside a handle.
+    Hidden,
+}
+
 /// Sections of the detail view, cycled with Tab.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum DetailTab {
@@ -487,6 +499,9 @@ pub(crate) struct AppState {
     pub search_query: String,
     pub detail_scroll: u16,
     pub detail_tab: DetailTab,
+    pub preview_size: PreviewSize,
+    /// The listing being resized while its divider is dragged.
+    pub preview_drag: Option<ratatui::layout::Rect>,
     pub detail_scroll_max: u16,
     pub(crate) markdown_cache: crate::widgets::markdown::MarkdownCache,
     pub input_overlay: Option<InputOverlay>,

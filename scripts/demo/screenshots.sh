@@ -56,6 +56,21 @@ shot() {
 }
 
 shot 01-wide-list "Wide (180×48): list with preview"
+
+# mouse BUTTON COLUMN ROW [m]: sends one SGR mouse event (1-based cells).
+mouse() { "${tmux[@]}" send-keys -t demo -l $'\e'"[<$1;$2;$3${4:-M}"; sleep 0.1; }
+# drag FROM TO: drags the list/preview divider from one column to another.
+drag() {
+  mouse 0 "$1" 24
+  mouse 32 $(( ($1 + $2) / 2 )) 24
+  mouse 32 "$2" 24
+  mouse 0 "$2" 24 m
+}
+drag 99 70
+shot 01b-dragged-wide "Dragged the divider left: a wider preview"
+drag 70 178
+shot 01c-dragged-closed "Dragged to the right edge: preview closed, handle left"
+drag 177 99
 # Search for the crash report: it has steps, a log block and a list. Search
 # is fuzzy over descriptions too, so the query must be distinctive.
 shot 02-wide-preview "Wide: the P0 crash previewed" 2 0 Space M B

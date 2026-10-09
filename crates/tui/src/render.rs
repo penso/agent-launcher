@@ -261,10 +261,15 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
         .saturating_sub(listing_y)
         .saturating_sub(legend_height);
     let listing = Rect::new(panel.x, listing_y, panel.width, listing_height);
-    let (listing, preview) = split_preview(listing, app.tab);
-    draw_listing(frame, listing, snapshot, app);
+    let (list, preview, divider) = split_preview(listing, app.tab, app.preview_size);
+    draw_listing(frame, list, snapshot, app);
     if let Some(preview) = preview {
         crate::detail::draw_preview(frame, preview, snapshot, app);
+    }
+    if let Some(divider) = divider {
+        draw_divider(frame, divider, app.preview_drag.is_some());
+        app.mouse.listing = listing;
+        app.mouse.divider = divider;
     }
     if legend_height > 0 {
         draw_legends(
@@ -284,26 +289,82 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app
 /// Narrowest listing that gets a preview beside it; below this the list
 /// keeps the full width and Enter opens the detail view, as before.
 const PREVIEW_MIN_WIDTH: u16 = 140;
+/// Narrowest preview a drag can leave; dragging past it closes the preview.
+const PREVIEW_MIN: u16 = 36;
+/// Narrowest list a drag can leave: its rows keep the full table columns.
+const LIST_MIN: u16 = 80;
 
-/// Splits the listing into the list and a preview of the selected row when
-/// the window is wide enough. The Logs tab has nothing to preview.
-fn split_preview(listing: Rect, tab: InboxTab) -> (Rect, Option<Rect>) {
+/// Splits the listing into the list, a preview of the selected row, and the
+/// draggable divider between them, when the window is wide enough. A closed
+/// preview leaves only the divider, as a handle at the right edge. The Logs
+/// tab has nothing to preview.
+fn split_preview(
+    listing: Rect,
+    tab: InboxTab,
+    size: crate::app::PreviewSize,
+) -> (Rect, Option<Rect>, Option<Rect>) {
+    use crate::app::PreviewSize;
     if listing.width < PREVIEW_MIN_WIDTH || listing.height < 10 || tab == InboxTab::Logs {
-        return (listing, None);
+        return (listing, None, None);
     }
-    let preview_width = (listing.width * 9 / 20).clamp(60, 100);
+    let preview_width = match size {
+        PreviewSize::Auto => (listing.width * 9 / 20).clamp(60, 100),
+        PreviewSize::Width(width) => width.clamp(PREVIEW_MIN, listing.width - LIST_MIN - 1),
+        PreviewSize::Hidden => 0,
+    };
     let list_width = listing.width - preview_width - 1;
+    let divider = Rect {
+        x: listing.x + list_width,
+        width: 1,
+        ..listing
+    };
+    let preview = (preview_width > 0).then(|| Rect {
+        x: divider.right(),
+        width: preview_width,
+        ..listing
+    });
     (
         Rect {
             width: list_width,
             ..listing
         },
-        Some(Rect {
-            x: listing.x + list_width + 1,
-            width: preview_width,
-            ..listing
-        }),
+        preview,
+        Some(divider),
     )
+}
+
+/// The preview size for a divider dragged to `column` within `listing`:
+/// the columns right of it, or closed when that is narrower than the minimum.
+pub(crate) fn preview_size_at(listing: Rect, column: u16) -> crate::app::PreviewSize {
+    let width = listing.right().saturating_sub(column + 1);
+    if width < PREVIEW_MIN {
+        crate::app::PreviewSize::Hidden
+    } else {
+        crate::app::PreviewSize::Width(width.min(listing.width.saturating_sub(LIST_MIN + 1)))
+    }
+}
+
+/// A thin rule with a grip in the middle; the accent colour while dragged.
+fn draw_divider(frame: &mut Frame<'_>, divider: Rect, dragging: bool) {
+    let color = if dragging {
+        theme::primary()
+    } else {
+        theme::border()
+    };
+    let middle = divider.y + divider.height / 2;
+    let lines: Vec<Line> = (divider.y..divider.bottom())
+        .map(|y| {
+            Line::styled(
+                if y.abs_diff(middle) <= 1 {
+                    "┃"
+                } else {
+                    "│"
+                },
+                Style::new().fg(color),
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), divider);
 }
 
 fn draw_tiny_inbox(frame: &mut Frame<'_>, area: Rect, snapshot: &RuntimeSnapshot, app: &AppState) {
@@ -1300,7 +1361,8 @@ impl Columns {
                 activity: 0,
                 author: 0,
                 age: 5,
-                source: 5,
+                // "github" and the "source" header need six cells plus a gap.
+                source: 7,
                 state: 8,
             }
         } else {
@@ -4334,7 +4396,9 @@ mod tests {
     /// whole panel, or what the preview leaves of it on wide screens.
     fn listing_right(width: u16) -> u16 {
         let panel = Rect::new(2, 0, width - 4, 30);
-        split_preview(panel, InboxTab::Issues).0.right()
+        split_preview(panel, InboxTab::Issues, Default::default())
+            .0
+            .right()
     }
 
     /// Every detail tab's text, for checks that care what the detail view
@@ -9008,6 +9072,71 @@ mod tests {
         assert!(text.contains("Esc cancel"));
     }
     #[test]
+    fn dragging_the_divider_resizes_closes_and_reopens_the_preview() {
+        use crate::app::PreviewSize;
+        let snapshot = pr_snapshot();
+        let mut app = AppState::default();
+        let drag = |app: &mut AppState, kind, column: u16| {
+            let row = app.mouse.divider.y + 2;
+            crate::mouse::handle_mouse(
+                app,
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &snapshot,
+                (180, 40),
+            )
+        };
+        let text = render(180, 40, &snapshot, &mut app);
+        assert!(text.contains('┃'), "the divider has a grip");
+        let divider = app.mouse.divider;
+        let listing = app.mouse.listing;
+        assert!(!divider.is_empty());
+
+        // Drag left: the preview grows and the list keeps its minimum.
+        assert!(drag(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            divider.x
+        ));
+        assert!(app.preview_drag.is_some());
+        assert!(drag(&mut app, MouseEventKind::Drag(MouseButton::Left), 20));
+        assert_eq!(
+            app.preview_size,
+            PreviewSize::Width(listing.width - LIST_MIN - 1)
+        );
+        assert!(drag(&mut app, MouseEventKind::Drag(MouseButton::Left), 100));
+        assert_eq!(app.preview_size, PreviewSize::Width(listing.right() - 101));
+        assert!(drag(&mut app, MouseEventKind::Up(MouseButton::Left), 100));
+        assert!(app.preview_drag.is_none());
+        render(180, 40, &snapshot, &mut app);
+        assert_eq!(app.mouse.divider.x, 100);
+        assert_eq!(app.mouse.rows[0].0.right(), 99);
+
+        // Drag to the right edge: the preview closes, leaving a handle.
+        let divider = app.mouse.divider;
+        drag(&mut app, MouseEventKind::Down(MouseButton::Left), divider.x);
+        drag(&mut app, MouseEventKind::Drag(MouseButton::Left), 175);
+        drag(&mut app, MouseEventKind::Up(MouseButton::Left), 175);
+        assert_eq!(app.preview_size, PreviewSize::Hidden);
+        let text = render(180, 40, &snapshot, &mut app);
+        assert!(!text.contains("Branch      review-ui"));
+        let handle = app.mouse.divider;
+        assert_eq!(handle.right(), listing.right());
+
+        // Dragging the handle back reopens it.
+        drag(&mut app, MouseEventKind::Down(MouseButton::Left), handle.x);
+        drag(&mut app, MouseEventKind::Drag(MouseButton::Left), 110);
+        drag(&mut app, MouseEventKind::Up(MouseButton::Left), 110);
+        assert_eq!(app.preview_size, PreviewSize::Width(listing.right() - 111));
+        render(180, 40, &snapshot, &mut app);
+        assert_eq!(app.mouse.divider.x, 110);
+    }
+
+    #[test]
     fn priority_is_coloured_by_level() {
         use crate::status::priority_color;
         assert_eq!(priority_color(0), theme::error());
@@ -9074,6 +9203,14 @@ mod tests {
         assert!(app.mouse.rows[0].0.right() < 100);
         // The preview names the item by title; its ID is a field.
         assert!(text.contains("ID          #42"));
+        // The list already shows the state, so the preview has no pill.
+        let divider = usize::from(app.mouse.divider.x);
+        let title_row = text
+            .lines()
+            .map(|line| line.chars().skip(divider + 1).collect::<String>())
+            .find(|right| right.contains("Improve review flow"))
+            .unwrap();
+        assert!(!title_row.contains("open"), "{title_row}");
         assert!(!text.contains("#42  Improve review flow"));
         assert!(!text.contains("head-456"), "SHAs stay in Details");
 
