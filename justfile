@@ -30,3 +30,8 @@ install:
     # launch is killed (SIGKILL) before it runs.
     cp target/release/agent-launcher "$HOME/.local/bin/agent-launcher.new"
     mv -f "$HOME/.local/bin/agent-launcher.new" "$HOME/.local/bin/agent-launcher"
+
+# Seed a Beads demo repository, run the launcher on it in a private tmux
+# server, and write colour screenshots to target/demo/screenshots.html.
+demo-shots:
+    scripts/demo/screenshots.sh
