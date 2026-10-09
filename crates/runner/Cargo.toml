@@ -1,23 +1,23 @@
 [package]
-name = "agent-launcher-runner"
 edition.workspace = true
-version.workspace = true
 license.workspace = true
+name              = "agent-launcher-runner"
+version.workspace = true
 
 [dependencies]
-agent-launcher-core = { path = "../core" }
-async-trait.workspace = true
-chrono.workspace = true
-dirs.workspace = true
+agent-launcher-core    = { path = "../core" }
+async-trait.workspace  = true
+chrono.workspace       = true
+dirs.workspace         = true
 futures-util.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-url = { workspace = true, features = ["serde"] }
-uuid = { workspace = true, features = ["v5"] }
+reqwest.workspace      = true
+serde.workspace        = true
+serde_json.workspace   = true
+thiserror.workspace    = true
+tokio.workspace        = true
+tracing.workspace      = true
+url                    = { features = ["serde"], workspace = true }
+uuid                   = { features = ["v5"], workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { features = ["fs", "process"], version = "1" }

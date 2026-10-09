@@ -3,11 +3,14 @@ default:
 
 nightly_toolchain := "nightly-2025-11-30"
 
+# Rust with rustfmt, TOML with taplo (aligned `=`, sorted keys; see taplo.toml).
 format:
     cargo +{{nightly_toolchain}} fmt --all
+    taplo fmt
 
 format-check:
     cargo +{{nightly_toolchain}} fmt --all -- --check
+    taplo fmt --check
 
 lockfile-check:
     cargo metadata --locked --format-version=1 > /dev/null

@@ -1,8 +1,8 @@
 [package]
-name = "agent-launcher-cli"
 edition.workspace = true
-version.workspace = true
 license.workspace = true
+name              = "agent-launcher-cli"
+version.workspace = true
 
 [[bin]]
 name = "agent-launcher"
@@ -10,18 +10,18 @@ path = "src/main.rs"
 
 [features]
 default = ["tui"]
-tui = ["dep:agent-launcher-tui", "dep:tokio"]
+tui     = ["dep:agent-launcher-tui", "dep:tokio"]
 
 [dependencies]
-agent-launcher-core = { path = "../core" }
-agent-launcher-issues = { path = "../issues" }
-agent-launcher-runner = { path = "../runner" }
+agent-launcher-core    = { path = "../core" }
+agent-launcher-issues  = { path = "../issues" }
+agent-launcher-runner  = { path = "../runner" }
 agent-launcher-runtime = { path = "../runtime" }
-agent-launcher-store = { path = "../store" }
-agent-launcher-tui = { path = "../tui", optional = true }
-clap.workspace = true
-dirs.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, optional = true }
-toml.workspace = true
-uuid = { workspace = true, features = ["v5"] }
+agent-launcher-store   = { path = "../store" }
+agent-launcher-tui     = { optional = true, path = "../tui" }
+clap.workspace         = true
+dirs.workspace         = true
+thiserror.workspace    = true
+tokio                  = { optional = true, workspace = true }
+toml.workspace         = true
+uuid                   = { features = ["v5"], workspace = true }

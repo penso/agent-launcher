@@ -1,16 +1,16 @@
 [package]
-name = "agent-launcher-store"
 edition.workspace = true
-version.workspace = true
 license.workspace = true
+name              = "agent-launcher-store"
+version.workspace = true
 
 [dependencies]
-agent-launcher-core = { path = "../core" }
-chrono.workspace = true
-serde.workspace = true
+agent-launcher-core  = { path = "../core" }
+chrono.workspace     = true
+rustix               = { features = ["fs", "process"], version = "1" }
+serde.workspace      = true
 serde_json.workspace = true
-sqlx.workspace = true
-thiserror.workspace = true
-rustix = { version = "1", features = ["fs", "process"] }
-sha2 = "0.10"
-tokio.workspace = true
+sha2                 = "0.10"
+sqlx.workspace       = true
+thiserror.workspace  = true
+tokio.workspace      = true

@@ -1,12 +1,12 @@
 [package]
-name = "agent-launcher-core"
 edition.workspace = true
-version.workspace = true
 license.workspace = true
+name              = "agent-launcher-core"
+version.workspace = true
 
 [dependencies]
 chrono.workspace = true
-serde.workspace = true
+serde.workspace  = true
 
 [dev-dependencies]
 toml.workspace = true

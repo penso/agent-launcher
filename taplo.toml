@@ -1,3 +1,6 @@
+# https://taplo.tamasfe.dev/configuration/formatter-options.html
+exclude = ["target/**"]
+
 [formatting]
 align_comments        = false
 align_entries         = true

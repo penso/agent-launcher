@@ -1,28 +1,28 @@
 [package]
-name = "agent-launcher-runtime"
 edition.workspace = true
-version.workspace = true
 license.workspace = true
+name              = "agent-launcher-runtime"
+version.workspace = true
 
 [dependencies]
-agent-launcher-core = { path = "../core" }
+agent-launcher-core   = { path = "../core" }
 agent-launcher-issues = { path = "../issues" }
 agent-launcher-runner = { path = "../runner" }
-agent-launcher-store = { path = "../store" }
-chrono.workspace = true
-minijinja.workspace = true
+agent-launcher-store  = { path = "../store" }
+chrono.workspace      = true
+minijinja.workspace   = true
 notify-rust.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-rustix = { version = "1", features = ["fs"] }
-uuid.workspace = true
+rustix                = { features = ["fs"], version = "1" }
+serde.workspace       = true
+serde_json.workspace  = true
+thiserror.workspace   = true
+tokio.workspace       = true
+tracing.workspace     = true
+uuid.workspace        = true
 
 [dev-dependencies]
-agent-launcher-issues = { path = "../issues", features = ["test-support"] }
-tokio = { workspace = true, features = ["test-util"] }
+agent-launcher-issues = { features = ["test-support"], path = "../issues" }
 async-trait.workspace = true
-sqlx.workspace = true
-tempfile = "3"
+sqlx.workspace        = true
+tempfile              = "3"
+tokio                 = { features = ["test-util"], workspace = true }

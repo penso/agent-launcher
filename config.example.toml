@@ -1,6 +1,6 @@
 # auto prefers Superset, then Herdr, then native Git/OpenCode.
 # Other values: superset, native, herdr, conductor.
-backend = "auto"
+backend               = "auto"
 poll_interval_seconds = 60
 
 # Set this to target a Superset host instead of the local machine.
@@ -19,9 +19,9 @@ desktop = true
 # Polls every 2s; observations expire after 10s. Four requests maximum, 10s deadline.
 # History is sampled (brief transitions can be missed), retained locally for 30min.
 [herdr_activity]
-enabled = true
 discover_local_sessions = true
 discover_saved_profiles = true
+enabled                 = true
 # Consent to enumerate OTHER running sessions on enabled configured SSH hosts.
 # false means configured-session coverage, not all sessions on those hosts.
 discover_remote_sessions = false
